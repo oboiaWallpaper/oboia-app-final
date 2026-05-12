@@ -1,5 +1,5 @@
 // lib/screens/ar/ar_screen.dart
-// OBOIA – AR Screen with status overlay. Displays native AR connection status.
+// OBOIA – AR Screen with in‑line scanning, status overlay, and eraser
 
 import 'dart:async';
 import 'dart:convert';
@@ -33,16 +33,21 @@ class _ARScreenState extends State<ARScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
 
+  // Camera state
   bool _cameraReady = false;
   bool _permissionDenied = false;
-  String _nativeStatus = "Initializing...";
-  List<String> _logLines = [];
 
-  // ... (rest of state variables unchanged)
+  // Native status
+  String _nativeStatus = "Initializing...";
+  final List<String> _logLines = [];
+
+  // Scanning state
   bool _isScanning = false;
   bool _hasSnapshot = false;
   List<DetectedSurface> _scannedSurfaces = [];
   List<DetectedObject> _scannedObjects = [];
+
+  // Eraser state
   int? _currentWallIndex;
 
   @override
@@ -67,7 +72,6 @@ class _ARScreenState extends State<ARScreen> {
   }
 
   void _onAREvent(AREvent event) {
-    // Always log boot/status events
     if (event.type == 'boot') {
       final msg = event.data['status'] ?? 'boot';
       setState(() {
@@ -86,7 +90,6 @@ class _ARScreenState extends State<ARScreen> {
       });
       return;
     }
-    // ... (rest of event handling remains the same as before)
     if (event.type == 'scanUpdate') {
       final dataStr = event.data['data'] as String? ?? '';
       if (dataStr.isNotEmpty) {
@@ -105,6 +108,7 @@ class _ARScreenState extends State<ARScreen> {
         _isScanning = false;
         _hasSnapshot = true;
       });
+      // Auto-apply wallpaper to all non-excluded walls
       for (int i = 0; i < _scannedSurfaces.length; i++) {
         if (!_scannedSurfaces[i].excluded && _scannedSurfaces[i].type == 'wall') {
           _arService.placeWallpaper(
@@ -121,7 +125,42 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  // ... (other methods: _startScan, _stopScan, etc., unchanged)
+  Future<void> _startScan() async {
+    setState(() {
+      _isScanning = true;
+      _hasSnapshot = false;
+      _scannedSurfaces.clear();
+      _scannedObjects.clear();
+    });
+    await _arService.setARMode('scanning');
+    await _arService.startScan();
+  }
+
+  Future<void> _stopScan() async {
+    await _arService.stopScan();
+  }
+
+  void _toggleSurfaceExclusion(String id) {
+    _arService.toggleSurfaceExclusion(id);
+  }
+
+  void _enterEraserMode(int wallIndex) {
+    setState(() => _currentWallIndex = wallIndex);
+    _arService.selectWall(wallIndex);
+    _arService.enterCutMode(wallIndex);
+  }
+
+  void _exitEraserMode() {
+    setState(() => _currentWallIndex = null);
+    _arService.exitCutMode();
+  }
+
+  @override
+  void dispose() {
+    _eventSub?.cancel();
+    _arService.disposeAR();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -166,6 +205,7 @@ class _ARScreenState extends State<ARScreen> {
               creationParamsCodec: StandardMessageCodec(),
             ),
           ),
+
           // STATUS OVERLAY (top left) – always visible
           Positioned(
             top: 40,
@@ -187,7 +227,8 @@ class _ARScreenState extends State<ARScreen> {
               ),
             ),
           ),
-          // ... (rest of overlays: top bar, scanning UI, wall cards – same as before)
+
+          // Top bar
           SafeArea(
             child: Padding(
               padding: const EdgeInsets.all(12),
@@ -211,13 +252,18 @@ class _ARScreenState extends State<ARScreen> {
               ),
             ),
           ),
-          // ... (scanning overlay and wall cards exact copy from previous version, omitted for brevity)
+
+          // Scanning overlay
           if (_isScanning) ...[
             const Positioned(
               top: 80,
               left: 20,
               right: 20,
-              child: Text('Move your device slowly...', style: TextStyle(color: Colors.white, fontSize: 18), textAlign: TextAlign.center),
+              child: Text(
+                'Move your device slowly around the room...',
+                style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                textAlign: TextAlign.center,
+              ),
             ),
             Positioned(
               bottom: 140,
@@ -231,10 +277,26 @@ class _ARScreenState extends State<ARScreen> {
                     final surface = _scannedSurfaces[index];
                     final excluded = surface.excluded;
                     return ListTile(
-                      leading: Icon(_iconForType(surface.type), color: excluded ? Colors.grey : goldColor),
-                      title: Text('${surface.type} ${index + 1}', style: TextStyle(color: excluded ? Colors.grey : Colors.white)),
-                      subtitle: Text('${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)} m²', style: const TextStyle(color: Colors.white70, fontSize: 12)),
-                      trailing: Switch(value: !excluded, onChanged: (_) => _toggleSurfaceExclusion(surface.id), activeColor: goldColor),
+                      leading: Icon(
+                        _iconForType(surface.type),
+                        color: excluded ? Colors.grey : goldColor,
+                      ),
+                      title: Text(
+                        '${surface.type} ${index + 1}',
+                        style: TextStyle(
+                          color: excluded ? Colors.grey : Colors.white,
+                          decoration: excluded ? TextDecoration.lineThrough : null,
+                        ),
+                      ),
+                      subtitle: Text(
+                        '${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)} m²',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12),
+                      ),
+                      trailing: Switch(
+                        value: !excluded,
+                        onChanged: (_) => _toggleSurfaceExclusion(surface.id),
+                        activeColor: goldColor,
+                      ),
                     );
                   },
                 ),
@@ -245,12 +307,18 @@ class _ARScreenState extends State<ARScreen> {
               left: 40,
               right: 40,
               child: ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: goldColor,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                ),
                 onPressed: _stopScan,
-                child: const Text('Done Scanning'),
+                child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black)),
               ),
             ),
           ],
+
+          // Post-scan wall cards
           if (_hasSnapshot && !_isScanning) ...[
             Positioned(
               bottom: 30,
@@ -269,16 +337,26 @@ class _ARScreenState extends State<ARScreen> {
                       child: Container(
                         width: 140,
                         margin: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(color: goldColor.withOpacity(0.2), borderRadius: BorderRadius.circular(12), border: Border.all(color: goldColor)),
+                        decoration: BoxDecoration(
+                          color: goldColor.withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: goldColor, width: 1),
+                        ),
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Text('Wall ${index + 1}', style: const TextStyle(color: Colors.white)),
+                            Text('Wall ${index + 1}',
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                             const SizedBox(height: 8),
-                            Text('${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)}', style: const TextStyle(color: Colors.white70, fontSize: 12)),
-                            Text('${surface.area.toStringAsFixed(1)} m²', style: const TextStyle(color: goldColor, fontSize: 12)),
+                            Text('${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)}',
+                                style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                            Text('${surface.area.toStringAsFixed(1)} m²',
+                                style: const TextStyle(color: goldColor, fontSize: 12)),
                             const Spacer(),
-                            IconButton(icon: const Icon(Icons.brush, color: Colors.white70), onPressed: () => _enterEraserMode(index)),
+                            IconButton(
+                              icon: const Icon(Icons.brush, color: Colors.white70),
+                              onPressed: () => _enterEraserMode(index),
+                            ),
                           ],
                         ),
                       ),
@@ -288,12 +366,17 @@ class _ARScreenState extends State<ARScreen> {
               ),
             ),
           ],
+
+          // Eraser exit button
           if (_currentWallIndex != null)
             Positioned(
               bottom: 10,
               left: 40,
               right: 40,
-              child: ElevatedButton(onPressed: _exitEraserMode, child: const Text('Exit Eraser')),
+              child: ElevatedButton(
+                onPressed: _exitEraserMode,
+                child: const Text('Exit Eraser'),
+              ),
             ),
         ],
       ),
@@ -302,7 +385,7 @@ class _ARScreenState extends State<ARScreen> {
               onPressed: _startScan,
               backgroundColor: goldColor,
               icon: const Icon(Icons.camera, color: Colors.black),
-              label: const Text('Start Scan', style: TextStyle(color: Colors.black)),
+              label: const Text('Start Scan', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
             )
           : null,
     );
@@ -317,8 +400,35 @@ class _ARScreenState extends State<ARScreen> {
       default: return Icons.help_outline;
     }
   }
-
-  // ... (methods unchanged)
 }
 
-// ... (DetectedSurface, DetectedObject classes unchanged)
+// Supporting models
+class DetectedSurface {
+  final String id;
+  final String type;
+  final double width;
+  final double height;
+  final double area;
+  final bool excluded;
+  DetectedSurface({required this.id, required this.type, required this.width, required this.height, required this.area, this.excluded = false});
+  factory DetectedSurface.fromJson(Map<String, dynamic> json) => DetectedSurface(
+    id: json['id'] as String,
+    type: json['type'] as String,
+    width: (json['width'] as num).toDouble(),
+    height: (json['height'] as num).toDouble(),
+    area: (json['area'] as num).toDouble(),
+    excluded: json['excluded'] as bool? ?? false,
+  );
+}
+
+class DetectedObject {
+  final String id;
+  final String type;
+  final bool excluded;
+  DetectedObject({required this.id, required this.type, this.excluded = false});
+  factory DetectedObject.fromJson(Map<String, dynamic> json) => DetectedObject(
+    id: json['id'] as String,
+    type: json['type'] as String,
+    excluded: json['excluded'] as bool? ?? false,
+  );
+}
