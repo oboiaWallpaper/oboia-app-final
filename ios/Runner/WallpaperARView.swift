@@ -1,5 +1,5 @@
 // WallpaperARView.swift
-// OBOIA – AR View with Diagnostic Boot Event
+// OBOIA – AR View with Diagnostic Boot Event (no duplicate stream handler)
 
 import ARKit
 import SceneKit
@@ -51,8 +51,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         super.init()
 
-        // Immediately emit a boot event to prove we're alive
-        // The event channel will buffer this until Dart attaches.
+        // Set self as the stream handler so onListen is called when Dart attaches.
         eventChannel.setStreamHandler(self)
 
         sceneView.delegate = self
@@ -66,31 +65,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         channel.setMethodCallHandler { [weak self] (call, result) in
             self?.handleMethodCall(call, result)
         }
-
-        // Send boot after everything is ready
-        DispatchQueue.main.async {
-            self.emit("boot", data: ["status": "WallpaperARView initialized"])
-        }
     }
 
     func view() -> UIView {
         return sceneView
-    }
-
-    // MARK: - FlutterStreamHandler (Event Channel)
-
-    private func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        self.eventSink = { event in
-            events(event)
-        }
-        // Send boot again now that Dart is listening (guaranteed delivery)
-        emit("boot", data: ["status": "Dart listener attached"])
-        return nil
-    }
-
-    private func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        eventSink = nil
-        return nil
     }
 
     // MARK: - Method Handler
@@ -145,6 +123,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
     }
 
+    // MARK: - AR Session Control
+
     private func initAR(result: @escaping FlutterResult) {
         do {
             let configuration = ARWorldTrackingConfiguration()
@@ -163,7 +143,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
-    // ... (rest of methods unchanged from the last working version)
     private func setARMode(_ mode: String, result: @escaping FlutterResult) {
         guard let newMode = ARViewMode(rawValue: mode) else {
             result(FlutterError(code: "INVALID_MODE", message: "Unknown mode: \(mode)", details: nil))
@@ -192,6 +171,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
+    // MARK: - Scanning
+
     private func startScan(result: @escaping FlutterResult) {
         guard #available(iOS 17.0, *) else {
             result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required", details: nil))
@@ -201,7 +182,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         let scanner = RoomScanner(arView: sceneView, messenger: nil)
         scanner.setEventSink { [weak self] (event) in
-            self?.eventSink?(event)
+            self?.emit(event["type"] as? String ?? "scanUpdate", data: event["data"] as? [String: Any] ?? [:])
         }
         scanner.start()
         self.roomScanner = scanner
@@ -227,6 +208,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
+    // MARK: - Wallpaper
+
     private func placeWallpaper(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let args = call.arguments as? [String: Any],
               let albedoUrl = args["albedoUrl"] as? String,
@@ -250,19 +233,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             albedoImage = $0
             group.leave()
         }
-
         group.enter()
         textureCache.loadImage(from: normalUrl) {
             normalImage = $0
             group.leave()
         }
-
         group.enter()
         textureCache.loadImage(from: roughnessUrl) {
             roughnessImage = $0
             group.leave()
         }
-
         group.enter()
         textureCache.loadImage(from: aoUrl) {
             aoImage = $0
@@ -271,23 +251,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self, let albedo = albedoImage else {
-                self?.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false, "message": "Failed to load textures"])
+                self?.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false])
                 result(nil)
                 return
             }
-
             let material = SCNMaterial()
             material.diffuse.contents = albedo
-            if let normal = normalImage {
-                material.normal.contents = normal
-                material.normal.intensity = 1.0
-            }
-            if let roughness = roughnessImage {
-                material.roughness.contents = roughness
-            }
-            if let ao = aoImage {
-                material.ambientOcclusion.contents = ao
-            }
+            if let n = normalImage { material.normal.contents = n; material.normal.intensity = 1.0 }
+            if let r = roughnessImage { material.roughness.contents = r }
+            if let a = aoImage { material.ambientOcclusion.contents = a }
             material.locksAmbientWithDiffuse = true
 
             if let node = self.wallNodes[String(wallIndex)] {
@@ -341,16 +313,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func getWallMeasurements(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let wallIndex = (call.arguments as? [String: Any])?["wallIndex"] as? Int else {
-            result(FlutterError(code: "INVALID_ARG", message: "wallIndex required", details: nil))
-            return
-        }
         result([
             "width": 0.0,
             "height": 0.0,
             "sqm": 0.0
         ])
     }
+
+    // MARK: - Eraser
 
     private func enterCutMode(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         isEraserActive = true
@@ -401,6 +371,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         eraserTool.applyMask(to: material)
     }
 
+    // MARK: - Event Emission
+
     private func emit(_ type: String, data: [String: Any] = [:]) {
         if let sink = eventSink {
             sink(["type": type, "data": data])
@@ -435,13 +407,12 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     }
 }
 
-// MARK: - FlutterStreamHandler conformance
+// MARK: - FlutterStreamHandler (single conformance)
 
 extension WallpaperARView: FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        self.eventSink = { event in
-            events(event)
-        }
+        self.eventSink = { event in events(event) }
+        // Send immediate boot
         emit("boot", data: ["status": "Dart listener attached"])
         return nil
     }
