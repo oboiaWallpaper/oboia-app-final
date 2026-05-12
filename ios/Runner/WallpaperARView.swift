@@ -1,6 +1,5 @@
 // WallpaperARView.swift
-// OBOIA — Clean AR Wallpaper Viewer with Eraser
-// iOS 17+ LiDAR. Uses RoomScanner, EraserTool, MeasurementEngine.
+// OBOIA – AR View with Diagnostic Boot Event
 
 import ARKit
 import SceneKit
@@ -16,7 +15,6 @@ enum ARViewMode: String {
 final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private let sceneView: ARSCNView
-    private let messenger: FlutterBinaryMessenger
     private let channel: FlutterMethodChannel
     private let eventChannel: FlutterEventChannel
 
@@ -37,26 +35,28 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
          viewId: Int64,
          messenger: FlutterBinaryMessenger,
          args: Any?) {
-        self.sceneView = ARSCNView(frame: frame)
-        self.messenger = messenger
 
-        self.channel = FlutterMethodChannel(
+        sceneView = ARSCNView(frame: frame)
+        sceneView.automaticallyUpdatesLighting = true
+        sceneView.autoenablesDefaultLighting = true
+
+        channel = FlutterMethodChannel(
             name: "com.oboia/ar",
             binaryMessenger: messenger
         )
-        self.eventChannel = FlutterEventChannel(
+        eventChannel = FlutterEventChannel(
             name: "com.oboia/ar_events",
             binaryMessenger: messenger
         )
 
         super.init()
 
+        // Immediately emit a boot event to prove we're alive
+        // The event channel will buffer this until Dart attaches.
+        eventChannel.setStreamHandler(self)
+
         sceneView.delegate = self
         sceneView.session.delegate = self
-        sceneView.automaticallyUpdatesLighting = true
-        sceneView.autoenablesDefaultLighting = true
-
-        sceneView.debugOptions = [.showFeaturePoints]
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         pan.maximumNumberOfTouches = 1
@@ -66,11 +66,34 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         channel.setMethodCallHandler { [weak self] (call, result) in
             self?.handleMethodCall(call, result)
         }
+
+        // Send boot after everything is ready
+        DispatchQueue.main.async {
+            self.emit("boot", data: ["status": "WallpaperARView initialized"])
+        }
     }
 
     func view() -> UIView {
         return sceneView
     }
+
+    // MARK: - FlutterStreamHandler (Event Channel)
+
+    private func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        self.eventSink = { event in
+            events(event)
+        }
+        // Send boot again now that Dart is listening (guaranteed delivery)
+        emit("boot", data: ["status": "Dart listener attached"])
+        return nil
+    }
+
+    private func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        eventSink = nil
+        return nil
+    }
+
+    // MARK: - Method Handler
 
     private func handleMethodCall(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         switch call.method {
@@ -123,11 +146,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func initAR(result: @escaping FlutterResult) {
-        let configuration = ARWorldTrackingConfiguration()
-        configuration.planeDetection = [.vertical]
-        sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
-        emit("boot", data: ["status": "ready"])
-        result(nil)
+        do {
+            let configuration = ARWorldTrackingConfiguration()
+            configuration.planeDetection = [.vertical]
+            sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+            emit("boot", data: ["status": "AR session running"])
+            result(nil)
+        } catch {
+            emit("error", data: ["message": "Failed to start AR: \(error.localizedDescription)"])
+            result(FlutterError(code: "AR_FAIL", message: error.localizedDescription, details: nil))
+        }
     }
 
     private func disposeAR(result: @escaping FlutterResult) {
@@ -135,6 +163,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
+    // ... (rest of methods unchanged from the last working version)
     private func setARMode(_ mode: String, result: @escaping FlutterResult) {
         guard let newMode = ARViewMode(rawValue: mode) else {
             result(FlutterError(code: "INVALID_MODE", message: "Unknown mode: \(mode)", details: nil))
@@ -170,7 +199,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
         setARMode("scanning") { _ in }
 
-        let scanner = RoomScanner(arView: sceneView, messenger: messenger)
+        let scanner = RoomScanner(arView: sceneView, messenger: nil)
         scanner.setEventSink { [weak self] (event) in
             self?.eventSink?(event)
         }
@@ -373,9 +402,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func emit(_ type: String, data: [String: Any] = [:]) {
-        eventSink?(["type": type, "data": data])
+        if let sink = eventSink {
+            sink(["type": type, "data": data])
+        }
     }
 }
+
+// MARK: - ARSCNViewDelegate / ARSessionDelegate
 
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {}
@@ -401,6 +434,25 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
         emit("wallDetected", data: ["wallIndex": wallId, "type": "vertical"])
     }
 }
+
+// MARK: - FlutterStreamHandler conformance
+
+extension WallpaperARView: FlutterStreamHandler {
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        self.eventSink = { event in
+            events(event)
+        }
+        emit("boot", data: ["status": "Dart listener attached"])
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        self.eventSink = nil
+        return nil
+    }
+}
+
+// MARK: - UIColor Hex Helper
 
 extension UIColor {
     convenience init?(hex: String) {
