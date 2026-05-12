@@ -1,7 +1,7 @@
-// WallpaperARView.swift
-// OBOIA – AR View with Diagnostic Boot Event (final, no duplicate handler, safe casts)
+// WallpaperARView.swift (complete, with camera check)
 
 import ARKit
+import AVFoundation
 import SceneKit
 import Flutter
 import UIKit
@@ -40,18 +40,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.automaticallyUpdatesLighting = true
         sceneView.autoenablesDefaultLighting = true
 
-        channel = FlutterMethodChannel(
-            name: "com.oboia/ar",
-            binaryMessenger: messenger
-        )
-        eventChannel = FlutterEventChannel(
-            name: "com.oboia/ar_events",
-            binaryMessenger: messenger
-        )
+        channel = FlutterMethodChannel(name: "com.oboia/ar", binaryMessenger: messenger)
+        eventChannel = FlutterEventChannel(name: "com.oboia/ar_events", binaryMessenger: messenger)
 
         super.init()
 
-        // Set self as the stream handler so onListen is called when Dart attaches.
         eventChannel.setStreamHandler(self)
 
         sceneView.delegate = self
@@ -67,65 +60,63 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
     }
 
-    func view() -> UIView {
-        return sceneView
-    }
-
-    // MARK: - Method Handler
+    func view() -> UIView { sceneView }
 
     private func handleMethodCall(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         switch call.method {
-        case "initAR":
-            initAR(result: result)
-        case "disposeAR":
-            disposeAR(result: result)
+        case "initAR": initAR(result: result)
+        case "disposeAR": disposeAR(result: result)
         case "setARMode":
-            if let modeStr = call.arguments as? String {
-                setARMode(modeStr, result: result)
-            } else {
-                result(FlutterError(code: "INVALID_ARG", message: "mode required", details: nil))
-            }
-        case "startScan":
-            startScan(result: result)
-        case "stopScan":
-            stopScan(result: result)
-        case "placeWallpaper":
-            placeWallpaper(call, result: result)
-        case "switchWallpaper":
-            switchWallpaper(call, result: result)
-        case "selectWall":
-            selectWall(call, result: result)
-        case "clearWall":
-            clearWall(call, result: result)
-        case "lockWall":
-            lockWall(call, result: result)
-        case "getWallMeasurements":
-            getWallMeasurements(call, result: result)
-        case "enterCutMode":
-            enterCutMode(call, result: result)
-        case "exitCutMode":
-            exitCutMode(result: result)
-        case "setBrushSize":
-            setBrushSize(call, result: result)
-        case "setBrushColor":
-            setBrushColor(call, result: result)
-        case "undoCut":
-            eraserTool.undoStroke()
-            result(nil)
-        case "clearAllCuts":
-            eraserTool.resetMask()
-            applyMaskToCurrentWall()
-            result(nil)
-        case "smartCut", "rectangleCut", "freehandCut", "circleCut":
-            result(nil)
-        default:
-            result(FlutterMethodNotImplemented)
+            if let mode = call.arguments as? String { setARMode(mode, result: result) }
+            else { result(FlutterError(code: "INVALID_ARG", message: "mode required", details: nil)) }
+        case "startScan": startScan(result: result)
+        case "stopScan": stopScan(result: result)
+        case "placeWallpaper": placeWallpaper(call, result: result)
+        case "switchWallpaper": switchWallpaper(call, result: result)
+        case "selectWall": selectWall(call, result: result)
+        case "clearWall": clearWall(call, result: result)
+        case "lockWall": lockWall(call, result: result)
+        case "getWallMeasurements": getWallMeasurements(call, result: result)
+        case "enterCutMode": enterCutMode(call, result: result)
+        case "exitCutMode": exitCutMode(result: result)
+        case "setBrushSize": setBrushSize(call, result: result)
+        case "setBrushColor": setBrushColor(call, result: result)
+        case "undoCut": eraserTool.undoStroke(); result(nil)
+        case "clearAllCuts": eraserTool.resetMask(); applyMaskToCurrentWall(); result(nil)
+        default: result(FlutterMethodNotImplemented)
         }
     }
 
-    // MARK: - AR Session Control
-
     private func initAR(result: @escaping FlutterResult) {
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        if status != .authorized {
+            if status == .notDetermined {
+                AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                    DispatchQueue.main.async {
+                        if granted {
+                            self?.startARSession(result: result)
+                        } else {
+                            self?.emit("error", data: ["message": "Camera access denied by user"])
+                            result(FlutterError(code: "CAMERA_DENIED", message: "Camera access denied", details: nil))
+                        }
+                    }
+                }
+                return
+            } else {
+                emit("error", data: ["message": "Camera access restricted or denied"])
+                result(FlutterError(code: "CAMERA_DENIED", message: "Camera access denied", details: nil))
+                return
+            }
+        }
+        startARSession(result: result)
+    }
+
+    private func startARSession(result: @escaping FlutterResult) {
+        guard ARWorldTrackingConfiguration.isSupported else {
+            emit("error", data: ["message": "ARKit not supported on this device"])
+            result(FlutterError(code: "ARKIT_UNSUPPORTED", message: "ARKit not supported", details: nil))
+            return
+        }
         do {
             let configuration = ARWorldTrackingConfiguration()
             configuration.planeDetection = [.vertical]
@@ -133,14 +124,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             emit("boot", data: ["status": "AR session running"])
             result(nil)
         } catch {
-            emit("error", data: ["message": "Failed to start AR: \(error.localizedDescription)"])
+            emit("error", data: ["message": error.localizedDescription])
             result(FlutterError(code: "AR_FAIL", message: error.localizedDescription, details: nil))
         }
     }
 
     private func disposeAR(result: @escaping FlutterResult) {
-        sceneView.session.pause()
-        result(nil)
+        sceneView.session.pause(); result(nil)
     }
 
     private func setARMode(_ mode: String, result: @escaping FlutterResult) {
@@ -149,7 +139,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             return
         }
         currentMode = newMode
-
         switch newMode {
         case .scanning:
             sceneView.debugOptions = [.showFeaturePoints]
@@ -171,18 +160,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
-    // MARK: - Scanning
-
     private func startScan(result: @escaping FlutterResult) {
         guard #available(iOS 17.0, *) else {
             result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required", details: nil))
             return
         }
         setARMode("scanning") { _ in }
-
         let scanner = RoomScanner(arView: sceneView, messenger: nil)
         scanner.setEventSink { [weak self] (event) in
-            // SAFE CAST: event is a raw Any; cast to [String: Any] to extract fields
             guard let dict = event as? [String: Any] else { return }
             let type = dict["type"] as? String ?? "scanUpdate"
             let data = dict["data"] as? [String: Any] ?? [:]
@@ -194,10 +179,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func stopScan(result: @escaping FlutterResult) {
-        guard let scanner = roomScanner else {
-            result(nil)
-            return
-        }
+        guard let scanner = roomScanner else { result(nil); return }
         scanner.stop { [weak self] snapshot in
             if let snapshot = snapshot,
                let jsonData = try? JSONEncoder().encode(snapshot),
@@ -212,8 +194,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
-    // MARK: - Wallpaper
-
     private func placeWallpaper(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let args = call.arguments as? [String: Any],
               let albedoUrl = args["albedoUrl"] as? String,
@@ -221,7 +201,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(FlutterError(code: "INVALID_ARG", message: "albedoUrl & wallIndex required", details: nil))
             return
         }
-
         let normalUrl = args["normalUrl"] as? String ?? ""
         let roughnessUrl = args["roughnessUrl"] as? String ?? ""
         let aoUrl = args["aoUrl"] as? String ?? ""
@@ -233,25 +212,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var aoImage: UIImage?
 
         group.enter()
-        textureCache.loadImage(from: albedoUrl) {
-            albedoImage = $0
-            group.leave()
-        }
+        textureCache.loadImage(from: albedoUrl) { albedoImage = $0; group.leave() }
         group.enter()
-        textureCache.loadImage(from: normalUrl) {
-            normalImage = $0
-            group.leave()
-        }
+        textureCache.loadImage(from: normalUrl) { normalImage = $0; group.leave() }
         group.enter()
-        textureCache.loadImage(from: roughnessUrl) {
-            roughnessImage = $0
-            group.leave()
-        }
+        textureCache.loadImage(from: roughnessUrl) { roughnessImage = $0; group.leave() }
         group.enter()
-        textureCache.loadImage(from: aoUrl) {
-            aoImage = $0
-            group.leave()
-        }
+        textureCache.loadImage(from: aoUrl) { aoImage = $0; group.leave() }
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self, let albedo = albedoImage else {
@@ -317,23 +284,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func getWallMeasurements(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        result([
-            "width": 0.0,
-            "height": 0.0,
-            "sqm": 0.0
-        ])
+        result(["width": 0.0, "height": 0.0, "sqm": 0.0])
     }
 
-    // MARK: - Eraser
-
     private func enterCutMode(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        isEraserActive = true
-        result(nil)
+        isEraserActive = true; result(nil)
     }
 
     private func exitCutMode(result: @escaping FlutterResult) {
-        isEraserActive = false
-        result(nil)
+        isEraserActive = false; result(nil)
     }
 
     private func setBrushSize(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -353,19 +312,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
         guard isEraserActive else { return }
         let location = gesture.location(in: sceneView)
-
         switch gesture.state {
-        case .began:
-            eraserTool.startStroke(at: location)
-        case .changed:
-            eraserTool.continueStroke(at: location)
-            applyMaskToCurrentWall()
-        case .ended, .cancelled:
-            eraserTool.endStroke()
-            applyMaskToCurrentWall()
-            emit("cutUpdate", data: ["wallIndex": currentWallIndex])
-        default:
-            break
+        case .began: eraserTool.startStroke(at: location)
+        case .changed: eraserTool.continueStroke(at: location); applyMaskToCurrentWall()
+        case .ended, .cancelled: eraserTool.endStroke(); applyMaskToCurrentWall(); emit("cutUpdate", data: ["wallIndex": currentWallIndex])
+        default: break
         }
     }
 
@@ -375,16 +326,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         eraserTool.applyMask(to: material)
     }
 
-    // MARK: - Event Emission
-
     private func emit(_ type: String, data: [String: Any] = [:]) {
-        if let sink = eventSink {
-            sink(["type": type, "data": data])
-        }
+        eventSink?(["type": type, "data": data])
     }
 }
-
-// MARK: - ARSCNViewDelegate / ARSessionDelegate
 
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {}
@@ -393,25 +338,19 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
         guard currentMode == .legacy || currentMode == .preview,
               let planeAnchor = anchor as? ARPlaneAnchor,
               planeAnchor.alignment == .vertical else { return }
-
-        let plane = SCNPlane(width: CGFloat(planeAnchor.extent.x),
-                             height: CGFloat(planeAnchor.extent.z))
+        let plane = SCNPlane(width: CGFloat(planeAnchor.extent.x), height: CGFloat(planeAnchor.extent.z))
         let material = SCNMaterial()
         material.diffuse.contents = UIColor.white.withAlphaComponent(0.3)
         plane.materials = [material]
-
         let planeNode = SCNNode(geometry: plane)
         planeNode.position = SCNVector3(planeAnchor.center.x, planeAnchor.center.y, planeAnchor.center.z)
         planeNode.eulerAngles = SCNVector3(-Float.pi/2, 0, 0)
         node.addChildNode(planeNode)
-
         let wallId = planeAnchor.identifier.uuidString
         wallNodes[wallId] = planeNode
         emit("wallDetected", data: ["wallIndex": wallId, "type": "vertical"])
     }
 }
-
-// MARK: - FlutterStreamHandler (single conformance)
 
 extension WallpaperARView: FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
@@ -421,35 +360,21 @@ extension WallpaperARView: FlutterStreamHandler {
     }
 
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        self.eventSink = nil
-        return nil
+        self.eventSink = nil; return nil
     }
 }
-
-// MARK: - UIColor Hex Helper
 
 extension UIColor {
     convenience init?(hex: String) {
         let r, g, b, a: CGFloat
         let start = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
-        let hexColor = start
-        let scanner = Scanner(string: hexColor)
+        let scanner = Scanner(string: start)
         var hexNumber: UInt64 = 0
         guard scanner.scanHexInt64(&hexNumber) else { return nil }
-
-        switch hexColor.count {
-        case 8:
-            a = CGFloat((hexNumber & 0xff000000) >> 24) / 255
-            r = CGFloat((hexNumber & 0x00ff0000) >> 16) / 255
-            g = CGFloat((hexNumber & 0x0000ff00) >> 8) / 255
-            b = CGFloat(hexNumber & 0x000000ff) / 255
-        case 6:
-            a = 1.0
-            r = CGFloat((hexNumber & 0xff0000) >> 16) / 255
-            g = CGFloat((hexNumber & 0x00ff00) >> 8) / 255
-            b = CGFloat(hexNumber & 0x0000ff) / 255
-        default:
-            return nil
+        switch start.count {
+        case 8: r = CGFloat((hexNumber & 0xff000000) >> 24) / 255; g = CGFloat((hexNumber & 0x00ff0000) >> 16) / 255; b = CGFloat((hexNumber & 0x0000ff00) >> 8) / 255; a = CGFloat(hexNumber & 0x000000ff) / 255
+        case 6: r = CGFloat((hexNumber & 0xff0000) >> 16) / 255; g = CGFloat((hexNumber & 0x00ff00) >> 8) / 255; b = CGFloat(hexNumber & 0x0000ff) / 255; a = 1.0
+        default: return nil
         }
         self.init(red: r, green: g, blue: b, alpha: a)
     }
