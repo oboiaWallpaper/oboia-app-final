@@ -1,11 +1,10 @@
 // lib/screens/ar/ar_screen.dart
-// OBOIA – AR Screen with in‑line scanning, status overlay, and eraser
+// OBOIA – AR Screen (no external permission_handler)
 
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:permission_handler/permission_handler.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
@@ -33,41 +32,31 @@ class _ARScreenState extends State<ARScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
 
-  // Camera state
-  bool _cameraReady = false;
-  bool _permissionDenied = false;
-
-  // Native status
+  // State
+  bool _arInitialized = false;
   String _nativeStatus = "Initializing...";
-  final List<String> _logLines = [];
+  List<String> _logLines = [];
 
-  // Scanning state
   bool _isScanning = false;
   bool _hasSnapshot = false;
   List<DetectedSurface> _scannedSurfaces = [];
   List<DetectedObject> _scannedObjects = [];
-
-  // Eraser state
   int? _currentWallIndex;
 
   @override
   void initState() {
     super.initState();
-    _requestCameraAndStart();
-  }
-
-  Future<void> _requestCameraAndStart() async {
-    final status = await Permission.camera.request();
-    if (status.isGranted) {
-      await _initAR();
-      setState(() => _cameraReady = true);
-    } else {
-      setState(() => _permissionDenied = true);
-    }
+    _initAR();
   }
 
   Future<void> _initAR() async {
-    await _arService.initAR();
+    try {
+      await _arService.initAR();
+      setState(() => _arInitialized = true);
+    } catch (e) {
+      setState(() => _nativeStatus = "AR init failed: $e");
+      _logLines.add('[ERROR] AR init failed: $e');
+    }
     _eventSub = _arService.events.listen(_onAREvent);
   }
 
@@ -77,7 +66,7 @@ class _ARScreenState extends State<ARScreen> {
       setState(() {
         _nativeStatus = msg.toString();
         _logLines.add('[BOOT] $msg');
-        if (_logLines.length > 10) _logLines.removeAt(0);
+        if (_logLines.length > 20) _logLines.removeAt(0);
       });
       return;
     }
@@ -86,7 +75,7 @@ class _ARScreenState extends State<ARScreen> {
       setState(() {
         _nativeStatus = 'ERROR: $msg';
         _logLines.add('[ERROR] $msg');
-        if (_logLines.length > 10) _logLines.removeAt(0);
+        if (_logLines.length > 20) _logLines.removeAt(0);
       });
       return;
     }
@@ -164,40 +153,11 @@ class _ARScreenState extends State<ARScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_cameraReady) {
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(
-          child: _permissionDenied
-              ? Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.no_photography, size: 64, color: Colors.white54),
-                    const SizedBox(height: 16),
-                    const Text('Camera permission is required.', style: TextStyle(color: Colors.white)),
-                    const SizedBox(height: 16),
-                    ElevatedButton(
-                      onPressed: () async {
-                        await openAppSettings();
-                        Navigator.of(context).pop();
-                      },
-                      child: const Text('Open Settings'),
-                    ),
-                    TextButton(
-                      onPressed: () => Navigator.of(context).pop(),
-                      child: const Text('Go Back', style: TextStyle(color: Colors.white70)),
-                    ),
-                  ],
-                )
-              : const CircularProgressIndicator(color: goldColor),
-        ),
-      );
-    }
-
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Stack(
         children: [
+          // AR Camera View
           const Positioned.fill(
             child: UiKitView(
               viewType: 'com.oboia/ar_view',
@@ -206,12 +166,12 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // STATUS OVERLAY (top left) – always visible
+          // Status overlay – always visible
           Positioned(
             top: 40,
             left: 10,
             child: Container(
-              width: MediaQuery.of(context).size.width * 0.7,
+              width: MediaQuery.of(context).size.width * 0.75,
               padding: const EdgeInsets.all(8),
               color: Colors.black54,
               child: Column(
@@ -260,8 +220,8 @@ class _ARScreenState extends State<ARScreen> {
               left: 20,
               right: 20,
               child: Text(
-                'Move your device slowly around the room...',
-                style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                'Move slowly around the room...',
+                style: TextStyle(color: Colors.white, fontSize: 18),
                 textAlign: TextAlign.center,
               ),
             ),
@@ -277,26 +237,10 @@ class _ARScreenState extends State<ARScreen> {
                     final surface = _scannedSurfaces[index];
                     final excluded = surface.excluded;
                     return ListTile(
-                      leading: Icon(
-                        _iconForType(surface.type),
-                        color: excluded ? Colors.grey : goldColor,
-                      ),
-                      title: Text(
-                        '${surface.type} ${index + 1}',
-                        style: TextStyle(
-                          color: excluded ? Colors.grey : Colors.white,
-                          decoration: excluded ? TextDecoration.lineThrough : null,
-                        ),
-                      ),
-                      subtitle: Text(
-                        '${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)} m²',
-                        style: const TextStyle(color: Colors.white70, fontSize: 12),
-                      ),
-                      trailing: Switch(
-                        value: !excluded,
-                        onChanged: (_) => _toggleSurfaceExclusion(surface.id),
-                        activeColor: goldColor,
-                      ),
+                      leading: Icon(_iconForType(surface.type), color: excluded ? Colors.grey : goldColor),
+                      title: Text('${surface.type} ${index + 1}', style: TextStyle(color: excluded ? Colors.grey : Colors.white)),
+                      subtitle: Text('${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)} m²', style: const TextStyle(color: Colors.white70)),
+                      trailing: Switch(value: !excluded, onChanged: (_) => _toggleSurfaceExclusion(surface.id), activeColor: goldColor),
                     );
                   },
                 ),
@@ -307,19 +251,15 @@ class _ARScreenState extends State<ARScreen> {
               left: 40,
               right: 40,
               child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: goldColor,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                ),
+                style: ElevatedButton.styleFrom(backgroundColor: goldColor),
                 onPressed: _stopScan,
-                child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black)),
+                child: const Text('Done Scanning'),
               ),
             ),
           ],
 
-          // Post-scan wall cards
-          if (_hasSnapshot && !_isScanning) ...[
+          // Post‑scan wall cards
+          if (_hasSnapshot && !_isScanning)
             Positioned(
               bottom: 30,
               left: 10,
@@ -337,26 +277,14 @@ class _ARScreenState extends State<ARScreen> {
                       child: Container(
                         width: 140,
                         margin: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: goldColor.withOpacity(0.2),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: goldColor, width: 1),
-                        ),
+                        decoration: BoxDecoration(color: goldColor.withOpacity(0.2), borderRadius: BorderRadius.circular(12), border: Border.all(color: goldColor)),
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Text('Wall ${index + 1}',
-                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                            const SizedBox(height: 8),
-                            Text('${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)}',
-                                style: const TextStyle(color: Colors.white70, fontSize: 12)),
-                            Text('${surface.area.toStringAsFixed(1)} m²',
-                                style: const TextStyle(color: goldColor, fontSize: 12)),
-                            const Spacer(),
-                            IconButton(
-                              icon: const Icon(Icons.brush, color: Colors.white70),
-                              onPressed: () => _enterEraserMode(index),
-                            ),
+                            Text('Wall ${index + 1}', style: const TextStyle(color: Colors.white)),
+                            Text('${surface.width.toStringAsFixed(1)} × ${surface.height.toStringAsFixed(1)}', style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                            Text('${surface.area.toStringAsFixed(1)} m²', style: const TextStyle(color: goldColor, fontSize: 12)),
+                            IconButton(icon: const Icon(Icons.brush, color: Colors.white70), onPressed: () => _enterEraserMode(index)),
                           ],
                         ),
                       ),
@@ -365,18 +293,13 @@ class _ARScreenState extends State<ARScreen> {
                 ),
               ),
             ),
-          ],
 
-          // Eraser exit button
           if (_currentWallIndex != null)
             Positioned(
               bottom: 10,
               left: 40,
               right: 40,
-              child: ElevatedButton(
-                onPressed: _exitEraserMode,
-                child: const Text('Exit Eraser'),
-              ),
+              child: ElevatedButton(onPressed: _exitEraserMode, child: const Text('Exit Eraser')),
             ),
         ],
       ),
@@ -384,8 +307,7 @@ class _ARScreenState extends State<ARScreen> {
           ? FloatingActionButton.extended(
               onPressed: _startScan,
               backgroundColor: goldColor,
-              icon: const Icon(Icons.camera, color: Colors.black),
-              label: const Text('Start Scan', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+              label: const Text('Start Scan', style: TextStyle(color: Colors.black)),
             )
           : null,
     );
@@ -402,7 +324,6 @@ class _ARScreenState extends State<ARScreen> {
   }
 }
 
-// Supporting models
 class DetectedSurface {
   final String id;
   final String type;
