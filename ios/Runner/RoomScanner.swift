@@ -61,7 +61,6 @@ final class RoomScanner: NSObject {
         let session = RoomCaptureSession()
 
         var config = RoomCaptureSession.Configuration()
-        config.isTexturingEnabled = true
         config.isCoachingEnabled = true
         session.run(configuration: config)
 
