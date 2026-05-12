@@ -1,5 +1,5 @@
 // WallpaperARView.swift
-// OBOIA – AR View with Diagnostic Boot Event (no duplicate stream handler)
+// OBOIA – AR View with Diagnostic Boot Event (final, no duplicate handler, safe casts)
 
 import ARKit
 import SceneKit
@@ -182,7 +182,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         let scanner = RoomScanner(arView: sceneView, messenger: nil)
         scanner.setEventSink { [weak self] (event) in
-            self?.emit(event["type"] as? String ?? "scanUpdate", data: event["data"] as? [String: Any] ?? [:])
+            // SAFE CAST: event is a raw Any; cast to [String: Any] to extract fields
+            guard let dict = event as? [String: Any] else { return }
+            let type = dict["type"] as? String ?? "scanUpdate"
+            let data = dict["data"] as? [String: Any] ?? [:]
+            self?.emit(type, data: data)
         }
         scanner.start()
         self.roomScanner = scanner
@@ -412,7 +416,6 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
 extension WallpaperARView: FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         self.eventSink = { event in events(event) }
-        // Send immediate boot
         emit("boot", data: ["status": "Dart listener attached"])
         return nil
     }
