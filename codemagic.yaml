@@ -13,6 +13,9 @@ workflows:
       xcode: latest
       cocoapods: default
     scripts:
+      - name: Set CocoaPods version (stable)
+        script: gem install cocoapods -v 1.15.2 --no-doc
+
       - name: Set up code signing
         script: |
           keychain initialize
@@ -30,7 +33,6 @@ workflows:
           project = Xcodeproj::Project.open('ios/Runner.xcodeproj')
           target = project.targets.find { |t| t.name == 'Runner' }
 
-          # Files to remove from compilation (old names)
           unwanted = [
             'ARWallpaperView.swift',
             'CutModeOverlay.swift',
@@ -38,7 +40,6 @@ workflows:
             'RoomScanController.swift'
           ]
 
-          # Remove from all build phases that contain files
           target.build_phases.each do |phase|
             next unless phase.respond_to?(:files)
             phase.files.to_a.each do |build_file|
@@ -49,7 +50,6 @@ workflows:
             end
           end
 
-          # Add new files to the main group and compile phase
           group = project.main_group['Runner']
           wanted = [
             'WallpaperARView.swift',
