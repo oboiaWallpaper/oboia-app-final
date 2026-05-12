@@ -1,0 +1,102 @@
+workflows:
+  ios-workflow:
+    name: iOS Workflow
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    integrations:
+      app_store_connect: Codemagic
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.oboia.app
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Set up code signing
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files com.oboia.app \
+            --type IOS_APP_STORE \
+            --create
+          keychain add-certificates
+          xcode-project use-profiles
+
+      - name: Register AR Swift files (clean old + add new)
+        script: |
+          gem install xcodeproj --quiet
+          ruby << 'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('ios/Runner.xcodeproj')
+          target = project.targets.find { |t| t.name == 'Runner' }
+
+          # Files to remove from compilation (old names)
+          unwanted = [
+            'ARWallpaperView.swift',
+            'CutModeOverlay.swift',
+            'WallpaperCutTool.swift',
+            'RoomScanController.swift'
+          ]
+
+          # Remove from all build phases that contain files
+          target.build_phases.each do |phase|
+            next unless phase.respond_to?(:files)
+            phase.files.to_a.each do |build_file|
+              path = build_file.file_ref&.path
+              if path && unwanted.include?(path)
+                phase.remove_build_file(build_file)
+              end
+            end
+          end
+
+          # Add new files to the main group and compile phase
+          group = project.main_group['Runner']
+          wanted = [
+            'WallpaperARView.swift',
+            'ARWallpaperViewFactory.swift',
+            'TextureCache.swift',
+            'EraserTool.swift',
+            'MeasurementEngine.swift',
+            'ManualWallSelector.swift',
+            'RoomScanner.swift'
+          ]
+          wanted.each do |filename|
+            unless group.children.any? { |c| c.respond_to?(:path) && c.path == filename }
+              ref = group.new_file(filename)
+              target.source_build_phase.add_file_reference(ref)
+            end
+          end
+
+          project.save
+          RUBY
+
+      - name: Set iOS 17 minimum deployment target
+        script: |
+          ruby << 'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('ios/Runner.xcodeproj')
+          project.targets.each do |target|
+            target.build_configurations.each do |config|
+              config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '17.0'
+            end
+          end
+          project.save
+          puts 'Set deployment target to iOS 17.0'
+          RUBY
+          sed -i '' 's/platform :ios, .*/platform :ios, '\''17.0'\''/' ios/Podfile
+
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Build iOS
+        script: |
+          flutter build ipa --release \
+            --export-options-plist=/Users/builder/export_options.plist
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
