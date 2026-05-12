@@ -41,6 +41,9 @@ class _ARScreenState extends State<ARScreen> {
 
   int? _currentWallIndex;
 
+  /// Collect error messages from native to display on screen
+  final List<String> _errorMessages = [];
+
   @override
   void initState() {
     super.initState();
@@ -53,6 +56,13 @@ class _ARScreenState extends State<ARScreen> {
   }
 
   void _onAREvent(AREvent event) {
+    if (event.type == 'error') {
+      final msg = event.errorMessage ?? 'Unknown native error';
+      _errorMessages.add('[${DateTime.now().toString().substring(11,19)}] $msg');
+      if (_errorMessages.length > 20) _errorMessages.removeAt(0);
+      setState(() {});
+      return;
+    }
     if (event.type == 'scanUpdate') {
       final dataStr = event.data['data'] as String? ?? '';
       if (dataStr.isNotEmpty) {
@@ -101,12 +111,10 @@ class _ARScreenState extends State<ARScreen> {
 
   Future<void> _stopScan() async {
     await _arService.stopScan();
-    // scanComplete event will handle the rest
   }
 
   void _toggleSurfaceExclusion(String id) {
     _arService.toggleSurfaceExclusion(id);
-    // UI updates on next scanUpdate
   }
 
   void _enterEraserMode(int wallIndex) {
@@ -133,12 +141,31 @@ class _ARScreenState extends State<ARScreen> {
       backgroundColor: Colors.transparent,
       body: Stack(
         children: [
-          // Native AR view (always visible, behind everything)
-          const UiKitView(
-            viewType: 'com.oboia/ar_view',
-            creationParams: <String, dynamic>{},
-            creationParamsCodec: StandardMessageCodec(),
+          // Native AR view – fill the entire screen
+          const Positioned.fill(
+            child: UiKitView(
+              viewType: 'com.oboia/ar_view',
+              creationParams: <String, dynamic>{},
+              creationParamsCodec: StandardMessageCodec(),
+            ),
           ),
+
+          // Debug error overlay (top left)
+          if (_errorMessages.isNotEmpty)
+            Positioned(
+              top: 60,
+              left: 10,
+              child: Container(
+                width: MediaQuery.of(context).size.width * 0.6,
+                padding: const EdgeInsets.all(8),
+                color: Colors.black54,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: _errorMessages.map((msg) => Text(msg, style: const TextStyle(color: Colors.red, fontSize: 10))).toList(),
+                ),
+              ),
+            ),
+
           // Top bar with wallpaper info and back button
           SafeArea(
             child: Padding(
@@ -166,7 +193,6 @@ class _ARScreenState extends State<ARScreen> {
 
           // SCANNING OVERLAY
           if (_isScanning) ...[
-            // Coaching message
             const Positioned(
               top: 80,
               left: 20,
@@ -177,7 +203,6 @@ class _ARScreenState extends State<ARScreen> {
                 textAlign: TextAlign.center,
               ),
             ),
-            // Surface list (doors/windows/objects)
             Positioned(
               bottom: 140,
               left: 0,
@@ -215,7 +240,6 @@ class _ARScreenState extends State<ARScreen> {
                 ),
               ),
             ),
-            // Done button
             Positioned(
               bottom: 50,
               left: 40,
@@ -281,7 +305,7 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ],
 
-          // If eraser mode is active, show a hint / close button
+          // Eraser exit button
           if (_currentWallIndex != null)
             Positioned(
               bottom: 10,
@@ -316,7 +340,6 @@ class _ARScreenState extends State<ARScreen> {
   }
 }
 
-// Minimal models for UI (mirrors native)
 class DetectedSurface {
   final String id;
   final String type;
