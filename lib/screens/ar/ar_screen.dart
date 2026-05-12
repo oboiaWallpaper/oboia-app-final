@@ -1,11 +1,11 @@
 // lib/screens/ar/ar_screen.dart
-// OBOIA – AR Screen with in‑line scanning & wallpaper placement
-// Camera always visible; scan UI overlays; eraser available after walls detected.
+// OBOIA – AR Screen with camera permission handling and pre‑camera UI.
 
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
@@ -33,21 +33,31 @@ class _ARScreenState extends State<ARScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
 
-  // State
+  // UI states
+  bool _cameraReady = false;
+  bool _permissionDenied = false;
   bool _isScanning = false;
   bool _hasSnapshot = false;
   List<DetectedSurface> _scannedSurfaces = [];
   List<DetectedObject> _scannedObjects = [];
-
   int? _currentWallIndex;
 
-  /// Collect error messages from native to display on screen
   final List<String> _errorMessages = [];
 
   @override
   void initState() {
     super.initState();
-    _initAR();
+    _requestCameraAndStart();
+  }
+
+  Future<void> _requestCameraAndStart() async {
+    final status = await Permission.camera.request();
+    if (status.isGranted) {
+      await _initAR();
+      setState(() => _cameraReady = true);
+    } else {
+      setState(() => _permissionDenied = true);
+    }
   }
 
   Future<void> _initAR() async {
@@ -81,7 +91,6 @@ class _ARScreenState extends State<ARScreen> {
         _isScanning = false;
         _hasSnapshot = true;
       });
-      // Auto-apply wallpaper to all non-excluded walls
       for (int i = 0; i < _scannedSurfaces.length; i++) {
         if (!_scannedSurfaces[i].excluded && _scannedSurfaces[i].type == 'wall') {
           _arService.placeWallpaper(
@@ -137,11 +146,43 @@ class _ARScreenState extends State<ARScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Show a friendly UI until camera permission is granted
+    if (!_cameraReady) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: _permissionDenied
+              ? Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.no_photography, size: 64, color: Colors.white54),
+                    const SizedBox(height: 16),
+                    const Text('Camera permission is required for AR.',
+                        style: TextStyle(color: Colors.white)),
+                    const SizedBox(height: 16),
+                    ElevatedButton(
+                      onPressed: () async {
+                        await openAppSettings();
+                        Navigator.of(context).pop(); // go back and retry
+                      },
+                      child: const Text('Open Settings'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Go Back', style: TextStyle(color: Colors.white70)),
+                    ),
+                  ],
+                )
+              : const CircularProgressIndicator(color: goldColor),
+        ),
+      );
+    }
+
+    // Camera ready – show AR view with overlays
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Stack(
         children: [
-          // Native AR view – fill the entire screen
           const Positioned.fill(
             child: UiKitView(
               viewType: 'com.oboia/ar_view',
@@ -150,7 +191,7 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // Debug error overlay (top left)
+          // Debug error overlay
           if (_errorMessages.isNotEmpty)
             Positioned(
               top: 60,
@@ -161,12 +202,14 @@ class _ARScreenState extends State<ARScreen> {
                 color: Colors.black54,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: _errorMessages.map((msg) => Text(msg, style: const TextStyle(color: Colors.red, fontSize: 10))).toList(),
+                  children: _errorMessages
+                      .map((msg) => Text(msg, style: const TextStyle(color: Colors.red, fontSize: 10)))
+                      .toList(),
                 ),
               ),
             ),
 
-          // Top bar with wallpaper info and back button
+          // Top bar
           SafeArea(
             child: Padding(
               padding: const EdgeInsets.all(12),
@@ -191,7 +234,7 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // SCANNING OVERLAY
+          // Scanning overlay
           if (_isScanning) ...[
             const Positioned(
               top: 80,
@@ -256,7 +299,7 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ],
 
-          // AFTER SCAN – WALL CARDS
+          // Post‑scan wall cards
           if (_hasSnapshot && !_isScanning) ...[
             Positioned(
               bottom: 30,
@@ -305,7 +348,6 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ],
 
-          // Eraser exit button
           if (_currentWallIndex != null)
             Positioned(
               bottom: 10,
