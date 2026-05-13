@@ -1,558 +1,400 @@
-// lib/services/ar_service.dart
-//
-// Dart-side bridge to native ARKit (iOS) / ARCore (Android) wallpaper renderer.
-//
-// v2.0 (May 2026) — bulletproof event bridge:
-//   - Native events are buffered until the FIRST Dart listener attaches,
-//     so the boot beacon never gets silently dropped.
-//   - Every event is also captured into a circular ring buffer of the last
-//     500 lines, accessible via ARService.instance.recentLogs.
-//   - Logs are also appended to Documents/oboia-debug.log on every event,
-//     surviving app restarts.
-//   - DiagnosticLog.dump() returns the entire ring buffer as a String for
-//     on-screen display.
+// lib/screens/ar/ar_screen.dart
+// OBOIA – AR Screen (final, all bugs fixed)
 
 import 'dart:async';
-import 'dart:collection';
-import 'dart:io';
-import 'package:flutter/foundation.dart';
+import 'dart:convert';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
+import '../../services/ar_service.dart';
+import '../../models/wallpaper_model.dart';
+import '../../models/shop_model.dart';
 
-import '../models/wallpaper_model.dart';
+const Color goldColor = Color(0xFFFFD369);
 
-// ─────────────────────────────────────────────────────────────────────────
-// DIAGNOSTIC LOG — global, never throws, always available
-// ─────────────────────────────────────────────────────────────────────────
+class ARScreen extends StatefulWidget {
+  final WallpaperModel wallpaper;
+  final double pricePerRoll;
 
-/// Global diagnostic log. Captures every meaningful event in the AR pipeline.
-/// Three sinks for redundancy:
-///  1) In-memory ring buffer (last 500 entries) — for on-screen viewer
-///  2) debugPrint — flows to Flutter overlay + IDE + Codemagic build log
-///  3) On-disk file: Documents/oboia-debug.log — survives app crashes
-///
-/// All sinks are best-effort. If file write fails, others continue.
-class DiagnosticLog {
-  DiagnosticLog._();
-  static final DiagnosticLog instance = DiagnosticLog._();
+  ARScreen({
+    super.key,
+    WallpaperModel? initialWallpaper,
+    ShopModel? initialShop,
+    double? pricePerRoll,
+  }) : assert(initialWallpaper != null, 'A wallpaper must be provided'),
+       wallpaper = initialWallpaper!,
+       pricePerRoll = pricePerRoll ?? 0.0;
 
-  static const int _maxEntries = 500;
-  final Queue<String> _ring = Queue<String>();
-  File? _file;
-  bool _fileInitInFlight = false;
-  bool _fileInitFailed = false;
+  @override
+  State<ARScreen> createState() => _ARScreenState();
+}
 
-  /// Add a line to all sinks. Format: HH:mm:ss.SSS [tag] message.
-  void log(String tag, String message) {
-    final ts = _timestamp();
-    final line = '$ts [$tag] $message';
+class _ARScreenState extends State<ARScreen> {
+  final ARService _arService = ARService.instance;
+  StreamSubscription<AREvent>? _eventSub;
 
-    // Sink 1: ring buffer (for on-screen viewer)
-    _ring.addLast(line);
-    while (_ring.length > _maxEntries) {
-      _ring.removeFirst();
-    }
+  String _nativeStatus = "Initializing...";
+  final List<String> _logLines = [];
 
-    // Sink 2: debugPrint (Flutter overlay, IDE)
-    debugPrint(line);
+  bool _isScanning = false;
+  bool _hasSnapshot = false;
+  List<DetectedSurface> _scannedSurfaces = [];
+  int? _currentWallIndex;
 
-    // Sink 3: file (best effort, async, never blocks)
-    _appendToFile(line);
+  @override
+  void initState() {
+    super.initState();
+    _initAR();
   }
 
-  String _timestamp() {
-    final now = DateTime.now();
-    String pad(int n, [int w = 2]) => n.toString().padLeft(w, '0');
-    return '${pad(now.hour)}:${pad(now.minute)}:${pad(now.second)}.${pad(now.millisecond, 3)}';
-  }
-
-  Future<void> _appendToFile(String line) async {
-    if (_fileInitFailed) return;
+  Future<void> _initAR() async {
     try {
-      _file ??= await _initFile();
-      if (_file == null) return;
-      await _file!.writeAsString('$line\n', mode: FileMode.append, flush: false);
-    } catch (_) {
-      // Don't let file errors break logging. Subsequent calls will retry init.
-    }
-  }
-
-  Future<File?> _initFile() async {
-    if (_fileInitInFlight) return null;
-    _fileInitInFlight = true;
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final f = File('${dir.path}/oboia-debug.log');
-      // Truncate to keep it bounded across launches; comment this line if you want growing log.
-      if (await f.exists() && (await f.length()) > 1024 * 1024) {
-        await f.writeAsString(''); // reset if >1MB
-      }
-      _fileInitInFlight = false;
-      return f;
-    } catch (_) {
-      _fileInitFailed = true;
-      _fileInitInFlight = false;
-      return null;
-    }
-  }
-
-  /// Snapshot of the current ring buffer as a single string. Newest at the bottom.
-  String dump() {
-    return _ring.join('\n');
-  }
-
-  /// Clear the in-memory ring buffer (file is untouched).
-  void clear() {
-    _ring.clear();
-  }
-
-  /// Read entire on-disk log file as a string. Returns empty if no file yet.
-  Future<String> readFileLog() async {
-    try {
-      final f = _file ?? await _initFile();
-      if (f == null) return '';
-      if (!await f.exists()) return '';
-      return await f.readAsString();
+      // Wait for native platform view to be fully created
+      await Future.delayed(const Duration(milliseconds: 1200));
+      await _arService.initAR();
     } catch (e) {
-      return '(failed to read log file: $e)';
+      _logLines.insert(0, 'Init error: $e');
+      setState(() => _nativeStatus = 'Init error: $e');
+    }
+    _eventSub = _arService.events.listen(_onAREvent);
+  }
+
+  void _onAREvent(AREvent event) {
+    if (event.type == 'boot') {
+      final msg = event.data['status'] ?? 'boot';
+      setState(() {
+        _nativeStatus = msg.toString();
+        _logLines.insert(0, '[BOOT] $msg');
+        if (_logLines.length > 10) _logLines.removeLast();
+      });
+    } else if (event.type == 'error') {
+      final msg = event.errorMessage ?? 'Unknown error';
+      setState(() {
+        _nativeStatus = 'ERROR: $msg';
+        _logLines.insert(0, '[ERROR] $msg');
+        if (_logLines.length > 10) _logLines.removeLast();
+      });
+    } else if (event.type == 'scanUpdate') {
+      final dataStr = event.data['data'] as String? ?? '';
+      if (dataStr.isNotEmpty) {
+        try {
+          final Map<String, dynamic> json = jsonDecode(dataStr);
+          final List<dynamic> surfaceList = json['surfaces'] ?? [];
+          setState(() {
+            _scannedSurfaces = surfaceList.map((e) => DetectedSurface.fromJson(e)).toList();
+          });
+        } catch (_) {}
+      }
+    } else if (event.type == 'scanComplete') {
+      setState(() {
+        _isScanning = false;
+        _hasSnapshot = true;
+      });
+    } else if (event.type == 'wallpaperPlaced') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Wallpaper applied to wall ${event.wallIndex}')),
+      );
     }
   }
-}
 
-/// Convenience top-level logger.
-void dlog(String tag, String message) {
-  DiagnosticLog.instance.log(tag, message);
-}
+  Future<void> _startScan() async {
+    setState(() {
+      _isScanning = true;
+      _hasSnapshot = false;
+      _scannedSurfaces.clear();
+    });
+    await _arService.setARMode('scanning');
+    await _arService.startScan();
+  }
 
-// ─────────────────────────────────────────────────────────────────────────
-// AR EVENT MODEL
-// ─────────────────────────────────────────────────────────────────────────
+  Future<void> _stopScan() async {
+    await _arService.stopScan();
+  }
 
-class AREvent {
-  final String type;
-  final Map<String, dynamic> data;
+  void _toggleSurfaceExclusion(String id) {
+    _arService.toggleSurfaceExclusion(id);
+  }
 
-  const AREvent({required this.type, required this.data});
+  void _enterEraserMode(int wallIndex) {
+    setState(() => _currentWallIndex = wallIndex);
+    _arService.selectWall(wallIndex);
+    _arService.enterCutMode(wallIndex);
+  }
 
-  factory AREvent.fromMap(Map<String, dynamic> map) {
-    final raw = map['data'];
-    final Map<String, dynamic> data = raw is Map
-        ? raw.map((k, v) => MapEntry(k.toString(), v))
-        : <String, dynamic>{};
-    return AREvent(
-      type: (map['type'] ?? '').toString(),
-      data: data,
+  void _exitEraserMode() {
+    setState(() => _currentWallIndex = null);
+    _arService.exitCutMode();
+  }
+
+  @override
+  void dispose() {
+    _eventSub?.cancel();
+    _arService.disposeAR();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          // LAYER 0: Native AR view (background)
+          Positioned.fill(
+            child: UiKitView(
+              viewType: 'com.oboia/ar_view',
+              creationParams: const <String, dynamic>{},
+              creationParamsCodec: const StandardMessageCodec(),
+            ),
+          ),
+
+          // LAYER 1: Back button (always visible)
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 8,
+            left: 8,
+            child: IconButton(
+              icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 24),
+              style: IconButton.styleFrom(backgroundColor: Colors.black54),
+              onPressed: () => Navigator.of(context).pop(),
+            ),
+          ),
+
+          // LAYER 2: Status overlay
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 44,
+            left: 16,
+            right: 16,
+            child: IgnorePointer(
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                color: Colors.black54,
+                child: Text(
+                  'Status: $_nativeStatus',
+                  style: const TextStyle(color: Colors.greenAccent, fontSize: 11),
+                ),
+              ),
+            ),
+          ),
+
+          // LAYER 3: Top info bar
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(48, 12, 12, 12),
+              child: Row(
+                children: [
+                  const Spacer(),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(widget.wallpaper.name,
+                          style: const TextStyle(color: Colors.white, fontSize: 16)),
+                      Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll',
+                          style: const TextStyle(color: goldColor, fontSize: 12)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // LAYER 4: Scanning UI
+          if (_isScanning) ...[
+            const Positioned(
+              top: 100,
+              left: 20,
+              right: 20,
+              child: Text(
+                'Move slowly around the room...',
+                style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                textAlign: TextAlign.center,
+              ),
+            ),
+            Positioned(
+              bottom: 140,
+              left: 0,
+              right: 0,
+              child: SizedBox(
+                height: 200,
+                child: ListView.builder(
+                  itemCount: _scannedSurfaces.length,
+                  itemBuilder: (context, index) {
+                    final s = _scannedSurfaces[index];
+                    final excluded = s.excluded;
+                    return ListTile(
+                      leading: Icon(
+                        _iconForType(s.type),
+                        color: excluded ? Colors.grey : goldColor,
+                      ),
+                      title: Text(
+                        '${s.type} ${index + 1}',
+                        style: TextStyle(
+                          color: excluded ? Colors.grey : Colors.white,
+                          decoration: excluded ? TextDecoration.lineThrough : null,
+                        ),
+                      ),
+                      subtitle: Text(
+                        '${s.width.toStringAsFixed(1)} × ${s.height.toStringAsFixed(1)} m²',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12),
+                      ),
+                      trailing: Switch(
+                        value: !excluded,
+                        onChanged: (_) => _toggleSurfaceExclusion(s.id),
+                        activeColor: goldColor,
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+            Positioned(
+              bottom: 50,
+              left: 40,
+              right: 40,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: goldColor,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                ),
+                onPressed: _stopScan,
+                child: const Text('Done Scanning',
+                    style: TextStyle(fontSize: 18, color: Colors.black)),
+              ),
+            ),
+          ],
+
+          // LAYER 5: Wall cards after scan
+          if (_hasSnapshot && !_isScanning)
+            Positioned(
+              bottom: 30,
+              left: 10,
+              right: 10,
+              child: SizedBox(
+                height: 160,
+                child: ListView.builder(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: _scannedSurfaces.length,
+                  itemBuilder: (context, index) {
+                    final s = _scannedSurfaces[index];
+                    if (s.type != 'wall') return const SizedBox.shrink();
+                    return GestureDetector(
+                      onTap: () => _enterEraserMode(index),
+                      child: Container(
+                        width: 140,
+                        margin: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: goldColor.withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: goldColor, width: 1),
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text('Wall ${index + 1}',
+                                style: const TextStyle(
+                                    color: Colors.white, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 8),
+                            Text(
+                              '${s.width.toStringAsFixed(1)} × ${s.height.toStringAsFixed(1)}',
+                              style: const TextStyle(color: Colors.white70, fontSize: 12),
+                            ),
+                            Text('${s.area.toStringAsFixed(1)} m²',
+                                style: const TextStyle(color: goldColor, fontSize: 12)),
+                            const Spacer(),
+                            IconButton(
+                              icon: const Icon(Icons.brush, color: Colors.white70),
+                              onPressed: () => _enterEraserMode(index),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+
+          // Eraser exit button
+          if (_currentWallIndex != null)
+            Positioned(
+              bottom: 10,
+              left: 40,
+              right: 40,
+              child: ElevatedButton(
+                onPressed: _exitEraserMode,
+                child: const Text('Exit Eraser'),
+              ),
+            ),
+        ],
+      ),
+      floatingActionButton: !_isScanning && !_hasSnapshot
+          ? FloatingActionButton.extended(
+              onPressed: _startScan,
+              backgroundColor: goldColor,
+              icon: const Icon(Icons.camera, color: Colors.black),
+              label: const Text('Start Scan',
+                  style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+            )
+          : null,
     );
   }
 
-  int? get wallIndex => data['wallIndex'] is int
-      ? data['wallIndex'] as int
-      : (data['wallIndex'] as num?)?.toInt();
-
-  double? get width => (data['width'] as num?)?.toDouble();
-  double? get height => (data['height'] as num?)?.toDouble();
-  double? get sqm => (data['sqm'] as num?)?.toDouble();
-  bool? get success => data['success'] as bool?;
-  String? get errorCode => data['code'] as String?;
-  String? get errorMessage => data['message'] as String?;
-
-  int? get cutCount => data['cutCount'] is int
-      ? data['cutCount'] as int
-      : (data['cutCount'] as num?)?.toInt();
-
-  String? get tool => data['tool'] as String?;
-  bool? get locked => data['locked'] as bool?;
-  int? get obstacleCount => data['count'] is int
-      ? data['count'] as int
-      : (data['count'] as num?)?.toInt();
-
-  String? get reason => data['reason'] as String?;
-  int? get cornerNumber => data['corner'] is int
-      ? data['corner'] as int
-      : (data['corner'] as num?)?.toInt();
-  int? get totalCorners => data['total'] is int
-      ? data['total'] as int
-      : (data['total'] as num?)?.toInt();
+  IconData _iconForType(String type) {
+    switch (type) {
+      case 'wall':
+        return Icons.dashboard;
+      case 'door':
+        return Icons.door_front_door;
+      case 'window':
+        return Icons.window;
+      case 'opening':
+        return Icons.arrow_right_alt;
+      default:
+        return Icons.help_outline;
+    }
+  }
 }
 
-class WallMeasurements {
-  final int wallIndex;
+class DetectedSurface {
+  final String id;
+  final String type;
   final double width;
   final double height;
-  final double sqm;
+  final double area;
+  final bool excluded;
 
-  const WallMeasurements({
-    required this.wallIndex,
+  DetectedSurface({
+    required this.id,
+    required this.type,
     required this.width,
     required this.height,
-    required this.sqm,
+    required this.area,
+    this.excluded = false,
   });
 
-  int rollsNeeded({required double rollWidth, required double rollLength}) {
-    final perRoll = rollWidth * rollLength;
-    if (perRoll <= 0) return 0;
-    return (sqm / perRoll).ceil();
-  }
-
-  double totalPrice({
-    required double rollWidth,
-    required double rollLength,
-    required double pricePerRoll,
-  }) {
-    return rollsNeeded(rollWidth: rollWidth, rollLength: rollLength) * pricePerRoll;
-  }
+  factory DetectedSurface.fromJson(Map<String, dynamic> json) => DetectedSurface(
+        id: json['id'] as String,
+        type: json['type'] as String,
+        width: (json['width'] as num).toDouble(),
+        height: (json['height'] as num).toDouble(),
+        area: (json['area'] as num).toDouble(),
+        excluded: json['excluded'] as bool? ?? false,
+      );
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// ARSERVICE — bulletproof bridge with buffering
-// ─────────────────────────────────────────────────────────────────────────
+class DetectedObject {
+  final String id;
+  final String type;
+  final bool excluded;
 
-class ARService {
-  ARService._();
-  static final ARService instance = ARService._();
+  DetectedObject({
+    required this.id,
+    required this.type,
+    this.excluded = false,
+  });
 
-  static const _channel = MethodChannel('com.oboia/ar');
-  static const _eventChannel = EventChannel('com.oboia/ar_events');
-
-  /// Sync stream controller: events are delivered immediately to all listeners,
-  /// but if no listener is attached yet, we buffer in [_pendingEvents].
-  final StreamController<AREvent> _controller = StreamController<AREvent>.broadcast();
-
-  /// Events that arrived from native before Dart attached its first listener.
-  /// Drained as soon as a listener attaches.
-  final List<AREvent> _pendingEvents = [];
-
-  /// True once at least one listener has subscribed via [events] getter.
-  bool _hasListener = false;
-
-  StreamSubscription<dynamic>? _eventSub;
-  bool _initialized = false;
-
-  /// Stream of native events. The first listener triggers a drain of any
-  /// events that arrived early.
-  Stream<AREvent> get events {
-    return Stream<AREvent>.multi((controller) {
-      _hasListener = true;
-      dlog('AR-DART', 'listener attached, draining ${_pendingEvents.length} pending events');
-
-      // Drain any buffered events to this new listener
-      final buffered = List<AREvent>.from(_pendingEvents);
-      _pendingEvents.clear();
-      for (final ev in buffered) {
-        controller.add(ev);
-      }
-
-      // Subscribe controller to live stream
-      final sub = _controller.stream.listen(
-        controller.add,
-        onError: controller.addError,
-        onDone: controller.close,
+  factory DetectedObject.fromJson(Map<String, dynamic> json) => DetectedObject(
+        id: json['id'] as String,
+        type: json['type'] as String,
+        excluded: json['excluded'] as bool? ?? false,
       );
-
-      controller.onCancel = () {
-        sub.cancel();
-      };
-    });
-  }
-
-  void _emit(AREvent ev) {
-    dlog('AR-DART', 'event recv type=${ev.type} data=${ev.data}');
-    if (_hasListener) {
-      _controller.add(ev);
-    } else {
-      _pendingEvents.add(ev);
-      if (_pendingEvents.length > 200) {
-        _pendingEvents.removeAt(0); // bound buffer
-      }
-    }
-  }
-
-  Future<void> initAR() async {
-    dlog('AR-DART', 'initAR() called, _initialized=$_initialized');
-    if (_initialized) {
-      dlog('AR-DART', 'initAR() already initialized — ensuring listener still attached');
-      if (_eventSub == null) {
-        _attachEventChannel();
-      }
-      return;
-    }
-    _initialized = true;
-
-    // CRITICAL: invoke initAR method FIRST. This forces the native side
-    // to be ready. Then wait a brief moment for the platform view to
-    // finish setting up its EventChannel stream handler. THEN attach
-    // the Dart listener — this guarantees Swift's onListen fires.
-    try {
-      dlog('AR-DART', 'invoking initAR method on channel (before event channel attach)');
-      await _channel.invokeMethod<void>('initAR');
-      dlog('AR-DART', 'initAR method returned successfully');
-    } on PlatformException catch (e) {
-      dlog('AR-DART', 'initAR method FAILED: code=${e.code} msg=${e.message}');
-      _emit(AREvent(
-        type: 'error',
-        data: {'code': e.code, 'message': e.message ?? ''},
-      ));
-      return;
-    }
-
-    // Wait one frame so that the UiKitView has been built and ARWallpaperView.init()
-    // has run its setupChannels(), which calls eventChannel.setStreamHandler(self).
-    // Without this delay, the Dart subscription happens before Swift registers
-    // the stream handler, and the connection is silently lost.
-    await Future.delayed(const Duration(milliseconds: 800));
-
-    dlog('AR-DART', 'attaching event channel listener (after native ready)');
-    _attachEventChannel();
-  }
-
-  void _attachEventChannel() {
-    dlog('AR-DART', 'attaching to event channel com.oboia/ar_events');
-    _eventSub = _eventChannel.receiveBroadcastStream().listen(
-      (event) {
-        if (event is Map) {
-          final map = event.map((k, v) => MapEntry(k.toString(), v));
-          _emit(AREvent.fromMap(map));
-        } else {
-          dlog('AR-DART', 'event channel got non-Map: ${event.runtimeType}');
-        }
-      },
-      onError: (err) {
-        dlog('AR-DART', 'event channel ERROR: $err');
-        _emit(AREvent(
-          type: 'error',
-          data: {'message': err.toString(), 'code': 'stream_error'},
-        ));
-      },
-      onDone: () {
-        dlog('AR-DART', 'event channel closed (onDone)');
-      },
-    );
-    dlog('AR-DART', 'event channel listener attached');
-  }
-
-  // ── Wallpaper Methods ───────────────────────────────────────────────────
-
-  Future<void> placeWallpaper({
-    required WallpaperModel wallpaper,
-    required int wallIndex,
-    required double pricePerRoll,
-  }) async {
-    dlog('AR-DART', 'placeWallpaper wallIndex=$wallIndex name="${wallpaper.name}"');
-    dlog('AR-DART', '  albedoUrl="${wallpaper.pbr.albedoUrl}"');
-    dlog('AR-DART', '  rollWidth=${wallpaper.rollWidth} rollLength=${wallpaper.rollLength}');
-    try {
-      await _channel.invokeMethod<void>('placeWallpaper', {
-        'albedoUrl': wallpaper.pbr.albedoUrl,
-        'normalUrl': wallpaper.pbr.normalUrl,
-        'roughnessUrl': wallpaper.pbr.roughnessUrl,
-        'aoUrl': wallpaper.pbr.aoUrl,
-        'rollWidth': wallpaper.rollWidth,
-        'rollLength': wallpaper.rollLength,
-        'pricePerRoll': pricePerRoll,
-        'wallIndex': wallIndex,
-      });
-      dlog('AR-DART', 'placeWallpaper method returned OK');
-    } on PlatformException catch (e) {
-      dlog('AR-DART', 'placeWallpaper FAILED: ${e.code} ${e.message}');
-      rethrow;
-    }
-  }
-
-  Future<void> switchWallpaper({
-    required WallpaperModel wallpaper,
-    required int wallIndex,
-    required double pricePerRoll,
-  }) async {
-    dlog('AR-DART', 'switchWallpaper wallIndex=$wallIndex name="${wallpaper.name}"');
-    try {
-      await _channel.invokeMethod<void>('switchWallpaper', {
-        'albedoUrl': wallpaper.pbr.albedoUrl,
-        'normalUrl': wallpaper.pbr.normalUrl,
-        'roughnessUrl': wallpaper.pbr.roughnessUrl,
-        'aoUrl': wallpaper.pbr.aoUrl,
-        'rollWidth': wallpaper.rollWidth,
-        'rollLength': wallpaper.rollLength,
-        'pricePerRoll': pricePerRoll,
-        'wallIndex': wallIndex,
-      });
-      dlog('AR-DART', 'switchWallpaper method returned OK');
-    } on PlatformException catch (e) {
-      dlog('AR-DART', 'switchWallpaper FAILED: ${e.code} ${e.message}');
-      rethrow;
-    }
-  }
-
-  Future<void> selectWall(int wallIndex) async {
-    dlog('AR-DART', 'selectWall wallIndex=$wallIndex');
-    await _channel.invokeMethod<void>('selectWall', {'wallIndex': wallIndex});
-  }
-
-  Future<void> clearWall(int wallIndex) async {
-    dlog('AR-DART', 'clearWall wallIndex=$wallIndex');
-    await _channel.invokeMethod<void>('clearWall', {'wallIndex': wallIndex});
-  }
-
-  Future<WallMeasurements?> getWallMeasurements(int wallIndex) async {
-    final res = await _channel.invokeMapMethod<String, dynamic>(
-      'getWallMeasurements',
-      {'wallIndex': wallIndex},
-    );
-    if (res == null) return null;
-    return WallMeasurements(
-      wallIndex: wallIndex,
-      width: (res['width'] as num).toDouble(),
-      height: (res['height'] as num).toDouble(),
-      sqm: (res['sqm'] as num).toDouble(),
-    );
-  }
-
-  Future<void> lockWall({required int wallIndex, required bool locked}) async {
-    dlog('AR-DART', 'lockWall wallIndex=$wallIndex locked=$locked');
-    await _channel.invokeMethod<void>('lockWall', {
-      'wallIndex': wallIndex,
-      'locked': locked,
-    });
-  }
-
-  Future<void> disposeAR() async {
-    dlog('AR-DART', 'disposeAR called');
-    try {
-      await _channel.invokeMethod<void>('disposeAR');
-    } catch (_) {}
-    await _eventSub?.cancel();
-    _eventSub = null;
-    _initialized = false;
-    dlog('AR-DART', 'disposeAR complete');
-  }
-
-  // ── Phase 1: RoomPlan Scanning ─────────────────────────────────────────
-
-  /// Start a RoomPlan-driven scan. Native side will stream `scanUpdate`
-  /// events containing arrays of detected walls/doors/windows/objects.
-  Future<void> startScan() async {
-    dlog('AR-DART', 'startScan invoked');
-    await _channel.invokeMethod<void>('startScan');
-    dlog('AR-DART', 'startScan method returned');
-  }
-
-  /// Stop the current scan. Native fires `scanComplete` when post-processing
-  /// finishes — this method does NOT wait for that event.
-  Future<void> stopScan() async {
-    dlog('AR-DART', 'stopScan invoked');
-    try {
-      await _channel.invokeMethod<void>('stopScan');
-    } catch (_) {
-      // ignore — stopping a non-running scan is fine
-    }
-  }
-
-  /// Toggle whether a surface (wall/door/window) is excluded from wallpaper
-  /// application. The next scanUpdate event will reflect the new state.
-  Future<void> toggleSurfaceExclusion(String id) async {
-    dlog('AR-DART', 'toggleSurfaceExclusion id=$id');
-    await _channel.invokeMethod<void>('toggleSurfaceExclusion', {'id': id});
-  }
-
-  /// Toggle exclusion on a furniture object.
-  Future<void> toggleObjectExclusion(String id) async {
-    dlog('AR-DART', 'toggleObjectExclusion id=$id');
-    await _channel.invokeMethod<void>('toggleObjectExclusion', {'id': id});
-  }
-
-  /// Switch native AR mode. Valid values: 'scanning', 'preview', 'legacy'.
-  /// - scanning: ARKit auto-plane detection ignored; RoomPlan active.
-  /// - preview:  scan complete; user taps walls to apply wallpaper.
-  /// - legacy:   old behavior (auto-apply on plane detection). For testing.
-  Future<void> setARMode(String mode) async {
-    dlog('AR-DART', 'setARMode -> $mode');
-    await _channel.invokeMethod<void>('setARMode', {'mode': mode});
-  }
-
-  // ── Manual Mode Methods ────────────────────────────────────────────────
-
-  Future<void> enterManualMode() async {
-    dlog('AR-DART', 'enterManualMode invoked');
-    await _channel.invokeMethod<void>('enterManualMode');
-    dlog('AR-DART', 'enterManualMode method returned');
-  }
-
-  Future<void> exitManualMode() async {
-    dlog('AR-DART', 'exitManualMode invoked');
-    await _channel.invokeMethod<void>('exitManualMode');
-  }
-
-  Future<void> resetManual() async {
-    dlog('AR-DART', 'resetManual invoked');
-    await _channel.invokeMethod<void>('resetManual');
-  }
-
-  // ── Cut Mode Methods ────────────────────────────────────────────────────
-
-  Future<void> enterCutMode(int wallIndex) async {
-    await _channel.invokeMethod<void>('enterCutMode', {'wallIndex': wallIndex});
-  }
-
-  Future<void> exitCutMode() async {
-    await _channel.invokeMethod<void>('exitCutMode');
-  }
-
-  Future<void> smartCut({
-    required double screenX,
-    required double screenY,
-    required int wallIndex,
-  }) async {
-    await _channel.invokeMethod<void>('smartCut', {
-      'screenX': screenX,
-      'screenY': screenY,
-      'wallIndex': wallIndex,
-    });
-  }
-
-  Future<void> rectangleCut({
-    required double screenMinX,
-    required double screenMinY,
-    required double screenMaxX,
-    required double screenMaxY,
-    required int wallIndex,
-  }) async {
-    await _channel.invokeMethod<void>('rectangleCut', {
-      'screenMinX': screenMinX,
-      'screenMinY': screenMinY,
-      'screenMaxX': screenMaxX,
-      'screenMaxY': screenMaxY,
-      'wallIndex': wallIndex,
-    });
-  }
-
-  Future<void> freehandCut({
-    required List<Map<String, double>> screenPoints,
-    required int wallIndex,
-  }) async {
-    await _channel.invokeMethod<void>('freehandCut', {
-      'screenPoints': screenPoints,
-      'wallIndex': wallIndex,
-    });
-  }
-
-  Future<void> circleCut({
-    required double screenCenterX,
-    required double screenCenterY,
-    required double screenRadius,
-    required int wallIndex,
-  }) async {
-    await _channel.invokeMethod<void>('circleCut', {
-      'screenCenterX': screenCenterX,
-      'screenCenterY': screenCenterY,
-      'screenRadius': screenRadius,
-      'wallIndex': wallIndex,
-    });
-  }
-
-  Future<void> undoCut(int wallIndex) async {
-    await _channel.invokeMethod<void>('undoCut', {'wallIndex': wallIndex});
-  }
-
-  Future<void> clearAllCuts(int wallIndex) async {
-    await _channel.invokeMethod<void>('clearAllCuts', {'wallIndex': wallIndex});
-  }
 }
