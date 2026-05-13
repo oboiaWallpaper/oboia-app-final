@@ -49,8 +49,10 @@ class _ARScreenState extends State<ARScreen> {
     _initAR();
   }
 
+  // FIX 3: Added 1200ms delay so native view is registered before initAR()
   Future<void> _initAR() async {
     try {
+      await Future.delayed(const Duration(milliseconds: 1200));
       await _arService.initAR();
       setState(() => _arInitialized = true);
     } catch (e) {
@@ -154,15 +156,17 @@ class _ARScreenState extends State<ARScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.transparent,
+      // FIX 2: was Colors.transparent — caused black flash / rendering artifacts
+      backgroundColor: Colors.black,
       body: Stack(
         children: [
           // AR Camera View
-          const Positioned.fill(
+          // FIX 1: removed const on Positioned.fill — UiKitView cannot be const
+          Positioned.fill(
             child: UiKitView(
               viewType: 'com.oboia/ar_view',
-              creationParams: <String, dynamic>{},
-              creationParamsCodec: StandardMessageCodec(),
+              creationParams: const <String, dynamic>{},
+              creationParamsCodec: const StandardMessageCodec(),
             ),
           ),
 
