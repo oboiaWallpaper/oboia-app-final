@@ -1,5 +1,5 @@
 // RoomScanner.swift
-// OBOIA - Complete LiDAR RoomPlan Scanner (data format fix)
+// OBOIA - Complete LiDAR RoomPlan Scanner (coaching disabled, data fix)
 
 import RoomPlan
 import ARKit
@@ -7,7 +7,7 @@ import SceneKit
 
 struct DetectedSurface: Codable {
     let id: String
-    let type: String       // "wall", "door", "window", "opening"
+    let type: String
     let width: Float
     let height: Float
     let area: Float
@@ -56,7 +56,7 @@ final class RoomScanner: NSObject {
 
         let session = RoomCaptureSession()
         var config = RoomCaptureSession.Configuration()
-        config.isCoachingEnabled = true
+        config.isCoachingEnabled = false   // ✅ FIX: coaching overlay blocks UI
         session.run(configuration: config)
 
         if let arView = arView {
