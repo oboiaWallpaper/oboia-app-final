@@ -11,7 +11,7 @@ workflows:
         bundle_identifier: com.oboia.app
       flutter: stable
       xcode: latest
-      cocoapods: 1.15.2          # ← Force a stable version that works with Firebase
+      cocoapods: default
     scripts:
       - name: Set up code signing
         script: |
