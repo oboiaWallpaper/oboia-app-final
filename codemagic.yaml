@@ -5,6 +5,7 @@ workflows:
     instance_type: mac_mini_m2
     integrations:
       app_store_connect: Codemagic
+
     environment:
       ios_signing:
         distribution_type: app_store
@@ -12,6 +13,7 @@ workflows:
       flutter: stable
       xcode: latest
       cocoapods: default
+
     scripts:
       - name: Set up code signing
         script: |
@@ -84,6 +86,13 @@ workflows:
 
       - name: Get Flutter packages
         script: flutter pub get
+
+      # ✅ NEW FIX — Skip CDN resolution completely
+      - name: Install CocoaPods using existing Podfile.lock
+        script: |
+          cd ios
+          pod install --no-repo-update
+          cd ..
 
       - name: Build iOS
         script: |
