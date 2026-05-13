@@ -1,4 +1,4 @@
-// WallpaperARView.swift (complete, with camera check)
+// WallpaperARView.swift – Camera feed visible (frame fix)
 
 import ARKit
 import AVFoundation
@@ -30,13 +30,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var isEraserActive = false
 
     private var eventSink: ((Any) -> Void)?
+    private var pendingEvents: [[String: Any]] = []
 
     init(frame: CGRect,
          viewId: Int64,
          messenger: FlutterBinaryMessenger,
          args: Any?) {
 
-        sceneView = ARSCNView(frame: frame)
+        // ✅ FIX: Use screen bounds instead of zero-sized frame
+        sceneView = ARSCNView(frame: UIScreen.main.bounds)
+        sceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+
         sceneView.automaticallyUpdatesLighting = true
         sceneView.autoenablesDefaultLighting = true
 
@@ -62,6 +66,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     func view() -> UIView { sceneView }
 
+    // MARK: - Method Handler
+
     private func handleMethodCall(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         switch call.method {
         case "initAR": initAR(result: result)
@@ -86,6 +92,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         default: result(FlutterMethodNotImplemented)
         }
     }
+
+    // MARK: - AR Lifecycle
 
     private func initAR(result: @escaping FlutterResult) {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -130,7 +138,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func disposeAR(result: @escaping FlutterResult) {
-        sceneView.session.pause(); result(nil)
+        sceneView.session.pause()
+        result(nil)
     }
 
     private func setARMode(_ mode: String, result: @escaping FlutterResult) {
@@ -326,10 +335,38 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         eraserTool.applyMask(to: material)
     }
 
+    // MARK: - Event Emission with Buffering
+
     private func emit(_ type: String, data: [String: Any] = [:]) {
-        eventSink?(["type": type, "data": data])
+        let payload: [String: Any] = ["type": type, "data": data]
+        if let sink = eventSink {
+            sink(payload)
+        } else {
+            pendingEvents.append(payload)
+        }
     }
 }
+
+// MARK: - FlutterStreamHandler
+
+extension WallpaperARView: FlutterStreamHandler {
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        self.eventSink = { event in events(event) }
+        for event in pendingEvents {
+            events(event)
+        }
+        pendingEvents.removeAll()
+        emit("boot", data: ["status": "Dart listener attached"])
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        self.eventSink = nil
+        return nil
+    }
+}
+
+// MARK: - ARSCNViewDelegate / ARSessionDelegate
 
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {}
@@ -352,17 +389,7 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     }
 }
 
-extension WallpaperARView: FlutterStreamHandler {
-    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        self.eventSink = { event in events(event) }
-        emit("boot", data: ["status": "Dart listener attached"])
-        return nil
-    }
-
-    func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        self.eventSink = nil; return nil
-    }
-}
+// MARK: - UIColor Hex Helper
 
 extension UIColor {
     convenience init?(hex: String) {
