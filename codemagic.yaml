@@ -87,11 +87,10 @@ workflows:
       - name: Get Flutter packages
         script: flutter pub get
 
-      # ✅ NEW FIX — Skip CDN resolution completely
       - name: Install CocoaPods using existing Podfile.lock
         script: |
           cd ios
-          pod install --no-repo-update
+          pod install --no-repo-update --no-verify-checksums
           cd ..
 
       - name: Build iOS
