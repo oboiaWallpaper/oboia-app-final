@@ -1,4 +1,4 @@
-// lib/screens/ar/ar_screen.dart – NULL-SAFE COMPLETE AR SCREEN
+// lib/screens/ar/ar_screen.dart – DIAGNOSTIC VERSION
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
@@ -30,7 +30,8 @@ class _ARScreenState extends State<ARScreen> {
   StreamSubscription<AREvent>? _eventSub;
 
   String _nativeStatus = "Initializing...";
-  final List<String> _logLines = [];
+  int _scanUpdateCount = 0;
+  String _firstScanData = "";
 
   bool _isScanning = false;
   bool _hasSnapshot = false;
@@ -48,7 +49,6 @@ class _ARScreenState extends State<ARScreen> {
       await Future.delayed(const Duration(milliseconds: 1200));
       await _arService.initAR();
     } catch (e) {
-      _logLines.insert(0, 'Init error: $e');
       setState(() => _nativeStatus = 'Init error: $e');
     }
     _eventSub = _arService.events.listen(_onAREvent);
@@ -57,31 +57,27 @@ class _ARScreenState extends State<ARScreen> {
   void _onAREvent(AREvent event) {
     if (event.type == 'boot') {
       final msg = event.data['status'] ?? 'boot';
-      setState(() {
-        _nativeStatus = msg.toString();
-        _logLines.insert(0, '[BOOT] $msg');
-        if (_logLines.length > 15) _logLines.removeLast();
-      });
+      setState(() => _nativeStatus = msg.toString());
     } else if (event.type == 'error') {
       final msg = event.errorMessage ?? 'Unknown error';
-      setState(() {
-        _nativeStatus = 'ERROR: $msg';
-        _logLines.insert(0, '[ERROR] $msg');
-        if (_logLines.length > 15) _logLines.removeLast();
-      });
+      setState(() => _nativeStatus = 'ERROR: $msg');
     } else if (event.type == 'scanUpdate') {
-      final dataStr = event.data['data'] as String? ?? '';
-      if (dataStr.isNotEmpty) {
-        try {
-          final Map<String, dynamic> json = jsonDecode(dataStr);
-          final List<dynamic> surfaceList = json['surfaces'] ?? [];
-          setState(() {
+      setState(() {
+        _scanUpdateCount++;
+        if (_firstScanData.isEmpty) {
+          _firstScanData = event.data.toString();
+        }
+        final dataStr = event.data['data'] as String? ?? '';
+        if (dataStr.isNotEmpty) {
+          try {
+            final Map<String, dynamic> json = jsonDecode(dataStr);
+            final List<dynamic> surfaceList = json['surfaces'] ?? [];
             _scannedSurfaces = surfaceList
                 .map((e) => DetectedSurface.fromJson(e as Map<String, dynamic>))
                 .toList();
-          });
-        } catch (_) {}
-      }
+          } catch (_) {}
+        }
+      });
     } else if (event.type == 'scanComplete') {
       setState(() {
         _isScanning = false;
@@ -117,6 +113,8 @@ class _ARScreenState extends State<ARScreen> {
       _isScanning = true;
       _hasSnapshot = false;
       _scannedSurfaces.clear();
+      _scanUpdateCount = 0;
+      _firstScanData = "";
     });
     await _arService.setARMode('scanning');
     await _arService.startScan();
@@ -177,24 +175,29 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // Status overlay
+          // Diagnostic overlay
           Positioned(
             top: MediaQuery.of(context).padding.top + 44,
             left: 8,
             right: 60,
             child: IgnorePointer(
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                color: Colors.black54,
-                child: Text(
-                  _nativeStatus,
-                  style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
+                padding: const EdgeInsets.all(8),
+                color: Colors.black87,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Status: $_nativeStatus', style: const TextStyle(color: Colors.greenAccent, fontSize: 10)),
+                    Text('Scan events received: $_scanUpdateCount', style: const TextStyle(color: Colors.yellow, fontSize: 10)),
+                    if (_firstScanData.isNotEmpty)
+                      Text('First data: $_firstScanData', style: const TextStyle(color: Colors.white70, fontSize: 8)),
+                  ],
                 ),
               ),
             ),
           ),
 
-          // Wallpaper info (only if wallpaper is not null)
+          // Wallpaper info
           if (widget.wallpaper != null)
             SafeArea(
               child: Padding(
@@ -205,10 +208,8 @@ class _ARScreenState extends State<ARScreen> {
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       children: [
-                        Text(widget.wallpaper!.name,
-                            style: const TextStyle(color: Colors.white, fontSize: 14)),
-                        Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll',
-                            style: const TextStyle(color: goldColor, fontSize: 11)),
+                        Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                        Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 11)),
                       ],
                     ),
                   ],
@@ -231,30 +232,28 @@ class _ARScreenState extends State<ARScreen> {
               right: 0,
               child: SizedBox(
                 height: 200,
-                child: ListView.builder(
-                  itemCount: _scannedSurfaces.length,
-                  itemBuilder: (context, index) {
-                    final s = _scannedSurfaces[index];
-                    final excluded = s.excluded;
-                    return ListTile(
-                      dense: true,
-                      leading: Icon(_iconForType(s.type),
-                          color: excluded ? Colors.grey : goldColor, size: 20),
-                      title: Text('${s.type} ${index + 1}',
-                          style: TextStyle(
-                              color: excluded ? Colors.grey : Colors.white,
-                              fontSize: 13,
-                              decoration: excluded ? TextDecoration.lineThrough : null)),
-                      subtitle: Text(
-                          '${s.width.toStringAsFixed(1)} × ${s.height.toStringAsFixed(1)} m | ${s.area.toStringAsFixed(1)} m²',
-                          style: const TextStyle(color: Colors.white70, fontSize: 10)),
-                      trailing: Switch(
-                          value: !excluded,
-                          onChanged: (_) => _toggleSurfaceExclusion(s.id),
-                          activeColor: goldColor),
-                    );
-                  },
-                ),
+                child: _scannedSurfaces.isEmpty
+                    ? const Center(child: Text('No surfaces detected yet', style: TextStyle(color: Colors.white54)))
+                    : ListView.builder(
+                        itemCount: _scannedSurfaces.length,
+                        itemBuilder: (context, index) {
+                          final s = _scannedSurfaces[index];
+                          final excluded = s.excluded;
+                          return ListTile(
+                            dense: true,
+                            leading: Icon(_iconForType(s.type), color: excluded ? Colors.grey : goldColor, size: 20),
+                            title: Text('${s.type} ${index + 1}',
+                                style: TextStyle(
+                                    color: excluded ? Colors.grey : Colors.white,
+                                    fontSize: 13,
+                                    decoration: excluded ? TextDecoration.lineThrough : null)),
+                            subtitle: Text(
+                                '${s.width.toStringAsFixed(1)} × ${s.height.toStringAsFixed(1)} m | ${s.area.toStringAsFixed(1)} m²',
+                                style: const TextStyle(color: Colors.white70, fontSize: 10)),
+                            trailing: Switch(value: !excluded, onChanged: (_) => _toggleSurfaceExclusion(s.id), activeColor: goldColor),
+                          );
+                        },
+                      ),
               ),
             ),
             Positioned(
@@ -262,13 +261,10 @@ class _ARScreenState extends State<ARScreen> {
               left: 40,
               right: 40,
               child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: goldColor,
-                    padding: const EdgeInsets.symmetric(vertical: 16),
+                style: ElevatedButton.styleFrom(backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
                 onPressed: _stopScan,
-                child: const Text('Done Scanning',
-                    style: TextStyle(fontSize: 18, color: Colors.black)),
+                child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black)),
               ),
             ),
           ],
@@ -291,31 +287,16 @@ class _ARScreenState extends State<ARScreen> {
                       child: Container(
                         width: 130,
                         margin: const EdgeInsets.symmetric(horizontal: 6),
-                        decoration: BoxDecoration(
-                            color: goldColor.withOpacity(0.2),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: goldColor, width: 1)),
+                        decoration: BoxDecoration(color: goldColor.withOpacity(0.2), borderRadius: BorderRadius.circular(12), border: Border.all(color: goldColor, width: 1)),
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Text('Wall ${index + 1}',
-                                style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 13)),
+                            Text('Wall ${index + 1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
                             const SizedBox(height: 6),
-                            Text('${s.width.toStringAsFixed(1)} × ${s.height.toStringAsFixed(1)}',
-                                style: const TextStyle(color: Colors.white70, fontSize: 11)),
-                            Text('${s.area.toStringAsFixed(1)} m²',
-                                style: const TextStyle(
-                                    color: goldColor,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.bold)),
+                            Text('${s.width.toStringAsFixed(1)} × ${s.height.toStringAsFixed(1)}', style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                            Text('${s.area.toStringAsFixed(1)} m²', style: const TextStyle(color: goldColor, fontSize: 12, fontWeight: FontWeight.bold)),
                             const Spacer(),
-                            IconButton(
-                                icon: const Icon(Icons.brush, color: Colors.white70, size: 20),
-                                onPressed: () => _enterEraserMode(index),
-                                padding: EdgeInsets.zero),
+                            IconButton(icon: const Icon(Icons.brush, color: Colors.white70, size: 20), onPressed: () => _enterEraserMode(index), padding: EdgeInsets.zero),
                           ],
                         ),
                       ),
@@ -331,9 +312,7 @@ class _ARScreenState extends State<ARScreen> {
               left: 40,
               right: 40,
               child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.redAccent,
-                    padding: const EdgeInsets.symmetric(vertical: 12)),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, padding: const EdgeInsets.symmetric(vertical: 12)),
                 onPressed: _exitEraserMode,
                 child: const Text('Exit Eraser', style: TextStyle(color: Colors.white)),
               ),
@@ -345,8 +324,7 @@ class _ARScreenState extends State<ARScreen> {
               onPressed: _startScan,
               backgroundColor: goldColor,
               icon: const Icon(Icons.camera, color: Colors.black),
-              label: const Text('Start Scan',
-                  style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+              label: const Text('Start Scan', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
             )
           : null,
     );
@@ -354,16 +332,11 @@ class _ARScreenState extends State<ARScreen> {
 
   IconData _iconForType(String type) {
     switch (type) {
-      case 'wall':
-        return Icons.dashboard;
-      case 'door':
-        return Icons.door_front_door;
-      case 'window':
-        return Icons.window;
-      case 'opening':
-        return Icons.arrow_right_alt;
-      default:
-        return Icons.help_outline;
+      case 'wall': return Icons.dashboard;
+      case 'door': return Icons.door_front_door;
+      case 'window': return Icons.window;
+      case 'opening': return Icons.arrow_right_alt;
+      default: return Icons.help_outline;
     }
   }
 }
@@ -375,24 +348,13 @@ class DetectedSurface {
   final double height;
   final double area;
   final bool excluded;
-
-  DetectedSurface({
-    required this.id,
-    required this.type,
-    required this.width,
-    required this.height,
-    required this.area,
-    this.excluded = false,
-  });
-
-  factory DetectedSurface.fromJson(Map<String, dynamic> json) {
-    return DetectedSurface(
-      id: json['id'] as String? ?? '',
-      type: json['type'] as String? ?? 'unknown',
-      width: (json['width'] as num?)?.toDouble() ?? 0.0,
-      height: (json['height'] as num?)?.toDouble() ?? 0.0,
-      area: (json['area'] as num?)?.toDouble() ?? 0.0,
-      excluded: json['excluded'] as bool? ?? false,
-    );
-  }
+  DetectedSurface({required this.id, required this.type, required this.width, required this.height, required this.area, this.excluded = false});
+  factory DetectedSurface.fromJson(Map<String, dynamic> json) => DetectedSurface(
+    id: json['id'] as String? ?? '',
+    type: json['type'] as String? ?? 'unknown',
+    width: (json['width'] as num?)?.toDouble() ?? 0.0,
+    height: (json['height'] as num?)?.toDouble() ?? 0.0,
+    area: (json['area'] as num?)?.toDouble() ?? 0.0,
+    excluded: json['excluded'] as bool? ?? false,
+  );
 }
