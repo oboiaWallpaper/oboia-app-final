@@ -1,5 +1,5 @@
 // RoomScanner.swift
-// OBOIA - Complete LiDAR RoomPlan Scanner
+// OBOIA - Complete LiDAR RoomPlan Scanner (data format fix)
 
 import RoomPlan
 import ARKit
@@ -7,7 +7,7 @@ import SceneKit
 
 struct DetectedSurface: Codable {
     let id: String
-    let type: String
+    let type: String       // "wall", "door", "window", "opening"
     let width: Float
     let height: Float
     let area: Float
@@ -29,14 +29,12 @@ struct DetectedObject: Codable {
 final class RoomScanner: NSObject {
 
     private weak var arView: ARSCNView?
-    private var messenger: FlutterBinaryMessenger?
     private var eventSink: ((Any) -> Void)?
 
     private var captureSession: RoomCaptureSession?
     private var roomBuilder: RoomBuilder?
 
     private var isScanning = false
-    private let lock = NSLock()
     private var lastUpdateTime: TimeInterval = 0
     private let updateDebounce: TimeInterval = 0.5
 
@@ -45,7 +43,6 @@ final class RoomScanner: NSObject {
 
     init(arView: ARSCNView?, messenger: FlutterBinaryMessenger?) {
         self.arView = arView
-        self.messenger = messenger
         super.init()
     }
 
@@ -55,11 +52,9 @@ final class RoomScanner: NSObject {
 
     func start() {
         guard isScanning == false else { return }
-
         isScanning = true
 
         let session = RoomCaptureSession()
-
         var config = RoomCaptureSession.Configuration()
         config.isCoachingEnabled = true
         session.run(configuration: config)
@@ -72,24 +67,15 @@ final class RoomScanner: NSObject {
         }
 
         session.delegate = self
-
         roomBuilder = RoomBuilder(options: [])
-
         self.captureSession = session
     }
 
     func stop(completion: @escaping (ScanSnapshot?) -> Void) {
-        guard isScanning else {
-            completion(nil)
-            return
-        }
+        guard isScanning else { completion(nil); return }
         isScanning = false
 
-        guard let session = captureSession else {
-            completion(nil)
-            return
-        }
-
+        guard let session = captureSession else { completion(nil); return }
         session.stop()
         roomBuilder = nil
 
@@ -97,9 +83,7 @@ final class RoomScanner: NSObject {
         completion(final)
 
         self.captureSession = nil
-        if let arView = arView {
-            arView.session.delegate = nil
-        }
+        if let arView = arView { arView.session.delegate = nil }
     }
 
     func toggleSurfaceExclusion(id: String) -> Bool? {
@@ -126,28 +110,24 @@ final class RoomScanner: NSObject {
             let h = wall.dimensions.y
             surfaces.append(DetectedSurface(id: id, type: "wall", width: w, height: h, area: w * h))
         }
-
         for door in capturedRoom.doors {
             let id = door.identifier.uuidString
             let w = door.dimensions.x
             let h = door.dimensions.y
             surfaces.append(DetectedSurface(id: id, type: "door", width: w, height: h, area: w * h))
         }
-
         for window in capturedRoom.windows {
             let id = window.identifier.uuidString
             let w = window.dimensions.x
             let h = window.dimensions.y
             surfaces.append(DetectedSurface(id: id, type: "window", width: w, height: h, area: w * h))
         }
-
         for opening in capturedRoom.openings {
             let id = opening.identifier.uuidString
             let w = opening.dimensions.x
             let h = opening.dimensions.y
             surfaces.append(DetectedSurface(id: id, type: "opening", width: w, height: h, area: w * h))
         }
-
         for obj in capturedRoom.objects {
             let id = obj.identifier.uuidString
             objects.append(DetectedObject(id: id, type: obj.category == .storage ? "furniture" : "unknown"))
@@ -165,10 +145,13 @@ final class RoomScanner: NSObject {
         let snapshot = ScanSnapshot(surfaces: currentSurfaces, objects: currentObjects)
         if let jsonData = try? JSONEncoder().encode(snapshot),
            let jsonString = String(data: jsonData, encoding: .utf8) {
-            eventSink?(["type": "scanUpdate", "data": jsonString])
+            // FIX: Wrap jsonString in a dict so WallpaperARView cast succeeds
+            eventSink?(["type": "scanUpdate", "data": ["data": jsonString]])
         }
     }
 }
+
+// MARK: - RoomCaptureSessionDelegate
 
 @available(iOS 17.0, *)
 extension RoomScanner: RoomCaptureSessionDelegate {
@@ -176,7 +159,6 @@ extension RoomScanner: RoomCaptureSessionDelegate {
         let now = CACurrentMediaTime()
         guard now - lastUpdateTime > updateDebounce else { return }
         lastUpdateTime = now
-
         processRoom(room)
         emitUpdate()
     }
@@ -208,6 +190,8 @@ extension RoomScanner: RoomCaptureSessionDelegate {
         eventSink?(["type": "scanInstruction", "data": ["instruction": "\(instruction)"]])
     }
 }
+
+// MARK: - ARSessionDelegate
 
 @available(iOS 17.0, *)
 extension RoomScanner: ARSessionDelegate {
