@@ -1,9 +1,15 @@
-// lib/screens/ar/ar_screen.dart – RED SCREEN TEST
+// lib/screens/ar/ar_screen.dart – RED SCREEN TEST (accepts arguments)
 
 import 'package:flutter/material.dart';
 
 class ARScreen extends StatefulWidget {
-  const ARScreen({super.key});
+  // Accept the arguments that main.dart passes, but ignore them for the test.
+  const ARScreen({
+    super.key,
+    dynamic initialWallpaper,
+    dynamic initialShop,
+    dynamic pricePerRoll,
+  });
 
   @override
   State<ARScreen> createState() => _ARScreenState();
@@ -16,7 +22,7 @@ class _ARScreenState extends State<ARScreen> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // TEMPORARY: replaced UiKitView with red box
+          // Red background to confirm Flutter is rendering
           const Positioned.fill(
             child: ColoredBox(color: Colors.red),
           ),
@@ -34,8 +40,10 @@ class _ARScreenState extends State<ARScreen> {
           const Positioned(
             top: 80,
             left: 20,
-            child: Text('STATUS: TESTING',
-                style: TextStyle(color: Colors.greenAccent, fontSize: 16)),
+            child: Text(
+              'STATUS: TESTING',
+              style: TextStyle(color: Colors.greenAccent, fontSize: 16),
+            ),
           ),
         ],
       ),
