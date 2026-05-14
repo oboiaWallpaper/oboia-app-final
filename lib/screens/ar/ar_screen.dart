@@ -1,5 +1,5 @@
-// lib/screens/ar/ar_screen.dart — DIAGNOSTIC VERSION v2
-// Shows scrollable log of all native events
+// lib/screens/ar/ar_screen.dart — DIAGNOSTIC v3
+// Every log line triggers setState. Try/catch on all native calls.
 
 import 'dart:async';
 import 'dart:convert';
@@ -51,33 +51,31 @@ class _ARScreenState extends State<ARScreen> {
       await Future.delayed(const Duration(milliseconds: 1200));
       await _arService.initAR();
     } catch (e) {
-      _addLog('Init error: $e');
-      setState(() => _nativeStatus = 'Init error: $e');
+      _log('Init error: $e');
     }
     _eventSub = _arService.events.listen(_onAREvent);
   }
 
-  void _addLog(String msg) {
-    _logLines.insert(0, '[${DateTime.now().toString().substring(11, 19)}] $msg');
-    if (_logLines.length > 25) _logLines.removeLast();
+  /// ALWAYS calls setState so every message renders immediately
+  void _log(String msg) {
+    if (!mounted) return;
+    setState(() {
+      _logLines.insert(0, '[${DateTime.now().toString().substring(11, 19)}] $msg');
+      if (_logLines.length > 30) _logLines.removeLast();
+      _nativeStatus = msg;
+    });
   }
 
   void _onAREvent(AREvent event) {
     if (event.type == 'boot') {
       final msg = event.data['status'] ?? 'boot';
-      setState(() {
-        _nativeStatus = msg.toString();
-        _addLog('[BOOT] $msg');
-      });
+      _log('[BOOT] $msg');
     } else if (event.type == 'error') {
       final msg = event.errorMessage ?? 'Unknown error';
-      setState(() {
-        _nativeStatus = 'ERROR: $msg';
-        _addLog('[ERROR] $msg');
-      });
+      _log('[ERROR] $msg');
     } else if (event.type == 'scanUpdate') {
-      setState(() => _scanEventCount++);
-      _addLog('[SCAN] event #$_scanEventCount');
+      _scanEventCount++;
+      _log('[SCAN] event #$_scanEventCount');
       final dataStr = event.data['data'] as String? ?? '';
       if (dataStr.isNotEmpty) {
         try {
@@ -88,14 +86,14 @@ class _ARScreenState extends State<ARScreen> {
                 .map((e) => DetectedSurface.fromJson(e as Map<String, dynamic>))
                 .toList();
           });
-          _addLog('[SCAN] ${_scannedSurfaces.length} surfaces parsed');
+          _log('[SCAN] ${_scannedSurfaces.length} surfaces parsed');
         } catch (e) {
-          _addLog('[SCAN] parse error: $e');
+          _log('[SCAN] parse error: $e');
         }
       }
     } else if (event.type == 'scanComplete') {
       setState(() { _isScanning = false; _hasSnapshot = true; });
-      _addLog('[COMPLETE] ${_scannedSurfaces.length} surfaces');
+      _log('[COMPLETE] ${_scannedSurfaces.length} surfaces');
       if (widget.wallpaper != null) {
         for (int i = 0; i < _scannedSurfaces.length; i++) {
           final s = _scannedSurfaces[i];
@@ -110,7 +108,7 @@ class _ARScreenState extends State<ARScreen> {
       }
     } else if (event.type == 'wallpaperPlaced') {
       final success = event.data['success'] as bool? ?? false;
-      _addLog('[PLACE] wall ${event.wallIndex} success=$success');
+      _log('[PLACE] wall ${event.wallIndex} success=$success');
       if (success && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Wallpaper applied to wall ${event.wallIndex}')),
@@ -118,11 +116,15 @@ class _ARScreenState extends State<ARScreen> {
       }
     } else if (event.type == 'scanInstruction') {
       final instruction = event.data['instruction'] ?? '';
-      _addLog('[INSTRUCTION] $instruction');
+      _log('[INSTRUCTION] $instruction');
     } else if (event.type == 'arModeChanged') {
-      _addLog('[MODE] ${event.data['mode']}');
+      _log('[MODE] ${event.data['mode']}');
+    } else if (event.type == 'wallDetected') {
+      if (!_isScanning) {
+        _log('[wallDetected]');
+      }
     } else {
-      _addLog('[${event.type}] ${event.data}');
+      _log('[${event.type}] ${event.data}');
     }
   }
 
@@ -133,14 +135,51 @@ class _ARScreenState extends State<ARScreen> {
       _scannedSurfaces.clear();
       _scanEventCount = 0;
     });
-    _addLog('Dart: calling setARMode(scanning)...');
-    await _arService.setARMode('scanning');
-    _addLog('Dart: calling startScan()...');
-    await _arService.startScan();
-    _addLog('Dart: startScan() returned');
+
+    // STEP 1: setARMode
+    _log('DART: calling setARMode(scanning)...');
+    try {
+      await _arService.setARMode('scanning');
+      _log('DART: setARMode RETURNED OK ✅');
+    } catch (e) {
+      _log('DART: setARMode THREW ❌: $e');
+      return;
+    }
+
+    // STEP 2: startScan
+    _log('DART: calling startScan()...');
+    try {
+      await _arService.startScan();
+      _log('DART: startScan RETURNED OK ✅');
+    } catch (e) {
+      _log('DART: startScan THREW ❌: $e');
+      return;
+    }
+
+    // STEP 3: Timer to check if events arrive
+    _log('DART: waiting for scan events...');
+    Future.delayed(const Duration(seconds: 5), () {
+      if (mounted && _isScanning && _scanEventCount == 0) {
+        _log('⚠️ 5s elapsed, still 0 scan events');
+      }
+    });
+    Future.delayed(const Duration(seconds: 15), () {
+      if (mounted && _isScanning && _scanEventCount == 0) {
+        _log('❌ 15s elapsed, 0 scan events — RoomPlan not working');
+      }
+    });
   }
 
-  Future<void> _stopScan() async { await _arService.stopScan(); }
+  Future<void> _stopScan() async {
+    _log('DART: calling stopScan()...');
+    try {
+      await _arService.stopScan();
+      _log('DART: stopScan RETURNED OK');
+    } catch (e) {
+      _log('DART: stopScan THREW: $e');
+    }
+  }
+
   void _toggleSurfaceExclusion(String id) { _arService.toggleSurfaceExclusion(id); }
   void _enterEraserMode(int wallIndex) {
     setState(() => _currentWallIndex = wallIndex);
@@ -177,7 +216,6 @@ class _ARScreenState extends State<ARScreen> {
         children: [
           _buildCameraView(),
 
-          // Back button
           Positioned(
             top: MediaQuery.of(context).padding.top + 8,
             left: 8,
@@ -188,15 +226,13 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // ═══════════════════════════════════════════════════════
-          // DIAGNOSTIC LOG — shows last 25 messages from native
-          // ═══════════════════════════════════════════════════════
+          // DIAGNOSTIC LOG
           Positioned(
             top: MediaQuery.of(context).padding.top + 44,
             left: 8, right: 8,
             child: IgnorePointer(
               child: Container(
-                constraints: const BoxConstraints(maxHeight: 200),
+                constraints: const BoxConstraints(maxHeight: 220),
                 padding: const EdgeInsets.all(6),
                 color: Colors.black87,
                 child: SingleChildScrollView(
@@ -208,11 +244,11 @@ class _ARScreenState extends State<ARScreen> {
                         style: const TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
                       ),
                       Text(
-                        'Scan events: $_scanEventCount | Surfaces: ${_scannedSurfaces.length}',
+                        'Scan events: $_scanEventCount | Surfaces: ${_scannedSurfaces.length} | Scanning: $_isScanning',
                         style: const TextStyle(color: Colors.yellowAccent, fontSize: 10),
                       ),
                       const Divider(color: Colors.white24, height: 8),
-                      ..._logLines.take(15).map((line) => Text(
+                      ..._logLines.take(20).map((line) => Text(
                         line,
                         style: const TextStyle(color: Colors.white70, fontSize: 9),
                         maxLines: 2,
@@ -225,7 +261,6 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // Wallpaper info
           if (widget.wallpaper != null)
             SafeArea(
               child: Padding(
@@ -240,7 +275,6 @@ class _ARScreenState extends State<ARScreen> {
               ),
             ),
 
-          // Scanning UI
           if (_isScanning) ...[
             Positioned(
               bottom: 180,
@@ -282,7 +316,6 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ],
 
-          // Post-scan wall cards
           if (_hasSnapshot && !_isScanning)
             Positioned(
               bottom: 20, left: 8, right: 8,
@@ -312,7 +345,6 @@ class _ARScreenState extends State<ARScreen> {
               ),
             ),
 
-          // Eraser exit button
           if (_currentWallIndex != null)
             Positioned(
               bottom: 20, left: 40, right: 40,
