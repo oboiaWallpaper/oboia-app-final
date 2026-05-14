@@ -87,14 +87,12 @@ workflows:
       - name: Get Flutter packages
         script: flutter pub get
 
-      - name: Install CocoaPods using existing Podfile.lock
-        script: |
-          cd ios
-          pod install --no-repo-update --no-verify-checksums
-          cd ..
-
       - name: Build iOS
         script: |
+          cd ios
+          rm -f Podfile.lock
+          pod install --repo-update
+          cd ..
           flutter build ipa --release \
             --export-options-plist=/Users/builder/export_options.plist
 
