@@ -1,4 +1,5 @@
-// RoomScanner.swift – delegate set BEFORE session runs
+// RoomScanner.swift — FIXED: no ARSession conflict, no delegate stealing
+// Drop-in replacement — put in ios/Runner/RoomScanner.swift
 
 import RoomPlan
 import ARKit
@@ -49,44 +50,99 @@ final class RoomScanner: NSObject {
         eventSink = sink
     }
 
+    // MARK: - Start Scan
+
     func start() {
-        guard isScanning == false else { return }
+        guard !isScanning else { return }
+
+        // ═══════════════════════════════════════════════════════════
+        // CRITICAL CHECK: RoomPlan requires LiDAR hardware
+        // ═══════════════════════════════════════════════════════════
+        guard RoomCaptureSession.isSupported else {
+            print("❌ RoomPlan NOT supported on this device")
+            eventSink?(["type": "error", "data": ["message": "RoomPlan not supported (LiDAR required)"]])
+            return
+        }
+        print("✅ RoomPlan IS supported on this device")
+
         isScanning = true
+        currentSurfaces = []
+        currentObjects = []
 
+        // ═══════════════════════════════════════════════════════════
+        // STEP 1: Pause the existing AR session BEFORE creating RoomPlan
+        // iOS only allows ONE active ARSession. If we don't pause first,
+        // the old session and RoomPlan's internal session fight each other
+        // and RoomPlan silently receives zero events.
+        // ═══════════════════════════════════════════════════════════
+        if let arView = arView {
+            arView.session.pause()
+            print("✅ Paused existing ARSession")
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // STEP 2: Create RoomCaptureSession and set delegate BEFORE run
+        // ═══════════════════════════════════════════════════════════
         let session = RoomCaptureSession()
-
-        // ✅ SET DELEGATE FIRST before session runs
         session.delegate = self
+        print("✅ RoomCaptureSession delegate set")
+
         roomBuilder = RoomBuilder(options: [])
         self.captureSession = session
 
+        // ═══════════════════════════════════════════════════════════
+        // STEP 3: Assign RoomPlan's ARSession to the view for camera feed
+        //
+        // DO NOT set arView.session.delegate = self
+        // RoomPlan MUST remain the internal delegate of its own ARSession.
+        // Stealing the delegate is what caused zero events.
+        // ═══════════════════════════════════════════════════════════
         if let arView = arView {
             arView.session = session.arSession
-            arView.session.delegate = self
+            // arView.session.delegate = self   ← REMOVED — this was the bug
             arView.automaticallyUpdatesLighting = true
-            arView.debugOptions = [.showFeaturePoints]
+            print("✅ Assigned RoomPlan ARSession to ARSCNView")
         }
 
-        // ✅ RUN AFTER delegate is set
+        // ═══════════════════════════════════════════════════════════
+        // STEP 4: Configure and run
+        // ═══════════════════════════════════════════════════════════
         var config = RoomCaptureSession.Configuration()
         config.isCoachingEnabled = false
         session.run(configuration: config)
+        print("✅ RoomCaptureSession.run() called")
+
+        eventSink?(["type": "boot", "data": ["status": "RoomPlan scan active"]])
     }
+
+    // MARK: - Stop Scan
 
     func stop(completion: @escaping (ScanSnapshot?) -> Void) {
-        guard isScanning else { completion(nil); return }
+        guard isScanning else {
+            completion(nil)
+            return
+        }
         isScanning = false
 
-        guard let session = captureSession else { completion(nil); return }
+        guard let session = captureSession else {
+            completion(nil)
+            return
+        }
+
         session.stop()
+        print("✅ RoomCaptureSession stopped")
+
         roomBuilder = nil
 
-        let final = ScanSnapshot(surfaces: currentSurfaces, objects: currentObjects)
-        completion(final)
+        let finalSnapshot = ScanSnapshot(surfaces: currentSurfaces, objects: currentObjects)
+        completion(finalSnapshot)
 
         self.captureSession = nil
-        if let arView = arView { arView.session.delegate = nil }
+        // DO NOT touch arView.session.delegate here
+        // The caller (WallpaperARView) will restore its own ARSession
     }
+
+    // MARK: - Surface/Object Exclusion
 
     func toggleSurfaceExclusion(id: String) -> Bool? {
         guard let idx = currentSurfaces.firstIndex(where: { $0.id == id }) else { return nil }
@@ -101,6 +157,8 @@ final class RoomScanner: NSObject {
         emitUpdate()
         return currentObjects[idx].excluded
     }
+
+    // MARK: - Process Room Data
 
     private func processRoom(_ capturedRoom: CapturedRoom) {
         var surfaces: [DetectedSurface] = []
@@ -132,12 +190,36 @@ final class RoomScanner: NSObject {
         }
         for obj in capturedRoom.objects {
             let id = obj.identifier.uuidString
-            objects.append(DetectedObject(id: id, type: obj.category == .storage ? "furniture" : "unknown"))
+            let category: String
+            switch obj.category {
+            case .storage: category = "storage"
+            case .table: category = "table"
+            case .sofa: category = "sofa"
+            case .chair: category = "chair"
+            case .bed: category = "bed"
+            case .television: category = "television"
+            case .bathtub: category = "bathtub"
+            case .toilet: category = "toilet"
+            case .sink: category = "sink"
+            case .refrigerator: category = "refrigerator"
+            case .stove: category = "stove"
+            case .washerDryer: category = "washerDryer"
+            case .fireplace: category = "fireplace"
+            default: category = "unknown"
+            }
+            objects.append(DetectedObject(id: id, type: category))
         }
+
+        let wallCount = surfaces.filter { $0.type == "wall" }.count
+        let doorCount = surfaces.filter { $0.type == "door" }.count
+        let windowCount = surfaces.filter { $0.type == "window" }.count
+        print("📐 RoomPlan update: \(wallCount) walls, \(doorCount) doors, \(windowCount) windows, \(objects.count) objects")
 
         self.currentSurfaces = surfaces
         self.currentObjects = objects
     }
+
+    // MARK: - Emit Updates to Dart
 
     private func emitUpdate() {
         guard Thread.isMainThread else {
@@ -156,7 +238,14 @@ final class RoomScanner: NSObject {
 
 @available(iOS 17.0, *)
 extension RoomScanner: RoomCaptureSessionDelegate {
+
+    func captureSession(_ session: RoomCaptureSession, didStartWith configuration: RoomCaptureSession.Configuration) {
+        print("✅ RoomPlan didStartWith fired — scanning is LIVE")
+        eventSink?(["type": "boot", "data": ["status": "RoomPlan scanning live"]])
+    }
+
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
+        print("📐 RoomPlan didUpdate fired")
         let now = CACurrentMediaTime()
         guard now - lastUpdateTime > updateDebounce else { return }
         lastUpdateTime = now
@@ -165,37 +254,42 @@ extension RoomScanner: RoomCaptureSessionDelegate {
     }
 
     func captureSession(_ session: RoomCaptureSession, didAdd room: CapturedRoom) {
+        print("📐 RoomPlan didAdd fired")
         processRoom(room)
         emitUpdate()
     }
 
     func captureSession(_ session: RoomCaptureSession, didChange room: CapturedRoom) {
+        print("📐 RoomPlan didChange fired")
         processRoom(room)
         emitUpdate()
     }
 
     func captureSession(_ session: RoomCaptureSession, didRemove room: CapturedRoom) {
+        print("📐 RoomPlan didRemove fired")
         processRoom(room)
         emitUpdate()
     }
 
     func captureSession(_ session: RoomCaptureSession, didEndWith data: CapturedRoomData, error: Error?) {
         if let error = error {
+            print("❌ RoomPlan ended with error: \(error.localizedDescription)")
             eventSink?(["type": "scanFailed", "data": ["message": error.localizedDescription]])
         } else {
-            eventSink?(["type": "scanComplete", "data": "ok"])
+            print("✅ RoomPlan ended successfully")
+            eventSink?(["type": "scanComplete", "data": ["status": "ok"]])
         }
     }
 
     func captureSession(_ session: RoomCaptureSession, didProvide instruction: RoomCaptureSession.Instruction) {
-        eventSink?(["type": "scanInstruction", "data": ["instruction": "\(instruction)"]])
+        let instructionStr = "\(instruction)"
+        print("💡 RoomPlan instruction: \(instructionStr)")
+        eventSink?(["type": "scanInstruction", "data": ["instruction": instructionStr]])
     }
 }
 
-// MARK: - ARSessionDelegate
-
-@available(iOS 17.0, *)
-extension RoomScanner: ARSessionDelegate {
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {}
-    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {}
-}
+// ═══════════════════════════════════════════════════════════
+// NOTE: ARSessionDelegate conformance has been REMOVED.
+// RoomPlan must be the sole controller of its own ARSession.
+// WallpaperARView handles ARSessionDelegate for preview mode.
+// ═══════════════════════════════════════════════════════════
