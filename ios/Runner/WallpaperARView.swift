@@ -1,5 +1,6 @@
-// WallpaperARView.swift — FIXED: no competing ARSession during scan
-// Drop-in replacement — put in ios/Runner/WallpaperARView.swift
+// WallpaperARView.swift — DIAGNOSTIC VERSION v2
+// startScan no longer calls setARMode (no competing ARSession)
+// Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
 import AVFoundation
@@ -38,7 +39,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
          messenger: FlutterBinaryMessenger,
          args: Any?) {
 
-        // ✅ FIX: Use screen bounds instead of zero-sized frame
         sceneView = ARSCNView(frame: UIScreen.main.bounds)
         sceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
@@ -146,11 +146,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         currentMode = newMode
         switch newMode {
         case .scanning:
-            // ═══════════════════════════════════════════════════════════
-            // NOTE: This mode is now only used if called directly.
-            // startScan() no longer calls setARMode("scanning").
-            // If called directly, it just sets debug options — no session run.
-            // ═══════════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════
+            // CHANGED: No session.run() here — just update mode flag.
+            // startScan() handles the session lifecycle now.
+            // ═══════════════════════════════════════════════════════
             sceneView.debugOptions = [.showFeaturePoints]
         case .preview:
             sceneView.debugOptions = []
@@ -170,18 +169,25 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // MARK: - Scan Lifecycle (FIXED)
 
     private func startScan(result: @escaping FlutterResult) {
+        // ═══════════════════════════════════════════════════════════
+        // DIAGNOSTIC: This message MUST appear in the status overlay.
+        // If you still see "Dart listener attached" after tapping
+        // Start Scan, the old code is still deployed.
+        // ═══════════════════════════════════════════════════════════
+        emit("boot", data: ["status": ">>> startScan ENTERED v2 <<<"])
+
         guard #available(iOS 17.0, *) else {
-            result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required for RoomPlan", details: nil))
+            emit("error", data: ["message": "iOS 17+ required for RoomPlan"])
+            result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required", details: nil))
             return
         }
 
+        emit("boot", data: ["status": "iOS 17 check passed"])
+
         // ═══════════════════════════════════════════════════════════
         // CRITICAL FIX: Do NOT call setARMode("scanning") here.
-        // That would start a COMPETING ARSession which prevents
-        // RoomPlan's internal ARSession from ever firing delegate events.
-        //
-        // Instead: just update the mode flag and debug options.
-        // The actual AR session pause happens inside RoomScanner.start()
+        // That starts a COMPETING ARSession which kills RoomPlan.
+        // Just update the mode flag.
         // ═══════════════════════════════════════════════════════════
         currentMode = .scanning
         sceneView.debugOptions = [.showFeaturePoints]
@@ -193,9 +199,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             let data = dict["data"] as? [String: Any] ?? [:]
             self?.emit(type, data: data)
         }
+
+        emit("boot", data: ["status": "Scanner created, calling start()..."])
         scanner.start()
         self.roomScanner = scanner
-        emit("boot", data: ["status": "Room scan started"])
+        emit("boot", data: ["status": "Scanner start() returned"])
         result(nil)
     }
 
@@ -213,17 +221,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             self.roomScanner = nil
 
-            // ═══════════════════════════════════════════════════════════
-            // RESTORE: Create a fresh ARSession for preview mode.
-            // RoomPlan's session is dead after stop(), so we need a new one.
-            // ═══════════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════
+            // Restore our own AR session for preview mode
+            // ═══════════════════════════════════════════════════════
             self.restorePreviewSession()
         }
         result(nil)
     }
 
-    /// Restores the AR session after RoomPlan scanning ends.
-    /// Creates a new ARSession so the sceneView has a working camera again.
     private func restorePreviewSession() {
         let newSession = ARSession()
         sceneView.session = newSession
@@ -235,7 +240,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         currentMode = .preview
         sceneView.debugOptions = []
-        print("✅ Preview ARSession restored")
         emit("boot", data: ["status": "Preview session restored"])
     }
 
