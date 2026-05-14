@@ -1,4 +1,5 @@
-// WallpaperARView.swift – Camera feed visible (frame fix)
+// WallpaperARView.swift — FIXED: no competing ARSession during scan
+// Drop-in replacement — put in ios/Runner/WallpaperARView.swift
 
 import ARKit
 import AVFoundation
@@ -125,16 +126,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(FlutterError(code: "ARKIT_UNSUPPORTED", message: "ARKit not supported", details: nil))
             return
         }
-        do {
-            let configuration = ARWorldTrackingConfiguration()
-            configuration.planeDetection = [.vertical]
-            sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
-            emit("boot", data: ["status": "AR session running"])
-            result(nil)
-        } catch {
-            emit("error", data: ["message": error.localizedDescription])
-            result(FlutterError(code: "AR_FAIL", message: error.localizedDescription, details: nil))
-        }
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.planeDetection = [.vertical]
+        sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        emit("boot", data: ["status": "AR session running"])
+        result(nil)
     }
 
     private func disposeAR(result: @escaping FlutterResult) {
@@ -150,10 +146,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         currentMode = newMode
         switch newMode {
         case .scanning:
+            // ═══════════════════════════════════════════════════════════
+            // NOTE: This mode is now only used if called directly.
+            // startScan() no longer calls setARMode("scanning").
+            // If called directly, it just sets debug options — no session run.
+            // ═══════════════════════════════════════════════════════════
             sceneView.debugOptions = [.showFeaturePoints]
-            let config = ARWorldTrackingConfiguration()
-            config.planeDetection = []
-            sceneView.session.run(config, options: [.resetTracking])
         case .preview:
             sceneView.debugOptions = []
             let config = ARWorldTrackingConfiguration()
@@ -169,12 +167,25 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
+    // MARK: - Scan Lifecycle (FIXED)
+
     private func startScan(result: @escaping FlutterResult) {
         guard #available(iOS 17.0, *) else {
-            result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required", details: nil))
+            result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required for RoomPlan", details: nil))
             return
         }
-        setARMode("scanning") { _ in }
+
+        // ═══════════════════════════════════════════════════════════
+        // CRITICAL FIX: Do NOT call setARMode("scanning") here.
+        // That would start a COMPETING ARSession which prevents
+        // RoomPlan's internal ARSession from ever firing delegate events.
+        //
+        // Instead: just update the mode flag and debug options.
+        // The actual AR session pause happens inside RoomScanner.start()
+        // ═══════════════════════════════════════════════════════════
+        currentMode = .scanning
+        sceneView.debugOptions = [.showFeaturePoints]
+
         let scanner = RoomScanner(arView: sceneView, messenger: nil)
         scanner.setEventSink { [weak self] (event) in
             guard let dict = event as? [String: Any] else { return }
@@ -184,24 +195,51 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
         scanner.start()
         self.roomScanner = scanner
+        emit("boot", data: ["status": "Room scan started"])
         result(nil)
     }
 
     private func stopScan(result: @escaping FlutterResult) {
         guard let scanner = roomScanner else { result(nil); return }
         scanner.stop { [weak self] snapshot in
+            guard let self = self else { return }
+
             if let snapshot = snapshot,
                let jsonData = try? JSONEncoder().encode(snapshot),
                let jsonString = String(data: jsonData, encoding: .utf8) {
-                self?.emit("scanComplete", data: ["snapshot": jsonString])
+                self.emit("scanComplete", data: ["snapshot": jsonString])
             } else {
-                self?.emit("scanComplete", data: ["snapshot": ""])
+                self.emit("scanComplete", data: ["snapshot": ""])
             }
-            self?.roomScanner = nil
-            self?.setARMode("preview") { _ in }
+            self.roomScanner = nil
+
+            // ═══════════════════════════════════════════════════════════
+            // RESTORE: Create a fresh ARSession for preview mode.
+            // RoomPlan's session is dead after stop(), so we need a new one.
+            // ═══════════════════════════════════════════════════════════
+            self.restorePreviewSession()
         }
         result(nil)
     }
+
+    /// Restores the AR session after RoomPlan scanning ends.
+    /// Creates a new ARSession so the sceneView has a working camera again.
+    private func restorePreviewSession() {
+        let newSession = ARSession()
+        sceneView.session = newSession
+        sceneView.session.delegate = self
+
+        let config = ARWorldTrackingConfiguration()
+        config.planeDetection = [.vertical]
+        sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+
+        currentMode = .preview
+        sceneView.debugOptions = []
+        print("✅ Preview ARSession restored")
+        emit("boot", data: ["status": "Preview session restored"])
+    }
+
+    // MARK: - Wallpaper Placement
 
     private func placeWallpaper(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let args = call.arguments as? [String: Any],
@@ -295,6 +333,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private func getWallMeasurements(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         result(["width": 0.0, "height": 0.0, "sqm": 0.0])
     }
+
+    // MARK: - Eraser
 
     private func enterCutMode(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         isEraserActive = true; result(nil)
