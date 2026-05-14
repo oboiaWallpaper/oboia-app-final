@@ -1,5 +1,4 @@
-// RoomScanner.swift
-// OBOIA - Complete LiDAR RoomPlan Scanner (coaching disabled, data fix)
+// RoomScanner.swift – delegate set BEFORE session runs
 
 import RoomPlan
 import ARKit
@@ -55,9 +54,11 @@ final class RoomScanner: NSObject {
         isScanning = true
 
         let session = RoomCaptureSession()
-        var config = RoomCaptureSession.Configuration()
-        config.isCoachingEnabled = false   // ✅ FIX: coaching overlay blocks UI
-        session.run(configuration: config)
+
+        // ✅ SET DELEGATE FIRST before session runs
+        session.delegate = self
+        roomBuilder = RoomBuilder(options: [])
+        self.captureSession = session
 
         if let arView = arView {
             arView.session = session.arSession
@@ -66,9 +67,10 @@ final class RoomScanner: NSObject {
             arView.debugOptions = [.showFeaturePoints]
         }
 
-        session.delegate = self
-        roomBuilder = RoomBuilder(options: [])
-        self.captureSession = session
+        // ✅ RUN AFTER delegate is set
+        var config = RoomCaptureSession.Configuration()
+        config.isCoachingEnabled = false
+        session.run(configuration: config)
     }
 
     func stop(completion: @escaping (ScanSnapshot?) -> Void) {
@@ -145,7 +147,6 @@ final class RoomScanner: NSObject {
         let snapshot = ScanSnapshot(surfaces: currentSurfaces, objects: currentObjects)
         if let jsonData = try? JSONEncoder().encode(snapshot),
            let jsonString = String(data: jsonData, encoding: .utf8) {
-            // FIX: Wrap jsonString in a dict so WallpaperARView cast succeeds
             eventSink?(["type": "scanUpdate", "data": ["data": jsonString]])
         }
     }
