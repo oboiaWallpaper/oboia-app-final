@@ -306,10 +306,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             verts.append(SCNVector3(ptr.pointee.x, ptr.pointee.y, ptr.pointee.z))
         }
 
-        // ── Classification (ARGeometrySource — has offset + stride) ──
-        let cSrc = geo.classification
+        // ── Classification (ARGeometrySource? — OPTIONAL, must unwrap) ──
+        let cSrcOpt = geo.classification
+        let hasClassification = (cSrcOpt != nil)
 
-        // ── Faces (ARGeometryElement — NO offset/stride, flat packed) ──
+        // ── Faces (ARGeometryElement — flat packed buffer) ──
         let fEl = geo.faces
         let bpi = fEl.bytesPerIndex         // 2 or 4
         let ipf = fEl.indexCountPerPrimitive // 3 for triangles
@@ -321,11 +322,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var openIdx:    [UInt32] = []
 
         for f in 0..<faceCount {
-            // Classification value for this face
-            let cPtr = cSrc.buffer.contents()
-                .advanced(by: cSrc.offset + cSrc.stride * f)
-                .assumingMemoryBound(to: UInt8.self)
-            let cls = ARMeshClassification(rawValue: Int(cPtr.pointee)) ?? .none
+            // Get classification for this face (default to .wall if no data)
+            var cls: ARMeshClassification = .wall
+            if hasClassification, let cSrc = cSrcOpt {
+                let cPtr = cSrc.buffer.contents()
+                    .advanced(by: cSrc.offset + cSrc.stride * f)
+                    .assumingMemoryBound(to: UInt8.self)
+                cls = ARMeshClassification(rawValue: Int(cPtr.pointee)) ?? .none
+            }
 
             // Triangle indices (flat packed in face buffer)
             var tri: [UInt32] = []
@@ -345,7 +349,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             case .ceiling:        ceilIdx.append(contentsOf: tri)
             case .floor:          floorIdx.append(contentsOf: tri)
             case .door, .window:  openIdx.append(contentsOf: tri)
-            default: break // skip unclassified
+            default:              wallIdx.append(contentsOf: tri) // unclassified → treat as wall
             }
         }
 
