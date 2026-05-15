@@ -1,5 +1,5 @@
-// lib/screens/ar/ar_screen.dart — DIAGNOSTIC v3
-// Every log line triggers setState. Try/catch on all native calls.
+// lib/screens/ar/ar_screen.dart — MESH SCAN UI v2 (AUDITED)
+// Clean UI for LiDAR mesh wireframe + wallpaper application
 
 import 'dart:async';
 import 'dart:convert';
@@ -31,12 +31,13 @@ class _ARScreenState extends State<ARScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
 
-  String _nativeStatus = "Initializing...";
+  String _statusText = "Initializing...";
   final List<String> _logLines = [];
   int _scanEventCount = 0;
 
   bool _isScanning = false;
   bool _hasSnapshot = false;
+  bool _showDebugLog = false;
   List<DetectedSurface> _scannedSurfaces = [];
   int? _currentWallIndex;
 
@@ -56,26 +57,25 @@ class _ARScreenState extends State<ARScreen> {
     _eventSub = _arService.events.listen(_onAREvent);
   }
 
-  /// ALWAYS calls setState so every message renders immediately
   void _log(String msg) {
     if (!mounted) return;
     setState(() {
       _logLines.insert(0, '[${DateTime.now().toString().substring(11, 19)}] $msg');
       if (_logLines.length > 30) _logLines.removeLast();
-      _nativeStatus = msg;
     });
   }
 
   void _onAREvent(AREvent event) {
     if (event.type == 'boot') {
-      final msg = event.data['status'] ?? 'boot';
+      final msg = (event.data['status'] ?? 'boot').toString();
       _log('[BOOT] $msg');
+      setState(() => _statusText = msg);
     } else if (event.type == 'error') {
       final msg = event.errorMessage ?? 'Unknown error';
       _log('[ERROR] $msg');
+      setState(() => _statusText = 'ERROR: $msg');
     } else if (event.type == 'scanUpdate') {
       _scanEventCount++;
-      _log('[SCAN] event #$_scanEventCount');
       final dataStr = event.data['data'] as String? ?? '';
       if (dataStr.isNotEmpty) {
         try {
@@ -86,7 +86,7 @@ class _ARScreenState extends State<ARScreen> {
                 .map((e) => DetectedSurface.fromJson(e as Map<String, dynamic>))
                 .toList();
           });
-          _log('[SCAN] ${_scannedSurfaces.length} surfaces parsed');
+          _log('[SCAN] ${_scannedSurfaces.length} surfaces');
         } catch (e) {
           _log('[SCAN] parse error: $e');
         }
@@ -94,37 +94,38 @@ class _ARScreenState extends State<ARScreen> {
     } else if (event.type == 'scanComplete') {
       setState(() { _isScanning = false; _hasSnapshot = true; });
       _log('[COMPLETE] ${_scannedSurfaces.length} surfaces');
-      if (widget.wallpaper != null) {
-        for (int i = 0; i < _scannedSurfaces.length; i++) {
-          final s = _scannedSurfaces[i];
-          if (!s.excluded && s.type == 'wall') {
-            _arService.placeWallpaper(
-              wallpaper: widget.wallpaper!,
-              wallIndex: i,
-              pricePerRoll: widget.pricePerRoll,
-            );
-          }
-        }
+      // Auto-apply wallpaper if selected
+      if (widget.wallpaper != null && _scannedSurfaces.isNotEmpty) {
+        _applyWallpaper();
       }
     } else if (event.type == 'wallpaperPlaced') {
       final success = event.data['success'] as bool? ?? false;
-      _log('[PLACE] wall ${event.wallIndex} success=$success');
+      _log('[PLACE] success=$success');
       if (success && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Wallpaper applied to wall ${event.wallIndex}')),
+          const SnackBar(content: Text('Wallpaper applied!'), duration: Duration(seconds: 2)),
         );
       }
     } else if (event.type == 'scanInstruction') {
-      final instruction = event.data['instruction'] ?? '';
-      _log('[INSTRUCTION] $instruction');
-    } else if (event.type == 'arModeChanged') {
-      _log('[MODE] ${event.data['mode']}');
+      _log('[INSTRUCTION] ${event.data['instruction']}');
     } else if (event.type == 'wallDetected') {
-      if (!_isScanning) {
-        _log('[wallDetected]');
-      }
+      // Suppress spam
     } else {
       _log('[${event.type}] ${event.data}');
+    }
+  }
+
+  Future<void> _applyWallpaper() async {
+    if (widget.wallpaper == null) return;
+    _log('Applying wallpaper...');
+    try {
+      await _arService.placeWallpaper(
+        wallpaper: widget.wallpaper!,
+        wallIndex: 0,
+        pricePerRoll: widget.pricePerRoll,
+      );
+    } catch (e) {
+      _log('placeWallpaper error: $e');
     }
   }
 
@@ -136,59 +137,31 @@ class _ARScreenState extends State<ARScreen> {
       _scanEventCount = 0;
     });
 
-    // STEP 1: setARMode
-    _log('DART: calling setARMode(scanning)...');
+    _log('DART: setARMode(scanning)...');
     try {
       await _arService.setARMode('scanning');
-      _log('DART: setARMode RETURNED OK ✅');
+      _log('DART: setARMode OK ✅');
     } catch (e) {
-      _log('DART: setARMode THREW ❌: $e');
-      return;
+      _log('DART: setARMode THREW: $e');
     }
 
-    // STEP 2: startScan
-    _log('DART: calling startScan()...');
+    _log('DART: startScan()...');
     try {
       await _arService.startScan();
-      _log('DART: startScan RETURNED OK ✅');
+      _log('DART: startScan OK ✅');
     } catch (e) {
-      _log('DART: startScan THREW ❌: $e');
-      return;
+      _log('DART: startScan THREW: $e');
     }
-
-    // STEP 3: Timer to check if events arrive
-    _log('DART: waiting for scan events...');
-    Future.delayed(const Duration(seconds: 5), () {
-      if (mounted && _isScanning && _scanEventCount == 0) {
-        _log('⚠️ 5s elapsed, still 0 scan events');
-      }
-    });
-    Future.delayed(const Duration(seconds: 15), () {
-      if (mounted && _isScanning && _scanEventCount == 0) {
-        _log('❌ 15s elapsed, 0 scan events — RoomPlan not working');
-      }
-    });
   }
 
   Future<void> _stopScan() async {
-    _log('DART: calling stopScan()...');
+    _log('DART: stopScan()...');
     try {
       await _arService.stopScan();
-      _log('DART: stopScan RETURNED OK');
+      _log('DART: stopScan OK');
     } catch (e) {
       _log('DART: stopScan THREW: $e');
     }
-  }
-
-  void _toggleSurfaceExclusion(String id) { _arService.toggleSurfaceExclusion(id); }
-  void _enterEraserMode(int wallIndex) {
-    setState(() => _currentWallIndex = wallIndex);
-    _arService.selectWall(wallIndex);
-    _arService.enterCutMode(wallIndex);
-  }
-  void _exitEraserMode() {
-    setState(() => _currentWallIndex = null);
-    _arService.exitCutMode();
   }
 
   @override
@@ -198,24 +171,24 @@ class _ARScreenState extends State<ARScreen> {
     super.dispose();
   }
 
-  Widget _buildCameraView() {
-    return Positioned.fill(
-      child: UiKitView(
-        viewType: 'com.oboia/ar_view',
-        creationParams: const <String, dynamic>{},
-        creationParamsCodec: const StandardMessageCodec(),
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
+    final wallCount = _scannedSurfaces.where((s) => s.type == 'wall').length;
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          _buildCameraView(),
+          // Camera + AR view
+          Positioned.fill(
+            child: UiKitView(
+              viewType: 'com.oboia/ar_view',
+              creationParams: const <String, dynamic>{},
+              creationParamsCodec: const StandardMessageCodec(),
+            ),
+          ),
 
+          // Back button
           Positioned(
             top: MediaQuery.of(context).padding.top + 8,
             left: 8,
@@ -226,132 +199,158 @@ class _ARScreenState extends State<ARScreen> {
             ),
           ),
 
-          // DIAGNOSTIC LOG
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 44,
-            left: 8, right: 8,
-            child: IgnorePointer(
+          // ═══════════════════════════════════════════════
+          // SCANNING: Instruction banner (like competitor)
+          // ═══════════════════════════════════════════════
+          if (_isScanning)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 8,
+              left: 60, right: 60,
               child: Container(
-                constraints: const BoxConstraints(maxHeight: 220),
-                padding: const EdgeInsets.all(6),
-                color: Colors.black87,
-                child: SingleChildScrollView(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Status: $_nativeStatus',
-                        style: const TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
-                      ),
-                      Text(
-                        'Scan events: $_scanEventCount | Surfaces: ${_scannedSurfaces.length} | Scanning: $_isScanning',
-                        style: const TextStyle(color: Colors.yellowAccent, fontSize: 10),
-                      ),
-                      const Divider(color: Colors.white24, height: 8),
-                      ..._logLines.take(20).map((line) => Text(
-                        line,
-                        style: const TextStyle(color: Colors.white70, fontSize: 9),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      )),
-                    ],
-                  ),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.9),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'Scan the walls you want\nto wallpaper',
+                  style: const TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600),
+                  textAlign: TextAlign.center,
                 ),
               ),
             ),
-          ),
 
-          if (widget.wallpaper != null)
-            SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(48, 12, 12, 12),
-                child: Row(children: [
-                  const Spacer(),
-                  Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                    Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 14)),
-                    Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 11)),
-                  ]),
-                ]),
-              ),
-            ),
-
+          // SCANNING: Status + Done button
           if (_isScanning) ...[
+            // Status pill
             Positioned(
-              bottom: 180,
-              left: 20, right: 20,
-              child: Text(
-                _scannedSurfaces.isEmpty
-                    ? 'Move slowly around the room...'
-                    : '${_scannedSurfaces.where((s) => s.type == "wall").length} walls detected',
-                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
-              ),
-            ),
-            Positioned(
-              bottom: 80, left: 0, right: 0,
-              child: SizedBox(
-                height: 100,
-                child: ListView.builder(
-                  itemCount: _scannedSurfaces.length,
-                  itemBuilder: (context, index) {
-                    final s = _scannedSurfaces[index];
-                    return ListTile(
-                      dense: true,
-                      leading: Icon(_iconForType(s.type), color: s.excluded ? Colors.grey : goldColor, size: 20),
-                      title: Text('${s.type} ${index+1}', style: TextStyle(color: s.excluded ? Colors.grey : Colors.white, fontSize: 13)),
-                      subtitle: Text('${s.width.toStringAsFixed(1)}×${s.height.toStringAsFixed(1)}m | ${s.area.toStringAsFixed(1)}m²', style: const TextStyle(color: Colors.white70, fontSize: 10)),
-                      trailing: Switch(value: !s.excluded, onChanged: (_) => _toggleSurfaceExclusion(s.id), activeColor: goldColor),
-                    );
-                  },
+              bottom: 100, left: 20, right: 20,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  _statusText,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
             ),
+            // Done button
             Positioned(
-              bottom: 20, left: 40, right: 40,
+              bottom: 30, left: 40, right: 40,
               child: ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: goldColor,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                ),
                 onPressed: _stopScan,
-                child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black)),
+                child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)),
               ),
             ),
           ],
 
-          if (_hasSnapshot && !_isScanning)
-            Positioned(
-              bottom: 20, left: 8, right: 8,
-              child: SizedBox(
-                height: 150,
-                child: ListView.builder(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: _scannedSurfaces.length,
-                  itemBuilder: (context, index) {
-                    final s = _scannedSurfaces[index];
-                    if (s.type != 'wall' || s.excluded) return const SizedBox.shrink();
-                    return GestureDetector(
-                      onTap: () => _enterEraserMode(index),
-                      child: Container(
-                        width: 130, margin: const EdgeInsets.symmetric(horizontal: 6),
-                        decoration: BoxDecoration(color: goldColor.withOpacity(0.2), borderRadius: BorderRadius.circular(12), border: Border.all(color: goldColor)),
+          // ═══════════════════════════════════════════════
+          // POST-SCAN: Wall cards + Apply button
+          // ═══════════════════════════════════════════════
+          if (_hasSnapshot && !_isScanning) ...[
+            if (_scannedSurfaces.isNotEmpty)
+              Positioned(
+                bottom: 80, left: 8, right: 8,
+                child: SizedBox(
+                  height: 110,
+                  child: ListView.builder(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: _scannedSurfaces.length,
+                    itemBuilder: (context, index) {
+                      final s = _scannedSurfaces[index];
+                      if (s.type != 'wall') return const SizedBox.shrink();
+                      return Container(
+                        width: 120, margin: const EdgeInsets.symmetric(horizontal: 6),
+                        decoration: BoxDecoration(
+                          color: goldColor.withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: goldColor),
+                        ),
                         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                          Text('Wall ${index+1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
-                          Text('${s.width.toStringAsFixed(1)}×${s.height.toStringAsFixed(1)}', style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                          Text('Wall ${index + 1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
+                          const SizedBox(height: 4),
+                          Text('${s.width.toStringAsFixed(1)}×${s.height.toStringAsFixed(1)}m', style: const TextStyle(color: Colors.white70, fontSize: 11)),
                           Text('${s.area.toStringAsFixed(1)} m²', style: const TextStyle(color: goldColor, fontSize: 12, fontWeight: FontWeight.bold)),
-                          IconButton(icon: const Icon(Icons.brush, color: Colors.white70, size: 20), onPressed: () => _enterEraserMode(index), padding: EdgeInsets.zero),
                         ]),
-                      ),
-                    );
-                  },
+                      );
+                    },
+                  ),
+                ),
+              ),
+            if (widget.wallpaper != null)
+              Positioned(
+                bottom: 20, left: 40, right: 40,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: goldColor,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                  ),
+                  onPressed: _applyWallpaper,
+                  child: const Text('Apply Wallpaper', style: TextStyle(fontSize: 16, color: Colors.black, fontWeight: FontWeight.bold)),
+                ),
+              ),
+          ],
+
+          // Wallpaper info (top right, when not scanning)
+          if (widget.wallpaper != null && !_isScanning)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 8,
+              right: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                  Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 10)),
+                ]),
+              ),
+            ),
+
+          // ═══════════════════════════════════════════════
+          // DEBUG LOG (tap anywhere on status to toggle)
+          // ═══════════════════════════════════════════════
+          if (!_isScanning && !_hasSnapshot)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 44,
+              left: 8, right: 8,
+              child: GestureDetector(
+                onDoubleTap: () => setState(() => _showDebugLog = !_showDebugLog),
+                child: Container(
+                  padding: const EdgeInsets.all(6),
+                  color: Colors.black54,
+                  child: Text('Status: $_statusText', style: const TextStyle(color: Colors.greenAccent, fontSize: 10)),
                 ),
               ),
             ),
 
-          if (_currentWallIndex != null)
+          if (_showDebugLog)
             Positioned(
-              bottom: 20, left: 40, right: 40,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, padding: const EdgeInsets.symmetric(vertical: 12)),
-                onPressed: _exitEraserMode,
-                child: const Text('Exit Eraser', style: TextStyle(color: Colors.white)),
+              top: MediaQuery.of(context).padding.top + 70,
+              left: 8, right: 8,
+              child: IgnorePointer(
+                child: Container(
+                  constraints: const BoxConstraints(maxHeight: 200),
+                  padding: const EdgeInsets.all(6),
+                  color: Colors.black87,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: _logLines.take(15).map((l) => Text(l, style: const TextStyle(color: Colors.white70, fontSize: 9), maxLines: 2, overflow: TextOverflow.ellipsis)).toList(),
+                    ),
+                  ),
+                ),
               ),
             ),
         ],
@@ -365,16 +364,6 @@ class _ARScreenState extends State<ARScreen> {
             )
           : null,
     );
-  }
-
-  IconData _iconForType(String type) {
-    switch (type) {
-      case 'wall': return Icons.dashboard;
-      case 'door': return Icons.door_front_door;
-      case 'window': return Icons.window;
-      case 'opening': return Icons.arrow_right_alt;
-      default: return Icons.help_outline;
-    }
   }
 }
 
