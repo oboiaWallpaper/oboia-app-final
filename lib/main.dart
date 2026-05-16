@@ -143,9 +143,11 @@ class OboiaApp extends StatelessWidget {
             } else if (extra is WallpaperModel) {
               wp = extra;
             }
+            // CHANGED: also pass pricePerRoll from the wallpaper to ARScreen
             return ARScreen(
               initialWallpaper: wp,
               initialShop: sh,
+              pricePerRoll: wp?.price,
             );
           },
         ),
