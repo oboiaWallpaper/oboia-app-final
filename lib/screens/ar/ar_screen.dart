@@ -1,5 +1,4 @@
-// lib/screens/ar/ar_screen.dart — PHASE A
-// Total wall area from mesh, auto-apply wallpaper, rolls + price
+// lib/screens/ar/ar_screen.dart — PHASE A + DEBUG LOG ALWAYS VISIBLE
 
 import 'dart:async';
 import 'dart:convert';
@@ -44,6 +43,8 @@ class _ARScreenState extends State<ARScreen> {
   @override
   void initState() {
     super.initState();
+    _log('initState: wallpaper=${widget.wallpaper?.name ?? "NONE"}');
+    _log('albedoUrl=${widget.wallpaper?.pbr.albedoUrl.substring(0, 50) ?? "EMPTY"}...');
     _initAR();
   }
 
@@ -51,8 +52,9 @@ class _ARScreenState extends State<ARScreen> {
     try {
       await Future.delayed(const Duration(milliseconds: 1200));
       await _arService.initAR();
+      _log('initAR completed');
     } catch (e) {
-      _log('Init error: $e');
+      _log('initAR error: $e');
     }
     _eventSub = _arService.events.listen(_onAREvent);
   }
@@ -80,7 +82,6 @@ class _ARScreenState extends State<ARScreen> {
         break;
 
       case 'scanComplete':
-        // Extract total wall area from mesh calculation
         final area = event.data['totalWallArea'];
         final segs = event.data['meshSegments'];
         setState(() {
@@ -89,42 +90,41 @@ class _ARScreenState extends State<ARScreen> {
           if (area is num) _totalWallArea = area.toDouble();
           if (segs is num) _meshSegments = segs.toInt();
         });
-        _log('[DONE] ${_totalWallArea.toStringAsFixed(1)} m², $_meshSegments mesh');
+        _log('[DONE] area=${_totalWallArea.toStringAsFixed(1)}m² segs=$_meshSegments');
 
-        // Auto-apply wallpaper if selected
+        // Auto-apply wallpaper
         if (widget.wallpaper != null) {
+          _log('Auto-applying wallpaper...');
           _applyWallpaper();
+        } else {
+          _log('No wallpaper selected — skipping auto-apply');
         }
         break;
 
       case 'wallpaperPlaced':
         final ok = event.data['success'] as bool? ?? false;
+        final msg = event.data['message'] ?? '';
         if (ok) {
           setState(() => _wallpaperApplied = true);
           _log('[WALLPAPER] Applied ✅');
         } else {
-          final msg = event.data['message'] ?? 'Failed';
-          _log('[WALLPAPER] Failed: $msg');
+          _log('[WALLPAPER] FAILED: $msg');
         }
         break;
 
       case 'wallDetected':
-        break; // suppress
+        break;
 
       default:
         _log('[${event.type}] ${event.data}');
     }
   }
 
-  // ── Roll calculation ───────────────────────────────────────
-
   double get _rollWidth => widget.wallpaper?.rollWidth ?? 0.53;
   double get _rollLength => widget.wallpaper?.rollLength ?? 10.0;
   double get _rollArea => _rollWidth * _rollLength;
   int get _rollsNeeded => _rollArea > 0 ? (_totalWallArea / _rollArea).ceil() : 0;
   double get _totalPrice => _rollsNeeded * widget.pricePerRoll;
-
-  // ── Actions ────────────────────────────────────────────────
 
   Future<void> _startScan() async {
     setState(() {
@@ -134,34 +134,43 @@ class _ARScreenState extends State<ARScreen> {
       _totalWallArea = 0;
       _meshSegments = 0;
     });
+    _log('DART: setARMode + startScan...');
     try {
       await _arService.setARMode('scanning');
+      _log('DART: setARMode OK');
       await _arService.startScan();
-      _log('Scan started');
+      _log('DART: startScan OK');
     } catch (e) {
-      _log('startScan error: $e');
+      _log('DART: scan error: $e');
     }
   }
 
   Future<void> _stopScan() async {
+    _log('DART: stopping scan...');
     try {
       await _arService.stopScan();
+      _log('DART: stopScan OK');
     } catch (e) {
-      _log('stopScan error: $e');
+      _log('DART: stopScan error: $e');
     }
   }
 
   Future<void> _applyWallpaper() async {
-    if (widget.wallpaper == null) return;
-    setState(() => _statusText = 'Applying wallpaper...');
+    if (widget.wallpaper == null) {
+      _log('_applyWallpaper: no wallpaper!');
+      return;
+    }
+    _log('Calling placeWallpaper...');
+    _log('  albedo: ${widget.wallpaper!.pbr.albedoUrl.isNotEmpty ? "YES" : "EMPTY"}');
     try {
       await _arService.placeWallpaper(
         wallpaper: widget.wallpaper!,
         wallIndex: 0,
         pricePerRoll: widget.pricePerRoll,
       );
+      _log('placeWallpaper returned');
     } catch (e) {
-      _log('Apply error: $e');
+      _log('placeWallpaper THREW: $e');
     }
   }
 
@@ -169,6 +178,7 @@ class _ARScreenState extends State<ARScreen> {
     try {
       await _arService.clearWall(0);
       setState(() => _wallpaperApplied = false);
+      _log('Wallpaper cleared');
     } catch (e) {
       _log('Clear error: $e');
     }
@@ -181,17 +191,13 @@ class _ARScreenState extends State<ARScreen> {
     super.dispose();
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // BUILD
-  // ═══════════════════════════════════════════════════════════
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // AR Camera View
+          // AR Camera
           Positioned.fill(
             child: UiKitView(
               viewType: 'com.oboia/ar_view',
@@ -212,10 +218,46 @@ class _ARScreenState extends State<ARScreen> {
           ),
 
           // ═══════════════════════════════════════════════
+          // ALWAYS-VISIBLE DEBUG LOG (top area)
+          // ═══════════════════════════════════════════════
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 44,
+            left: 8, right: 8,
+            child: IgnorePointer(
+              child: Container(
+                constraints: const BoxConstraints(maxHeight: 160),
+                padding: const EdgeInsets.all(6),
+                color: Colors.black87,
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Status: $_statusText',
+                        style: const TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
+                      ),
+                      Text(
+                        'Scan: $_isScanning | Done: $_scanDone | WP: $_wallpaperApplied | Area: ${_totalWallArea.toStringAsFixed(1)}m²',
+                        style: const TextStyle(color: Colors.yellowAccent, fontSize: 10),
+                      ),
+                      const Divider(color: Colors.white24, height: 6),
+                      ..._logLines.take(12).map((l) => Text(
+                        l,
+                        style: const TextStyle(color: Colors.white70, fontSize: 9),
+                        maxLines: 2, overflow: TextOverflow.ellipsis,
+                      )),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // ═══════════════════════════════════════════════
           // SCANNING PHASE
           // ═══════════════════════════════════════════════
           if (_isScanning) ...[
-            // Top instruction banner
+            // Instruction banner
             Positioned(
               top: MediaQuery.of(context).padding.top + 8,
               left: 60, right: 60,
@@ -224,29 +266,11 @@ class _ARScreenState extends State<ARScreen> {
                 decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.92),
                   borderRadius: BorderRadius.circular(12),
-                  boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8)],
                 ),
                 child: const Text(
                   'Scan the walls you want\nto wallpaper',
                   style: TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600),
                   textAlign: TextAlign.center,
-                ),
-              ),
-            ),
-            // Bottom status
-            Positioned(
-              bottom: 100, left: 20, right: 20,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Text(
-                  _statusText,
-                  style: const TextStyle(color: Colors.white70, fontSize: 13),
-                  textAlign: TextAlign.center,
-                  maxLines: 1, overflow: TextOverflow.ellipsis,
                 ),
               ),
             ),
@@ -258,7 +282,6 @@ class _ARScreenState extends State<ARScreen> {
                   backgroundColor: goldColor,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                  elevation: 4,
                 ),
                 onPressed: _stopScan,
                 child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)),
@@ -270,17 +293,14 @@ class _ARScreenState extends State<ARScreen> {
           // POST-SCAN PHASE
           // ═══════════════════════════════════════════════
           if (_scanDone && !_isScanning) ...[
-            // Wallpaper name (top right)
+            // Wallpaper info (top right)
             if (widget.wallpaper != null)
               Positioned(
                 top: MediaQuery.of(context).padding.top + 8,
                 right: 12,
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
+                  decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(10)),
                   child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
                     Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
                     Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 11)),
@@ -295,28 +315,21 @@ class _ARScreenState extends State<ARScreen> {
                 padding: EdgeInsets.fromLTRB(20, 16, 20, MediaQuery.of(context).padding.bottom + 16),
                 decoration: const BoxDecoration(
                   color: Color(0xF0222222),
-                  borderRadius: BorderRadius.only(
-                    topLeft: Radius.circular(24),
-                    topRight: Radius.circular(24),
-                  ),
+                  borderRadius: BorderRadius.only(topLeft: Radius.circular(24), topRight: Radius.circular(24)),
                 ),
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  // Drag handle
                   Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
                   const SizedBox(height: 16),
 
-                  // Stats row
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceAround,
-                    children: [
-                      _statColumn('Wall Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
-                      _statColumn('Rolls', '$_rollsNeeded'),
-                      _statColumn('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
-                    ],
-                  ),
+                  // Stats
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                    _statColumn('Wall Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
+                    _statColumn('Rolls', '$_rollsNeeded'),
+                    _statColumn('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
+                  ]),
                   const SizedBox(height: 16),
 
-                  // Action buttons
+                  // Buttons
                   if (!_wallpaperApplied && widget.wallpaper != null)
                     SizedBox(
                       width: double.infinity,
@@ -332,7 +345,6 @@ class _ARScreenState extends State<ARScreen> {
                     ),
 
                   if (_wallpaperApplied) ...[
-                    // Applied state — show change/clear/rescan options
                     Row(children: [
                       Expanded(
                         child: ElevatedButton.icon(
@@ -361,7 +373,6 @@ class _ARScreenState extends State<ARScreen> {
                       ),
                     ]),
                     const SizedBox(height: 10),
-                    // Rescan button
                     TextButton.icon(
                       onPressed: _startScan,
                       icon: const Icon(Icons.replay, color: Colors.white38, size: 16),
@@ -372,23 +383,6 @@ class _ARScreenState extends State<ARScreen> {
               ),
             ),
           ],
-
-          // ═══════════════════════════════════════════════
-          // IDLE: Status + Start Scan button
-          // ═══════════════════════════════════════════════
-          if (!_isScanning && !_scanDone)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 48,
-              left: 12, right: 12,
-              child: Container(
-                padding: const EdgeInsets.all(6),
-                color: Colors.black45,
-                child: Text(
-                  _statusText,
-                  style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
-                ),
-              ),
-            ),
         ],
       ),
       floatingActionButton: !_isScanning && !_scanDone
