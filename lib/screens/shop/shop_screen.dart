@@ -167,10 +167,11 @@ class _ShopScreenState extends State<ShopScreen> {
     );
   }
 
+  // CHANGED: now passes wallpaper and shop as extra to the /ar route
   void _openAR(Shop? shop, Wallpaper w) {
     if (shop == null) return;
     context.read<ShopProvider>().setContext(shop: shop, wallpaper: w);
-    context.push('/ar');
+    context.push('/ar', extra: {'wallpaper': w, 'shop': shop});
   }
 
   Widget _banner(Shop? shop) {
