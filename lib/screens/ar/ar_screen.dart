@@ -1,5 +1,5 @@
-// lib/screens/ar/ar_screen.dart — MESH SCAN UI v2 (AUDITED)
-// Clean UI for LiDAR mesh wireframe + wallpaper application
+// lib/screens/ar/ar_screen.dart — PHASE A
+// Total wall area from mesh, auto-apply wallpaper, rolls + price
 
 import 'dart:async';
 import 'dart:convert';
@@ -33,13 +33,13 @@ class _ARScreenState extends State<ARScreen> {
 
   String _statusText = "Initializing...";
   final List<String> _logLines = [];
-  int _scanEventCount = 0;
 
   bool _isScanning = false;
-  bool _hasSnapshot = false;
-  bool _showDebugLog = false;
-  List<DetectedSurface> _scannedSurfaces = [];
-  int? _currentWallIndex;
+  bool _scanDone = false;
+  bool _wallpaperApplied = false;
+
+  double _totalWallArea = 0.0;
+  int _meshSegments = 0;
 
   @override
   void initState() {
@@ -66,58 +66,94 @@ class _ARScreenState extends State<ARScreen> {
   }
 
   void _onAREvent(AREvent event) {
-    if (event.type == 'boot') {
-      final msg = (event.data['status'] ?? 'boot').toString();
-      _log('[BOOT] $msg');
-      setState(() => _statusText = msg);
-    } else if (event.type == 'error') {
-      final msg = event.errorMessage ?? 'Unknown error';
-      _log('[ERROR] $msg');
-      setState(() => _statusText = 'ERROR: $msg');
-    } else if (event.type == 'scanUpdate') {
-      _scanEventCount++;
-      final dataStr = event.data['data'] as String? ?? '';
-      if (dataStr.isNotEmpty) {
-        try {
-          final Map<String, dynamic> json = jsonDecode(dataStr);
-          final List<dynamic> surfaceList = json['surfaces'] ?? [];
-          setState(() {
-            _scannedSurfaces = surfaceList
-                .map((e) => DetectedSurface.fromJson(e as Map<String, dynamic>))
-                .toList();
-          });
-          _log('[SCAN] ${_scannedSurfaces.length} surfaces');
-        } catch (e) {
-          _log('[SCAN] parse error: $e');
+    switch (event.type) {
+      case 'boot':
+        final msg = (event.data['status'] ?? '').toString();
+        setState(() => _statusText = msg);
+        _log('[BOOT] $msg');
+        break;
+
+      case 'error':
+        final msg = event.errorMessage ?? 'Unknown';
+        setState(() => _statusText = 'ERROR: $msg');
+        _log('[ERROR] $msg');
+        break;
+
+      case 'scanComplete':
+        // Extract total wall area from mesh calculation
+        final area = event.data['totalWallArea'];
+        final segs = event.data['meshSegments'];
+        setState(() {
+          _isScanning = false;
+          _scanDone = true;
+          if (area is num) _totalWallArea = area.toDouble();
+          if (segs is num) _meshSegments = segs.toInt();
+        });
+        _log('[DONE] ${_totalWallArea.toStringAsFixed(1)} m², $_meshSegments mesh');
+
+        // Auto-apply wallpaper if selected
+        if (widget.wallpaper != null) {
+          _applyWallpaper();
         }
-      }
-    } else if (event.type == 'scanComplete') {
-      setState(() { _isScanning = false; _hasSnapshot = true; });
-      _log('[COMPLETE] ${_scannedSurfaces.length} surfaces');
-      // Auto-apply wallpaper if selected
-      if (widget.wallpaper != null && _scannedSurfaces.isNotEmpty) {
-        _applyWallpaper();
-      }
-    } else if (event.type == 'wallpaperPlaced') {
-      final success = event.data['success'] as bool? ?? false;
-      _log('[PLACE] success=$success');
-      if (success && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Wallpaper applied!'), duration: Duration(seconds: 2)),
-        );
-      }
-    } else if (event.type == 'scanInstruction') {
-      _log('[INSTRUCTION] ${event.data['instruction']}');
-    } else if (event.type == 'wallDetected') {
-      // Suppress spam
-    } else {
-      _log('[${event.type}] ${event.data}');
+        break;
+
+      case 'wallpaperPlaced':
+        final ok = event.data['success'] as bool? ?? false;
+        if (ok) {
+          setState(() => _wallpaperApplied = true);
+          _log('[WALLPAPER] Applied ✅');
+        } else {
+          final msg = event.data['message'] ?? 'Failed';
+          _log('[WALLPAPER] Failed: $msg');
+        }
+        break;
+
+      case 'wallDetected':
+        break; // suppress
+
+      default:
+        _log('[${event.type}] ${event.data}');
+    }
+  }
+
+  // ── Roll calculation ───────────────────────────────────────
+
+  double get _rollWidth => widget.wallpaper?.rollWidth ?? 0.53;
+  double get _rollLength => widget.wallpaper?.rollLength ?? 10.0;
+  double get _rollArea => _rollWidth * _rollLength;
+  int get _rollsNeeded => _rollArea > 0 ? (_totalWallArea / _rollArea).ceil() : 0;
+  double get _totalPrice => _rollsNeeded * widget.pricePerRoll;
+
+  // ── Actions ────────────────────────────────────────────────
+
+  Future<void> _startScan() async {
+    setState(() {
+      _isScanning = true;
+      _scanDone = false;
+      _wallpaperApplied = false;
+      _totalWallArea = 0;
+      _meshSegments = 0;
+    });
+    try {
+      await _arService.setARMode('scanning');
+      await _arService.startScan();
+      _log('Scan started');
+    } catch (e) {
+      _log('startScan error: $e');
+    }
+  }
+
+  Future<void> _stopScan() async {
+    try {
+      await _arService.stopScan();
+    } catch (e) {
+      _log('stopScan error: $e');
     }
   }
 
   Future<void> _applyWallpaper() async {
     if (widget.wallpaper == null) return;
-    _log('Applying wallpaper...');
+    setState(() => _statusText = 'Applying wallpaper...');
     try {
       await _arService.placeWallpaper(
         wallpaper: widget.wallpaper!,
@@ -125,42 +161,16 @@ class _ARScreenState extends State<ARScreen> {
         pricePerRoll: widget.pricePerRoll,
       );
     } catch (e) {
-      _log('placeWallpaper error: $e');
+      _log('Apply error: $e');
     }
   }
 
-  Future<void> _startScan() async {
-    setState(() {
-      _isScanning = true;
-      _hasSnapshot = false;
-      _scannedSurfaces.clear();
-      _scanEventCount = 0;
-    });
-
-    _log('DART: setARMode(scanning)...');
+  Future<void> _clearWallpaper() async {
     try {
-      await _arService.setARMode('scanning');
-      _log('DART: setARMode OK ✅');
+      await _arService.clearWall(0);
+      setState(() => _wallpaperApplied = false);
     } catch (e) {
-      _log('DART: setARMode THREW: $e');
-    }
-
-    _log('DART: startScan()...');
-    try {
-      await _arService.startScan();
-      _log('DART: startScan OK ✅');
-    } catch (e) {
-      _log('DART: startScan THREW: $e');
-    }
-  }
-
-  Future<void> _stopScan() async {
-    _log('DART: stopScan()...');
-    try {
-      await _arService.stopScan();
-      _log('DART: stopScan OK');
-    } catch (e) {
-      _log('DART: stopScan THREW: $e');
+      _log('Clear error: $e');
     }
   }
 
@@ -171,15 +181,17 @@ class _ARScreenState extends State<ARScreen> {
     super.dispose();
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // BUILD
+  // ═══════════════════════════════════════════════════════════
+
   @override
   Widget build(BuildContext context) {
-    final wallCount = _scannedSurfaces.where((s) => s.type == 'wall').length;
-
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // Camera + AR view
+          // AR Camera View
           Positioned.fill(
             child: UiKitView(
               viewType: 'com.oboia/ar_view',
@@ -200,29 +212,28 @@ class _ARScreenState extends State<ARScreen> {
           ),
 
           // ═══════════════════════════════════════════════
-          // SCANNING: Instruction banner (like competitor)
+          // SCANNING PHASE
           // ═══════════════════════════════════════════════
-          if (_isScanning)
+          if (_isScanning) ...[
+            // Top instruction banner
             Positioned(
               top: MediaQuery.of(context).padding.top + 8,
               left: 60, right: 60,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.9),
+                  color: Colors.white.withOpacity(0.92),
                   borderRadius: BorderRadius.circular(12),
+                  boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8)],
                 ),
-                child: Text(
+                child: const Text(
                   'Scan the walls you want\nto wallpaper',
-                  style: const TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600),
+                  style: TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600),
                   textAlign: TextAlign.center,
                 ),
               ),
             ),
-
-          // SCANNING: Status + Done button
-          if (_isScanning) ...[
-            // Status pill
+            // Bottom status
             Positioned(
               bottom: 100, left: 20, right: 20,
               child: Container(
@@ -233,10 +244,9 @@ class _ARScreenState extends State<ARScreen> {
                 ),
                 child: Text(
                   _statusText,
-                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
                   textAlign: TextAlign.center,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
                 ),
               ),
             ),
@@ -248,6 +258,7 @@ class _ARScreenState extends State<ARScreen> {
                   backgroundColor: goldColor,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                  elevation: 4,
                 ),
                 onPressed: _stopScan,
                 child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)),
@@ -256,106 +267,131 @@ class _ARScreenState extends State<ARScreen> {
           ],
 
           // ═══════════════════════════════════════════════
-          // POST-SCAN: Wall cards + Apply button
+          // POST-SCAN PHASE
           // ═══════════════════════════════════════════════
-          if (_hasSnapshot && !_isScanning) ...[
-            if (_scannedSurfaces.isNotEmpty)
-              Positioned(
-                bottom: 80, left: 8, right: 8,
-                child: SizedBox(
-                  height: 110,
-                  child: ListView.builder(
-                    scrollDirection: Axis.horizontal,
-                    itemCount: _scannedSurfaces.length,
-                    itemBuilder: (context, index) {
-                      final s = _scannedSurfaces[index];
-                      if (s.type != 'wall') return const SizedBox.shrink();
-                      return Container(
-                        width: 120, margin: const EdgeInsets.symmetric(horizontal: 6),
-                        decoration: BoxDecoration(
-                          color: goldColor.withOpacity(0.2),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: goldColor),
-                        ),
-                        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                          Text('Wall ${index + 1}', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
-                          const SizedBox(height: 4),
-                          Text('${s.width.toStringAsFixed(1)}×${s.height.toStringAsFixed(1)}m', style: const TextStyle(color: Colors.white70, fontSize: 11)),
-                          Text('${s.area.toStringAsFixed(1)} m²', style: const TextStyle(color: goldColor, fontSize: 12, fontWeight: FontWeight.bold)),
-                        ]),
-                      );
-                    },
-                  ),
-                ),
-              ),
+          if (_scanDone && !_isScanning) ...[
+            // Wallpaper name (top right)
             if (widget.wallpaper != null)
               Positioned(
-                bottom: 20, left: 40, right: 40,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: goldColor,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                top: MediaQuery.of(context).padding.top + 8,
+                right: 12,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(10),
                   ),
-                  onPressed: _applyWallpaper,
-                  child: const Text('Apply Wallpaper', style: TextStyle(fontSize: 16, color: Colors.black, fontWeight: FontWeight.bold)),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+                    Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 11)),
+                  ]),
                 ),
               ),
-          ],
 
-          // Wallpaper info (top right, when not scanning)
-          if (widget.wallpaper != null && !_isScanning)
+            // Bottom summary card
             Positioned(
-              top: MediaQuery.of(context).padding.top + 8,
-              right: 12,
+              bottom: 0, left: 0, right: 0,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
-                child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                  Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
-                  Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 10)),
+                padding: EdgeInsets.fromLTRB(20, 16, 20, MediaQuery.of(context).padding.bottom + 16),
+                decoration: const BoxDecoration(
+                  color: Color(0xF0222222),
+                  borderRadius: BorderRadius.only(
+                    topLeft: Radius.circular(24),
+                    topRight: Radius.circular(24),
+                  ),
+                ),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  // Drag handle
+                  Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
+                  const SizedBox(height: 16),
+
+                  // Stats row
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _statColumn('Wall Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
+                      _statColumn('Rolls', '$_rollsNeeded'),
+                      _statColumn('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Action buttons
+                  if (!_wallpaperApplied && widget.wallpaper != null)
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: goldColor,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        ),
+                        onPressed: _applyWallpaper,
+                        child: const Text('Apply Wallpaper', style: TextStyle(fontSize: 16, color: Colors.black, fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+
+                  if (_wallpaperApplied) ...[
+                    // Applied state — show change/clear/rescan options
+                    Row(children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: goldColor,
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                          onPressed: _applyWallpaper,
+                          icon: const Icon(Icons.refresh, color: Colors.black, size: 18),
+                          label: const Text('Change', style: TextStyle(color: Colors.black, fontSize: 14, fontWeight: FontWeight.w600)),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            side: const BorderSide(color: Colors.white38),
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                          onPressed: _clearWallpaper,
+                          icon: const Icon(Icons.visibility_off, color: Colors.white70, size: 18),
+                          label: const Text('Clear', style: TextStyle(color: Colors.white70, fontSize: 14)),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 10),
+                    // Rescan button
+                    TextButton.icon(
+                      onPressed: _startScan,
+                      icon: const Icon(Icons.replay, color: Colors.white38, size: 16),
+                      label: const Text('Rescan Room', style: TextStyle(color: Colors.white38, fontSize: 13)),
+                    ),
+                  ],
                 ]),
               ),
             ),
+          ],
 
           // ═══════════════════════════════════════════════
-          // DEBUG LOG (tap anywhere on status to toggle)
+          // IDLE: Status + Start Scan button
           // ═══════════════════════════════════════════════
-          if (!_isScanning && !_hasSnapshot)
+          if (!_isScanning && !_scanDone)
             Positioned(
-              top: MediaQuery.of(context).padding.top + 44,
-              left: 8, right: 8,
-              child: GestureDetector(
-                onDoubleTap: () => setState(() => _showDebugLog = !_showDebugLog),
-                child: Container(
-                  padding: const EdgeInsets.all(6),
-                  color: Colors.black54,
-                  child: Text('Status: $_statusText', style: const TextStyle(color: Colors.greenAccent, fontSize: 10)),
-                ),
-              ),
-            ),
-
-          if (_showDebugLog)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 70,
-              left: 8, right: 8,
-              child: IgnorePointer(
-                child: Container(
-                  constraints: const BoxConstraints(maxHeight: 200),
-                  padding: const EdgeInsets.all(6),
-                  color: Colors.black87,
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: _logLines.take(15).map((l) => Text(l, style: const TextStyle(color: Colors.white70, fontSize: 9), maxLines: 2, overflow: TextOverflow.ellipsis)).toList(),
-                    ),
-                  ),
+              top: MediaQuery.of(context).padding.top + 48,
+              left: 12, right: 12,
+              child: Container(
+                padding: const EdgeInsets.all(6),
+                color: Colors.black45,
+                child: Text(
+                  _statusText,
+                  style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
                 ),
               ),
             ),
         ],
       ),
-      floatingActionButton: !_isScanning && !_hasSnapshot
+      floatingActionButton: !_isScanning && !_scanDone
           ? FloatingActionButton.extended(
               onPressed: _startScan,
               backgroundColor: goldColor,
@@ -365,19 +401,12 @@ class _ARScreenState extends State<ARScreen> {
           : null,
     );
   }
-}
 
-class DetectedSurface {
-  final String id, type;
-  final double width, height, area;
-  final bool excluded;
-  DetectedSurface({required this.id, required this.type, required this.width, required this.height, required this.area, this.excluded = false});
-  factory DetectedSurface.fromJson(Map<String, dynamic> json) => DetectedSurface(
-    id: json['id'] as String? ?? '',
-    type: json['type'] as String? ?? 'unknown',
-    width: (json['width'] as num?)?.toDouble() ?? 0.0,
-    height: (json['height'] as num?)?.toDouble() ?? 0.0,
-    area: (json['area'] as num?)?.toDouble() ?? 0.0,
-    excluded: json['excluded'] as bool? ?? false,
-  );
+  Widget _statColumn(String label, String value) {
+    return Column(children: [
+      Text(value, style: const TextStyle(color: goldColor, fontSize: 20, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 2),
+      Text(label, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+    ]);
+  }
 }
