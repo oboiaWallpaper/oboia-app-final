@@ -1,5 +1,5 @@
-// WallpaperARView.swift — PHASE A: Wireframe + Wallpaper on Mesh
-// Single ARSession, proper UV mapping, wall area from mesh
+// WallpaperARView.swift — PHASE A v2: Freeze + Wall-Only
+// Mesh freezes after Done, unclassified = hidden, no post-scan growth
 // Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
@@ -25,11 +25,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private let textureCache = TextureCache.shared
     private let eraserTool = EraserTool()
 
-    // ── Mesh state (only mutated on main thread) ─────────────
+    // ── Mesh state (main thread only) ────────────────────────
     private var meshNodes: [UUID: SCNNode] = [:]
     private var totalWallAreaSqm: Float = 0.0
     private var currentWallIndex: Int = 0
     private var wallNodes: [String: SCNNode] = [:]
+
+    // ── FREEZE FLAG: stops all mesh updates after scan ───────
+    private var meshFrozen = false
 
     // ── Wallpaper textures ───────────────────────────────────
     private var wpAlbedo: UIImage?
@@ -47,7 +50,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var pendingEvents: [[String: Any]] = []
 
     // ═══════════════════════════════════════════════════════════
-    // WIREFRAME MATERIALS (lazy, created once, reused)
+    // MATERIALS
     // ═══════════════════════════════════════════════════════════
 
     private lazy var matWallWire: SCNMaterial = {
@@ -71,8 +74,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         m.isDoubleSided = true; m.lightingModel = .constant; return m
     }()
     private lazy var matHidden: SCNMaterial = {
-        let m = SCNMaterial(); m.diffuse.contents = UIColor.clear
-        m.isDoubleSided = true; m.transparency = 0.0; return m
+        let m = SCNMaterial()
+        m.diffuse.contents = UIColor.clear
+        m.isDoubleSided = true
+        m.transparency = 0.0
+        m.writesToDepthBuffer = false
+        return m
     }()
 
     // ═══════════════════════════════════════════════════════════
@@ -106,14 +113,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     func view() -> UIView { sceneView }
 
     // ═══════════════════════════════════════════════════════════
-    // METHOD ROUTER — every method ar_service.dart calls
+    // METHOD ROUTER
     // ═══════════════════════════════════════════════════════════
 
     private func route(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any]
         switch call.method {
-
-        // ── Lifecycle ──
         case "initAR":       initAR(result: result)
         case "disposeAR":    sceneView.session.pause(); result(nil)
         case "setARMode":
@@ -121,8 +126,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             else { result(FlutterError(code: "BAD_ARG", message: "mode string required", details: nil)) }
         case "startScan":    startScan(result: result)
         case "stopScan":     stopScan(result: result)
-
-        // ── Wallpaper ──
         case "placeWallpaper", "switchWallpaper":
             placeWallpaper(args, result: result)
         case "selectWall":
@@ -139,8 +142,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(nil)
         case "getWallMeasurements":
             result(["width": 0.0, "height": 0.0, "sqm": Double(totalWallAreaSqm)])
-
-        // ── Eraser / Cut ──
         case "enterCutMode":  isEraserActive = true; result(nil)
         case "exitCutMode":   isEraserActive = false; result(nil)
         case "setBrushSize":
@@ -151,12 +152,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(nil)
         case "undoCut":       eraserTool.undoStroke(); result(nil)
         case "clearAllCuts":  eraserTool.resetMask(); result(nil)
-
-        // ── Exclusion (for future use) ──
         case "toggleSurfaceExclusion", "toggleObjectExclusion":
             result(nil)
-
-        // ── Anything else → not implemented ──
         default: result(FlutterMethodNotImplemented)
         }
     }
@@ -212,18 +209,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // SCAN — Single ARSession with LiDAR mesh
+    // SCAN — LiDAR mesh with classification
     // ═══════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan PHASE-A <<<"])
+        emit("boot", data: ["status": ">>> startScan PHASE-A v2 <<<"])
 
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             emit("error", data: ["message": "LiDAR mesh not supported"])
             result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil))
             return
         }
-        emit("boot", data: ["status": "LiDAR ✅"])
 
         // Clear previous
         for (_, n) in meshNodes { n.removeFromParentNode() }
@@ -231,9 +227,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         wallNodes.removeAll()
         totalWallAreaSqm = 0
         isWallpaperApplied = false
+        meshFrozen = false  // ← UNFREEZE so mesh builds during scan
         currentMode = .scanning
 
-        // Single ARSession — mesh + planes, no RoomPlan
         let c = ARWorldTrackingConfiguration()
         c.planeDetection = [.vertical, .horizontal]
         c.sceneReconstruction = .meshWithClassification
@@ -247,9 +243,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func stopScan(result: @escaping FlutterResult) {
+        // ═══════════════════════════════════════════════════════
+        // FREEZE: No more mesh updates after this point
+        // ═══════════════════════════════════════════════════════
+        meshFrozen = true
         currentMode = .preview
 
-        // ── Calculate total wall area from mesh triangles ──
+        // Calculate wall area from existing mesh
         totalWallAreaSqm = 0
         if let frame = sceneView.session.currentFrame {
             for anchor in frame.anchors {
@@ -257,6 +257,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 totalWallAreaSqm += computeWallArea(anchor: ma)
             }
         }
+
+        // ═══════════════════════════════════════════════════════
+        // CRITICAL: Switch to plain AR config WITHOUT mesh
+        // reconstruction. This stops new mesh anchors from
+        // being created. Camera keeps working, existing mesh
+        // nodes stay in the scene, but nothing new appears.
+        // ═══════════════════════════════════════════════════════
+        let plainConfig = ARWorldTrackingConfiguration()
+        plainConfig.planeDetection = []
+        plainConfig.environmentTexturing = .automatic
+        // Do NOT reset tracking — keep world coordinates so mesh stays aligned
+        sceneView.session.run(plainConfig, options: [])
 
         emit("scanComplete", data: [
             "totalWallArea": totalWallAreaSqm,
@@ -266,7 +278,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
-    /// Computes the total area of wall-classified triangles in world space
+    // ═══════════════════════════════════════════════════════════
+    // WALL AREA CALCULATION (only wall-classified triangles)
+    // ═══════════════════════════════════════════════════════════
+
     private func computeWallArea(anchor: ARMeshAnchor) -> Float {
         let geo = anchor.geometry
         let vSrc = geo.vertices
@@ -278,18 +293,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var area: Float = 0
 
         for f in 0..<fEl.count {
-            // Check classification
-            var isWall = true
+            // ONLY count wall-classified faces
             if let c = cOpt {
                 let cv = c.buffer.contents()
                     .advanced(by: c.offset + c.stride * f)
                     .assumingMemoryBound(to: UInt8.self).pointee
                 let cls = ARMeshClassification(rawValue: Int(cv)) ?? .none
-                isWall = (cls == .wall)
+                guard cls == .wall else { continue }
             }
-            guard isWall else { continue }
 
-            // Get 3 vertex indices
             var idx: [Int] = []
             for j in 0..<ipf {
                 let off = (f * ipf + j) * bpi
@@ -299,7 +311,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             guard idx.count == 3 else { continue }
 
-            // Get world positions
             func worldPos(_ i: Int) -> SIMD3<Float> {
                 let ptr = vSrc.buffer.contents()
                     .advanced(by: vSrc.offset + vSrc.stride * i)
@@ -311,8 +322,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             let p0 = worldPos(idx[0])
             let p1 = worldPos(idx[1])
             let p2 = worldPos(idx[2])
-            let cross = simd_cross(p1 - p0, p2 - p0)
-            area += simd_length(cross) * 0.5
+            area += simd_length(simd_cross(p1 - p0, p2 - p0)) * 0.5
         }
         return area
     }
@@ -334,7 +344,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let ipf = fEl.indexCountPerPrimitive
         let transform = anchor.transform
 
-        // ── Extract vertices + generate UVs ──────────────────
+        // ── Vertices + UVs ───────────────────────────────────
         var verts: [SCNVector3] = []
         var uvs: [CGPoint] = []
         verts.reserveCapacity(vertCount)
@@ -347,33 +357,35 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             let local = ptr.pointee
             verts.append(SCNVector3(local.x, local.y, local.z))
 
-            // UV from world position for consistent tiling across room
             let w = transform * SIMD4<Float>(local.x, local.y, local.z, 1.0)
-            // Use world X+Z as horizontal, world Y as vertical
-            // Tiles every ~0.53m (standard wallpaper roll width)
             let tileScale: Float = 1.0 / 0.53
-            let u = (w.x + w.z) * tileScale
-            let v = w.y * tileScale
-            uvs.append(CGPoint(x: CGFloat(u), y: CGFloat(v)))
+            uvs.append(CGPoint(
+                x: CGFloat((w.x + w.z) * tileScale),
+                y: CGFloat(w.y * tileScale)
+            ))
         }
 
-        // ── Classify faces into buckets ──────────────────────
+        // ── Classify faces ───────────────────────────────────
         var wallIdx:  [UInt32] = []
         var ceilIdx:  [UInt32] = []
         var floorIdx: [UInt32] = []
         var doorIdx:  [UInt32] = []
+        // NO "unclassified" bucket — unclassified faces are SKIPPED
 
         for f in 0..<faceCount {
-            // Classification (optional — default to wall if missing)
-            var cls: ARMeshClassification = .wall
+            // Get classification (skip if none or unclassified)
+            var cls: ARMeshClassification = .none
             if let c = cOpt {
                 let cv = c.buffer.contents()
                     .advanced(by: c.offset + c.stride * f)
                     .assumingMemoryBound(to: UInt8.self).pointee
                 cls = ARMeshClassification(rawValue: Int(cv)) ?? .none
+            } else {
+                // No classification data at all — skip this face
+                continue
             }
 
-            // Read triangle indices (flat-packed, no offset/stride)
+            // Read triangle indices
             var tri: [UInt32] = []
             for j in 0..<ipf {
                 let off = (f * ipf + j) * bpi
@@ -382,23 +394,30 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 else { tri.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
             }
 
+            // ═══════════════════════════════════════════════════
+            // STRICT CLASSIFICATION:
+            // - .wall → wireframe during scan, wallpaper after
+            // - .ceiling, .floor → subtle wireframe during scan, HIDDEN after
+            // - .door, .window → gold wireframe during scan, HIDDEN after
+            // - .none, .seat, .table, .unknown → ALWAYS HIDDEN (skip)
+            // ═══════════════════════════════════════════════════
             switch cls {
             case .wall:          wallIdx.append(contentsOf: tri)
             case .ceiling:       ceilIdx.append(contentsOf: tri)
             case .floor:         floorIdx.append(contentsOf: tri)
             case .door, .window: doorIdx.append(contentsOf: tri)
-            default:             wallIdx.append(contentsOf: tri) // unclassified → wall
+            default:             break  // furniture, objects, unknown → SKIP entirely
             }
         }
 
-        // ── Build SCNGeometry with UV source ─────────────────
+        // ── Build geometry ───────────────────────────────────
         let vertSrc = SCNGeometrySource(vertices: verts)
         let uvSrc = SCNGeometrySource(textureCoordinates: uvs)
 
         var elements: [SCNGeometryElement] = []
         var materials: [SCNMaterial] = []
 
-        func addElement(_ indices: [UInt32], _ mat: SCNMaterial) {
+        func addEl(_ indices: [UInt32], _ mat: SCNMaterial) {
             guard !indices.isEmpty else { return }
             let data = Data(bytes: indices, count: indices.count * 4)
             elements.append(SCNGeometryElement(
@@ -407,20 +426,20 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             materials.append(mat)
         }
 
-        // Wall: wireframe during scan, wallpaper when applied
-        let wallMat = isWallpaperApplied ? makeWallpaperMaterial() : matWallWire
-        addElement(wallIdx, wallMat)
-
-        // Other surfaces: always wireframe (hidden after scan)
         if currentMode == .scanning {
-            addElement(ceilIdx, matCeilWire)
-            addElement(floorIdx, matFloorWire)
-            addElement(doorIdx, matDoorWire)
+            // During scan: show wireframe on walls, ceiling, floor, doors
+            addEl(wallIdx, matWallWire)
+            addEl(ceilIdx, matCeilWire)
+            addEl(floorIdx, matFloorWire)
+            addEl(doorIdx, matDoorWire)
         } else {
-            // In preview: hide non-wall mesh so only wallpaper is visible
-            addElement(ceilIdx, matHidden)
-            addElement(floorIdx, matHidden)
-            addElement(doorIdx, matHidden)
+            // After scan (preview mode):
+            // Walls get wallpaper (or wireframe if not applied yet)
+            addEl(wallIdx, isWallpaperApplied ? makeWallpaperMaterial() : matWallWire)
+            // Everything else is HIDDEN
+            addEl(ceilIdx, matHidden)
+            addEl(floorIdx, matHidden)
+            addEl(doorIdx, matHidden)
         }
 
         guard !elements.isEmpty else { return nil }
@@ -438,34 +457,30 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         m.fillMode = .fill
         m.isDoubleSided = true
         m.lightingModel = .physicallyBased
-        m.transparency = 0.92 // slight see-through for realism
+        m.transparency = 0.92
 
         if let img = wpAlbedo {
             m.diffuse.contents = img
-            m.diffuse.wrapS = .repeat
-            m.diffuse.wrapT = .repeat
+            m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
         }
         if let img = wpNormal {
             m.normal.contents = img
-            m.normal.wrapS = .repeat
-            m.normal.wrapT = .repeat
+            m.normal.wrapS = .repeat; m.normal.wrapT = .repeat
             m.normal.intensity = 0.8
         }
         if let img = wpRoughness {
             m.roughness.contents = img
-            m.roughness.wrapS = .repeat
-            m.roughness.wrapT = .repeat
+            m.roughness.wrapS = .repeat; m.roughness.wrapT = .repeat
         }
         if let img = wpAO {
             m.ambientOcclusion.contents = img
-            m.ambientOcclusion.wrapS = .repeat
-            m.ambientOcclusion.wrapT = .repeat
+            m.ambientOcclusion.wrapS = .repeat; m.ambientOcclusion.wrapT = .repeat
         }
         return m
     }
 
     // ═══════════════════════════════════════════════════════════
-    // APPLY / CLEAR WALLPAPER
+    // APPLY / CLEAR
     // ═══════════════════════════════════════════════════════════
 
     private func applyWallpaperToAllMeshes() {
@@ -492,7 +507,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // PLACE WALLPAPER (loads textures then applies)
+    // PLACE WALLPAPER
     // ═══════════════════════════════════════════════════════════
 
     private func placeWallpaper(_ args: [String: Any]?, result: @escaping FlutterResult) {
@@ -512,7 +527,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         group.enter()
         textureCache.loadImage(from: albedoUrl) { img in a = img; group.leave() }
-
         if !normalUrl.isEmpty {
             group.enter()
             textureCache.loadImage(from: normalUrl) { img in n = img; group.leave() }
@@ -529,16 +543,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
             guard let albedo = a else {
-                self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false, "message": "Failed to load albedo texture"])
-                self.emit("boot", data: ["status": "❌ Texture load failed"])
+                self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false, "message": "Texture load failed"])
                 result(nil); return
             }
-
             self.wpAlbedo = albedo
             self.wpNormal = n
             self.wpRoughness = r
             self.wpAO = o
-
             self.emit("boot", data: ["status": "Textures loaded, applying..."])
             self.applyWallpaperToAllMeshes()
             self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": true])
@@ -569,7 +580,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // EVENT EMISSION
+    // EVENTS
     // ═══════════════════════════════════════════════════════════
 
     private func emit(_ type: String, data: [String: Any] = [:]) {
@@ -602,9 +613,14 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
 
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
         guard let ma = anchor as? ARMeshAnchor else { return }
-        guard currentMode == .scanning || currentMode == .preview else { return }
-        guard let geo = buildMeshGeometry(from: ma) else { return }
 
+        // ═══════════════════════════════════════════════════════
+        // FROZEN CHECK: After Done Scanning, reject ALL new mesh
+        // ═══════════════════════════════════════════════════════
+        guard !meshFrozen else { return }
+        guard currentMode == .scanning else { return }
+
+        guard let geo = buildMeshGeometry(from: ma) else { return }
         let meshNode = SCNNode(geometry: geo)
         node.addChildNode(meshNode)
 
@@ -620,7 +636,12 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
         guard let ma = anchor as? ARMeshAnchor else { return }
-        guard currentMode == .scanning || currentMode == .preview else { return }
+
+        // ═══════════════════════════════════════════════════════
+        // FROZEN CHECK: No updates after scan complete
+        // ═══════════════════════════════════════════════════════
+        guard !meshFrozen else { return }
+        guard currentMode == .scanning else { return }
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self,
@@ -632,6 +653,7 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
 
     func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
         guard let ma = anchor as? ARMeshAnchor else { return }
+        // Allow removal even when frozen (cleanup)
         DispatchQueue.main.async { [weak self] in
             self?.meshNodes[ma.identifier]?.removeFromParentNode()
             self?.meshNodes.removeValue(forKey: ma.identifier)
