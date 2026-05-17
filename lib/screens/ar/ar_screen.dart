@@ -1,26 +1,19 @@
-// lib/screens/ar/ar_screen.dart — PHASE 1: Brush Selection + Toolbar
-
+// lib/screens/ar/ar_screen.dart — DEFINITIVE: Lasso + Soft Brush + Opacity
 import 'dart:async';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
-import 'package:flutter/services.dart';
 
 const Color goldColor = Color(0xFFFFD369);
 
 class ARScreen extends StatefulWidget {
   final WallpaperModel? wallpaper;
   final double pricePerRoll;
-
-  ARScreen({
-    super.key,
-    WallpaperModel? initialWallpaper,
-    ShopModel? initialShop,
-    double? pricePerRoll,
-  }) : wallpaper = initialWallpaper,
-       pricePerRoll = pricePerRoll ?? 0.0;
-
+  ARScreen({super.key, WallpaperModel? initialWallpaper, ShopModel? initialShop, double? pricePerRoll})
+      : wallpaper = initialWallpaper, pricePerRoll = pricePerRoll ?? 0.0;
   @override
   State<ARScreen> createState() => _ARScreenState();
 }
@@ -29,30 +22,25 @@ class _ARScreenState extends State<ARScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
 
-  // State
   String _statusText = "Initializing...";
   final List<String> _logLines = [];
-  bool _isScanning = false;
-  bool _scanDone = false;
-  bool _wallpaperApplied = false;
-  bool _editMode = false;
-  String _brushMode = 'erase'; // 'paint' or 'erase'
-  double _brushSize = 0.08; // meters
+  bool _isScanning = false, _scanDone = false, _wallpaperApplied = false;
+  bool _editMode = false, _showLog = false;
+  String _brushMode = 'erase'; // 'paint', 'erase', 'lasso'
+  double _brushSize = 0.08, _wallpaperOpacity = 0.96;
   double _totalWallArea = 0.0;
-  int _meshSegments = 0;
-  bool _showLog = false;
+
+  // Lasso points (screen coordinates)
+  List<Offset> _lassoPoints = [];
 
   @override
-  void initState() {
-    super.initState();
-    _initAR();
-  }
+  void initState() { super.initState(); _initAR(); }
 
   Future<void> _initAR() async {
     try {
       await Future.delayed(const Duration(milliseconds: 1200));
       await _arService.initAR();
-    } catch (e) { _log('Init error: $e'); }
+    } catch (e) { _log('Init: $e'); }
     _eventSub = _arService.events.listen(_onAREvent);
   }
 
@@ -67,457 +55,351 @@ class _ARScreenState extends State<ARScreen> {
   void _onAREvent(AREvent event) {
     switch (event.type) {
       case 'boot':
-        final msg = (event.data['status'] ?? '').toString();
-        setState(() => _statusText = msg);
-        _log('[BOOT] $msg');
+        setState(() => _statusText = (event.data['status'] ?? '').toString());
         break;
       case 'error':
-        final msg = event.errorMessage ?? 'Unknown';
-        setState(() => _statusText = 'ERROR: $msg');
-        _log('[ERROR] $msg');
+        setState(() => _statusText = 'ERROR: ${event.errorMessage}');
+        _log('[ERROR] ${event.errorMessage}');
         break;
       case 'scanComplete':
         final area = event.data['totalWallArea'];
-        final segs = event.data['meshSegments'];
         setState(() {
-          _isScanning = false;
-          _scanDone = true;
+          _isScanning = false; _scanDone = true;
           if (area is num) _totalWallArea = area.toDouble();
-          if (segs is num) _meshSegments = segs.toInt();
         });
-        _log('[DONE] ${_totalWallArea.toStringAsFixed(1)}m², $_meshSegments mesh');
-        // Go into edit mode by default after scan
         _enterEditMode();
         break;
       case 'wallpaperPlaced':
         final ok = event.data['success'] as bool? ?? false;
         final area = event.data['area'];
-        if (ok) {
-          setState(() {
-            _wallpaperApplied = true;
-            _editMode = false;
-            if (area is num) _totalWallArea = area.toDouble();
-          });
-          _log('[WALLPAPER] Applied ✅');
-        } else {
-          _log('[WALLPAPER] Failed: ${event.data['message']}');
-        }
+        if (ok) setState(() { _wallpaperApplied = true; _editMode = false; if (area is num) _totalWallArea = area.toDouble(); });
         break;
       case 'selectionChanged':
         final area = event.data['area'];
-        if (area is num) {
-          setState(() => _totalWallArea = area.toDouble());
-        }
+        if (area is num) setState(() => _totalWallArea = area.toDouble());
         break;
-      case 'wallDetected':
-        break;
-      default:
-        _log('[${event.type}]');
+      default: break;
     }
   }
 
-  // ── Calculations ───────────────────────────────────────────
-  double get _rollWidth => widget.wallpaper?.rollWidth ?? 0.53;
-  double get _rollLength => widget.wallpaper?.rollLength ?? 10.0;
-  double get _rollArea => _rollWidth * _rollLength;
+  // Calculations
+  double get _rollArea => (widget.wallpaper?.rollWidth ?? 0.53) * (widget.wallpaper?.rollLength ?? 10.0);
   int get _rollsNeeded => _rollArea > 0 ? (_totalWallArea / _rollArea).ceil() : 0;
   double get _totalPrice => _rollsNeeded * widget.pricePerRoll;
 
-  // ── Actions ────────────────────────────────────────────────
+  // Actions
   Future<void> _startScan() async {
-    setState(() {
-      _isScanning = true; _scanDone = false; _wallpaperApplied = false;
-      _editMode = false; _totalWallArea = 0; _meshSegments = 0;
-    });
-    try {
-      await _arService.setARMode('scanning');
-      await _arService.startScan();
-    } catch (e) { _log('Scan error: $e'); }
+    setState(() { _isScanning = true; _scanDone = false; _wallpaperApplied = false; _editMode = false; _totalWallArea = 0; _lassoPoints.clear(); });
+    try { await _arService.setARMode('scanning'); await _arService.startScan(); } catch (e) { _log('Scan: $e'); }
   }
-
   Future<void> _stopScan() async {
-    try { await _arService.stopScan(); } catch (e) { _log('Stop error: $e'); }
+    try { await _arService.stopScan(); } catch (e) { _log('Stop: $e'); }
   }
-
   Future<void> _enterEditMode() async {
-    setState(() { _editMode = true; _brushMode = 'erase'; });
-    try {
-      await _arService.enterCutMode(0);
-      await _arService.setBrushMode('erase');
-    } catch (e) { _log('Edit error: $e'); }
+    setState(() { _editMode = true; _brushMode = 'erase'; _lassoPoints.clear(); });
+    try { await _arService.enterCutMode(0); await _arService.setBrushMode('erase'); } catch (_) {}
   }
-
   Future<void> _exitEditMode() async {
-    setState(() => _editMode = false);
-    try { await _arService.exitCutMode(); } catch (e) { _log('Exit error: $e'); }
+    setState(() { _editMode = false; _lassoPoints.clear(); });
+    try { await _arService.exitCutMode(); } catch (_) {}
   }
-
   Future<void> _setBrushMode(String mode) async {
-    setState(() => _brushMode = mode);
-    try { await _arService.setBrushMode(mode); } catch (e) { _log('Brush error: $e'); }
+    setState(() { _brushMode = mode; _lassoPoints.clear(); });
+    if (mode != 'lasso') {
+      try { await _arService.setBrushMode(mode); } catch (_) {}
+    }
   }
-
   Future<void> _setBrushSize(double size) async {
     setState(() => _brushSize = size);
-    try {
-      await _arService.setBrushSize(size);
-    } catch (e) { _log('Size error: $e'); }
+    try { await _arService.setBrushSize(size); } catch (_) {}
   }
-
-  Future<void> _undoSelection() async {
-    try { await _arService.undoCut(0); } catch (e) { _log('Undo error: $e'); }
+  Future<void> _setOpacity(double val) async {
+    setState(() => _wallpaperOpacity = val);
+    try { await _arService.setWallpaperOpacity(val); } catch (_) {}
   }
-
-  Future<void> _resetSelection() async {
-    try { await _arService.clearAllCuts(0); } catch (e) { _log('Reset error: $e'); }
-  }
+  Future<void> _undo() async { try { await _arService.undoCut(0); } catch (_) {} }
+  Future<void> _reset() async { try { await _arService.clearAllCuts(0); } catch (_) {} }
 
   Future<void> _applyWallpaper() async {
     if (widget.wallpaper == null) return;
     try {
-      await _arService.placeWallpaper(
-        wallpaper: widget.wallpaper!,
-        wallIndex: 0,
-        pricePerRoll: widget.pricePerRoll,
-      );
-    } catch (e) { _log('Apply error: $e'); }
+      await _arService.placeWallpaper(wallpaper: widget.wallpaper!, wallIndex: 0, pricePerRoll: widget.pricePerRoll);
+    } catch (e) { _log('Apply: $e'); }
+  }
+  Future<void> _clearWallpaper() async {
+    try { await _arService.clearWall(0); setState(() => _wallpaperApplied = false); } catch (_) {}
   }
 
-  Future<void> _clearWallpaper() async {
+  // Lasso: tap to add points
+  void _addLassoPoint(Offset point) {
+    setState(() => _lassoPoints.add(point));
+  }
+  Future<void> _applyLasso() async {
+    if (_lassoPoints.length < 3) return;
+    final pts = _lassoPoints.map((p) => [p.dx, p.dy]).toList();
     try {
-      await _arService.clearWall(0);
-      setState(() => _wallpaperApplied = false);
-    } catch (e) { _log('Clear error: $e'); }
+      await _arService.applyLasso(pts, _brushMode == 'lasso' ? 'erase' : 'paint');
+    } catch (e) { _log('Lasso: $e'); }
+    setState(() => _lassoPoints.clear());
   }
 
   @override
-  void dispose() {
-    _eventSub?.cancel();
-    _arService.disposeAR();
-    super.dispose();
-  }
-
-  // ═══════════════════════════════════════════════════════════
-  // BUILD
-  // ═══════════════════════════════════════════════════════════
+  void dispose() { _eventSub?.cancel(); _arService.disposeAR(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          // AR View
+      body: Stack(children: [
+        // AR View
+        Positioned.fill(child: UiKitView(viewType: 'com.oboia/ar_view',
+            creationParams: const <String, dynamic>{}, creationParamsCodec: StandardMessageCodec())),
+
+        // Lasso overlay (draws dots + lines on screen)
+        if (_editMode && _brushMode == 'lasso' && _lassoPoints.isNotEmpty)
           Positioned.fill(
-            child: UiKitView(
-              viewType: 'com.oboia/ar_view',
-              creationParams: const <String, dynamic>{},
-              creationParamsCodec: StandardMessageCodec(),  // ← removed const
+            child: IgnorePointer(
+              child: CustomPaint(painter: _LassoPainter(_lassoPoints)),
             ),
           ),
 
-          // Back button
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 8, left: 8,
-            child: IconButton(
-              icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 24),
+        // Lasso tap detector (covers screen when lasso active)
+        if (_editMode && _brushMode == 'lasso')
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTapDown: (details) => _addLassoPoint(details.localPosition),
+              child: Container(color: Colors.transparent),
+            ),
+          ),
+
+        // Back button
+        Positioned(top: MediaQuery.of(context).padding.top + 8, left: 8,
+          child: IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 24),
               style: IconButton.styleFrom(backgroundColor: Colors.black54),
-              onPressed: () => Navigator.of(context).pop(),
-            ),
-          ),
+              onPressed: () => Navigator.of(context).pop())),
 
-          // ─── SCANNING ─────────────────────────────────
-          if (_isScanning) ...[
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 8, left: 60, right: 60,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.92),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Text('Scan the walls you want\nto wallpaper',
-                  style: TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600),
-                  textAlign: TextAlign.center),
-              ),
-            ),
-            Positioned(
-              bottom: 100, left: 20, right: 20,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
-                child: Text(_statusText, style: const TextStyle(color: Colors.white70, fontSize: 13),
-                  textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis),
-              ),
-            ),
-            Positioned(
-              bottom: 30, left: 40, right: 40,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
-                onPressed: _stopScan,
-                child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)),
-              ),
-            ),
-          ],
-
-          // ─── EDIT MODE: Floating Toolbar ──────────────
-          if (_scanDone && _editMode) ...[
-            // Instruction
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 8, left: 50, right: 50,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.75),
-                  borderRadius: BorderRadius.circular(10)),
-                child: Text(
-                  _brushMode == 'erase'
-                      ? 'Rub finger to remove unwanted areas'
-                      : 'Rub finger to add missing areas',
-                  style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
-                  textAlign: TextAlign.center),
-              ),
-            ),
-
-            // Toolbar
-            Positioned(
-              bottom: 140, left: 16, right: 16,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: const Color(0xE6222222),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Colors.white12),
-                ),
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  // Tool buttons row
-                  Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-                    _toolBtn(Icons.brush, 'Paint', _brushMode == 'paint', () => _setBrushMode('paint')),
-                    _toolBtn(Icons.auto_fix_high, 'Erase', _brushMode == 'erase', () => _setBrushMode('erase')),
-                    _toolBtn(Icons.undo, 'Undo', false, _undoSelection),
-                    _toolBtn(Icons.restart_alt, 'Reset', false, _resetSelection),
-                  ]),
-                  const SizedBox(height: 10),
-                  // Brush size slider
-                  Row(children: [
-                    const Icon(Icons.circle, color: Colors.white38, size: 10),
-                    Expanded(
-                      child: Slider(
-                        value: _brushSize,
-                        min: 0.02, max: 0.25,
-                        activeColor: goldColor,
-                        inactiveColor: Colors.white24,
-                        onChanged: (v) => _setBrushSize(v),
-                      ),
-                    ),
-                    const Icon(Icons.circle, color: Colors.white38, size: 22),
-                  ]),
-                  // Area display
-                  Text('Selected: ${_totalWallArea.toStringAsFixed(1)} m²',
-                    style: const TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w600)),
-                ]),
-              ),
-            ),
-
-            // Apply wallpaper button
-            if (widget.wallpaper != null)
-              Positioned(
-                bottom: 30, left: 40, right: 40,
-                child: Row(children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: goldColor,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
-                      onPressed: _applyWallpaper,
-                      icon: const Icon(Icons.wallpaper, color: Colors.black, size: 20),
-                      label: const Text('Apply Wallpaper', style: TextStyle(fontSize: 15, color: Colors.black, fontWeight: FontWeight.bold)),
-                    ),
-                  ),
-                ]),
-              ),
-          ],
-
-          // ─── POST-APPLY: Summary ──────────────────────
-          if (_scanDone && _wallpaperApplied && !_editMode) ...[
-            // Wallpaper name
-            if (widget.wallpaper != null)
-              Positioned(
-                top: MediaQuery.of(context).padding.top + 8, right: 12,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(10)),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-                    Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
-                    Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 11)),
-                  ]),
-                ),
-              ),
-
-            // Bottom summary
-            Positioned(
-              bottom: 0, left: 0, right: 0,
-              child: Container(
-                padding: EdgeInsets.fromLTRB(20, 16, 20, MediaQuery.of(context).padding.bottom + 16),
-                decoration: const BoxDecoration(
-                  color: Color(0xF0222222),
-                  borderRadius: BorderRadius.only(topLeft: Radius.circular(24), topRight: Radius.circular(24)),
-                ),
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
-                  const SizedBox(height: 16),
-                  Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                    _statCol('Wall Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
-                    _statCol('Rolls', '$_rollsNeeded'),
-                    _statCol('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
-                  ]),
-                  const SizedBox(height: 16),
-                  // Action buttons
-                  Row(children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: goldColor,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
-                        onPressed: _enterEditMode,
-                        icon: const Icon(Icons.edit, color: Colors.black, size: 18),
-                        label: const Text('Edit Selection', style: TextStyle(color: Colors.black, fontSize: 14, fontWeight: FontWeight.w600)),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        style: OutlinedButton.styleFrom(
-                          side: const BorderSide(color: Colors.white38),
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
-                        onPressed: _clearWallpaper,
-                        icon: const Icon(Icons.visibility_off, color: Colors.white70, size: 18),
-                        label: const Text('Clear', style: TextStyle(color: Colors.white70, fontSize: 14)),
-                      ),
-                    ),
-                  ]),
-                  const SizedBox(height: 8),
-                  TextButton.icon(
-                    onPressed: _startScan,
-                    icon: const Icon(Icons.replay, color: Colors.white38, size: 16),
-                    label: const Text('Rescan Room', style: TextStyle(color: Colors.white38, fontSize: 13)),
-                  ),
-                ]),
-              ),
-            ),
-          ],
-
-          // ─── POST-SCAN, no wallpaper yet, not editing ─
-          if (_scanDone && !_wallpaperApplied && !_editMode)
-            Positioned(
-              bottom: 30, left: 40, right: 40,
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                Text('${_totalWallArea.toStringAsFixed(1)} m² selected',
-                  style: const TextStyle(color: goldColor, fontSize: 16, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 12),
-                Row(children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: goldColor,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
-                      onPressed: _enterEditMode,
-                      icon: const Icon(Icons.edit, color: Colors.black),
-                      label: const Text('Edit', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-                    ),
-                  ),
-                  if (widget.wallpaper != null) ...[
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.green,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
-                        onPressed: _applyWallpaper,
-                        icon: const Icon(Icons.wallpaper, color: Colors.white),
-                        label: const Text('Apply', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                      ),
-                    ),
-                  ],
-                ]),
-              ]),
-            ),
-
-          // ─── DEBUG LOG (double tap status to toggle) ──
-          if (!_isScanning && _showLog)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 50, left: 8, right: 8,
-              child: IgnorePointer(
-                child: Container(
-                  constraints: const BoxConstraints(maxHeight: 160),
-                  padding: const EdgeInsets.all(6), color: Colors.black87,
-                  child: SingleChildScrollView(
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start,
-                      children: _logLines.take(12).map((l) => Text(l,
-                        style: const TextStyle(color: Colors.white70, fontSize: 9),
-                        maxLines: 2, overflow: TextOverflow.ellipsis)).toList()),
-                  ),
-                ),
-              ),
-            ),
-
-          // Status bar (double-tap to show log)
-          if (!_isScanning)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 44, left: 50, right: 50,
-              child: GestureDetector(
-                onDoubleTap: () => setState(() => _showLog = !_showLog),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
-                  child: Text(_statusText, style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
-                    textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis),
-                ),
-              ),
-            ),
+        // ── SCANNING ─────────────────────────────
+        if (_isScanning) ...[
+          Positioned(top: MediaQuery.of(context).padding.top + 8, left: 60, right: 60,
+            child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(color: Colors.white.withOpacity(0.92), borderRadius: BorderRadius.circular(12)),
+              child: const Text('Scan the walls you want\nto wallpaper',
+                style: TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600), textAlign: TextAlign.center))),
+          Positioned(bottom: 100, left: 20, right: 20,
+            child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
+              child: Text(_statusText, style: const TextStyle(color: Colors.white70, fontSize: 13),
+                textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis))),
+          Positioned(bottom: 30, left: 40, right: 40,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
+              onPressed: _stopScan,
+              child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
-      ),
+
+        // ── EDIT MODE ────────────────────────────
+        if (_scanDone && _editMode) ...[
+          // Instruction
+          Positioned(top: MediaQuery.of(context).padding.top + 8, left: 50, right: 50,
+            child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(color: Colors.black.withOpacity(0.75), borderRadius: BorderRadius.circular(10)),
+              child: Text(
+                _brushMode == 'lasso' ? 'Tap to place points, then Apply'
+                    : _brushMode == 'erase' ? 'Rub to remove areas' : 'Rub to add areas',
+                style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+                textAlign: TextAlign.center))),
+
+          // Toolbar
+          Positioned(bottom: _brushMode == 'lasso' ? 160 : 140, left: 12, right: 12,
+            child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+              decoration: BoxDecoration(color: const Color(0xE6222222), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.white12)),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                // Tool row
+                Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                  _toolBtn(Icons.brush, 'Paint', _brushMode == 'paint', () => _setBrushMode('paint')),
+                  _toolBtn(Icons.auto_fix_high, 'Erase', _brushMode == 'erase', () => _setBrushMode('erase')),
+                  _toolBtn(Icons.polyline, 'Lasso', _brushMode == 'lasso', () => _setBrushMode('lasso')),
+                  _toolBtn(Icons.undo, 'Undo', false, _undo),
+                  _toolBtn(Icons.restart_alt, 'Reset', false, _reset),
+                ]),
+                const SizedBox(height: 8),
+
+                // Brush size (hidden for lasso)
+                if (_brushMode != 'lasso')
+                  Row(children: [
+                    const Icon(Icons.circle, color: Colors.white38, size: 8),
+                    Expanded(child: Slider(value: _brushSize, min: 0.02, max: 0.25,
+                        activeColor: goldColor, inactiveColor: Colors.white24,
+                        onChanged: (v) => _setBrushSize(v))),
+                    const Icon(Icons.circle, color: Colors.white38, size: 20),
+                  ]),
+
+                // Opacity slider
+                Row(children: [
+                  const Text('Opacity', style: TextStyle(color: Colors.white38, fontSize: 10)),
+                  Expanded(child: Slider(value: _wallpaperOpacity, min: 0.1, max: 1.0,
+                      activeColor: goldColor.withOpacity(0.6), inactiveColor: Colors.white12,
+                      onChanged: (v) => _setOpacity(v))),
+                  Text('${(_wallpaperOpacity * 100).toInt()}%', style: const TextStyle(color: Colors.white38, fontSize: 10)),
+                ]),
+
+                Text('Selected: ${_totalWallArea.toStringAsFixed(1)} m²',
+                    style: const TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w600)),
+              ]))),
+
+          // Lasso: Apply button (when points exist)
+          if (_brushMode == 'lasso' && _lassoPoints.length >= 3)
+            Positioned(bottom: 80, left: 40, right: 40,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
+                onPressed: _applyLasso,
+                icon: const Icon(Icons.check, color: Colors.white),
+                label: Text('Apply Lasso (${_lassoPoints.length} pts)', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
+
+          // Apply wallpaper button
+          if (widget.wallpaper != null)
+            Positioned(bottom: 20, left: 40, right: 40,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: goldColor,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
+                onPressed: _applyWallpaper,
+                icon: const Icon(Icons.wallpaper, color: Colors.black, size: 20),
+                label: const Text('Apply Wallpaper', style: TextStyle(fontSize: 15, color: Colors.black, fontWeight: FontWeight.bold)))),
+        ],
+
+        // ── POST-APPLY ───────────────────────────
+        if (_scanDone && _wallpaperApplied && !_editMode) ...[
+          if (widget.wallpaper != null)
+            Positioned(top: MediaQuery.of(context).padding.top + 8, right: 12,
+              child: Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(10)),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Text(widget.wallpaper!.name, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+                  Text('${widget.pricePerRoll.toStringAsFixed(0)} UZS/roll', style: const TextStyle(color: goldColor, fontSize: 11)),
+                ]))),
+
+          Positioned(bottom: 0, left: 0, right: 0,
+            child: Container(
+              padding: EdgeInsets.fromLTRB(20, 16, 20, MediaQuery.of(context).padding.bottom + 16),
+              decoration: const BoxDecoration(color: Color(0xF0222222),
+                borderRadius: BorderRadius.only(topLeft: Radius.circular(24), topRight: Radius.circular(24))),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
+                const SizedBox(height: 16),
+                Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                  _stat('Wall Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
+                  _stat('Rolls', '$_rollsNeeded'),
+                  _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
+                ]),
+                const SizedBox(height: 16),
+                Row(children: [
+                  Expanded(child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(backgroundColor: goldColor,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                    onPressed: _enterEditMode,
+                    icon: const Icon(Icons.edit, color: Colors.black, size: 18),
+                    label: const Text('Edit', style: TextStyle(color: Colors.black, fontSize: 14, fontWeight: FontWeight.w600)))),
+                  const SizedBox(width: 12),
+                  Expanded(child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.white38),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                    onPressed: _clearWallpaper,
+                    icon: const Icon(Icons.visibility_off, color: Colors.white70, size: 18),
+                    label: const Text('Clear', style: TextStyle(color: Colors.white70, fontSize: 14)))),
+                ]),
+                const SizedBox(height: 8),
+                TextButton.icon(onPressed: _startScan,
+                    icon: const Icon(Icons.replay, color: Colors.white38, size: 16),
+                    label: const Text('Rescan', style: TextStyle(color: Colors.white38, fontSize: 13))),
+              ]))),
+        ],
+
+        // Status bar (double-tap for log)
+        if (!_isScanning)
+          Positioned(top: MediaQuery.of(context).padding.top + 44, left: 50, right: 50,
+            child: GestureDetector(onDoubleTap: () => setState(() => _showLog = !_showLog),
+              child: Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+                child: Text(_statusText, style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
+                    textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis)))),
+
+        if (_showLog)
+          Positioned(top: MediaQuery.of(context).padding.top + 65, left: 8, right: 8,
+            child: IgnorePointer(child: Container(constraints: const BoxConstraints(maxHeight: 150),
+                padding: const EdgeInsets.all(6), color: Colors.black87,
+                child: SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+                    children: _logLines.take(10).map((l) => Text(l, style: const TextStyle(color: Colors.white70, fontSize: 9),
+                        maxLines: 2, overflow: TextOverflow.ellipsis)).toList()))))),
+      ]),
       floatingActionButton: !_isScanning && !_scanDone
-          ? FloatingActionButton.extended(
-              onPressed: _startScan, backgroundColor: goldColor,
+          ? FloatingActionButton.extended(onPressed: _startScan, backgroundColor: goldColor,
               icon: const Icon(Icons.camera, color: Colors.black),
-              label: const Text('Start Scan', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-            )
+              label: const Text('Start Scan', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)))
           : null,
     );
   }
 
   Widget _toolBtn(IconData icon, String label, bool active, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+    return GestureDetector(onTap: onTap, child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: active ? goldColor.withOpacity(0.3) : Colors.transparent,
           borderRadius: BorderRadius.circular(10),
-          border: active ? Border.all(color: goldColor, width: 1.5) : null,
-        ),
+          border: active ? Border.all(color: goldColor, width: 1.5) : null),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(icon, color: active ? goldColor : Colors.white60, size: 22),
+          Icon(icon, color: active ? goldColor : Colors.white60, size: 20),
           const SizedBox(height: 2),
-          Text(label, style: TextStyle(color: active ? goldColor : Colors.white60, fontSize: 10, fontWeight: FontWeight.w500)),
-        ]),
-      ),
-    );
+          Text(label, style: TextStyle(color: active ? goldColor : Colors.white60, fontSize: 9, fontWeight: FontWeight.w500)),
+        ])));
   }
 
-  Widget _statCol(String label, String value) {
-    return Column(children: [
-      Text(value, style: const TextStyle(color: goldColor, fontSize: 20, fontWeight: FontWeight.bold)),
-      const SizedBox(height: 2),
-      Text(label, style: const TextStyle(color: Colors.white54, fontSize: 12)),
-    ]);
+  Widget _stat(String label, String value) => Column(children: [
+    Text(value, style: const TextStyle(color: goldColor, fontSize: 20, fontWeight: FontWeight.bold)),
+    const SizedBox(height: 2),
+    Text(label, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+  ]);
+}
+
+/// Draws lasso polygon on screen
+class _LassoPainter extends CustomPainter {
+  final List<Offset> points;
+  _LassoPainter(this.points);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty) return;
+    final linePaint = Paint()..color = Colors.redAccent..strokeWidth = 2.5..style = PaintingStyle.stroke;
+    final dotPaint = Paint()..color = Colors.white..style = PaintingStyle.fill;
+    final fillPaint = Paint()..color = Colors.red.withOpacity(0.1)..style = PaintingStyle.fill;
+
+    // Draw filled polygon
+    if (points.length >= 3) {
+      final path = Path()..moveTo(points[0].dx, points[0].dy);
+      for (int i = 1; i < points.length; i++) { path.lineTo(points[i].dx, points[i].dy); }
+      path.close();
+      canvas.drawPath(path, fillPaint);
+      canvas.drawPath(path, linePaint);
+    } else {
+      // Draw lines between points
+      for (int i = 0; i < points.length - 1; i++) {
+        canvas.drawLine(points[i], points[i + 1], linePaint);
+      }
+    }
+
+    // Draw dots at each point
+    for (final p in points) {
+      canvas.drawCircle(p, 6, dotPaint);
+      canvas.drawCircle(p, 6, linePaint);
+    }
   }
+
+  @override
+  bool shouldRepaint(covariant _LassoPainter old) => true;
 }
