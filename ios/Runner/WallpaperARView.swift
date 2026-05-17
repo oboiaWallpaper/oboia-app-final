@@ -1,5 +1,5 @@
-// WallpaperARView.swift — PHASE 1 v2: Fixed Selection + Brush Cursor
-// Wall-only init, wallpaper preview in edit, 3D brush ring
+// WallpaperARView.swift — DEFINITIVE: Smooth Edges + Lasso + Soft Brush
+// Per-vertex alpha, gaussian falloff, lasso polygon cut, opacity slider
 // Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
@@ -27,13 +27,19 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var meshNodes: [UUID: SCNNode] = [:]
     private var meshFrozen = false
 
-    // ── Selection ────────────────────────────────────────────
-    private var selectedFaces: [UUID: Set<Int>] = [:]
-    private var faceCentroids: [UUID: [SIMD3<Float>]] = [:]
-    private var faceCounts: [UUID: Int] = [:]
-    /// Which faces are classified as WALL by ARKit (never changes after scan)
-    private var wallFaces: [UUID: Set<Int>] = [:]
-    private var undoStack: [(UUID, Set<Int>)] = []
+    // ── Per-Vertex Alpha (THE KEY TO SMOOTH EDGES) ───────────
+    /// Each vertex gets 0.0 (hidden) to 1.0 (visible). SceneKit interpolates
+    /// alpha across triangle faces → smooth gradient at boundaries.
+    private var vertexAlpha: [UUID: [Float]] = [:]
+    /// Precomputed world positions for brush/lasso hit testing
+    private var vertexWorldPos: [UUID: [SIMD3<Float>]] = [:]
+    /// Which vertices are on wall-classified faces
+    private var wallVertices: [UUID: Set<Int>] = [:]
+    /// Vertex count per anchor
+    private var vertexCounts: [UUID: Int] = [:]
+
+    // ── Undo ─────────────────────────────────────────────────
+    private var undoStack: [(UUID, [Float])] = []
     private let maxUndo = 20
 
     // ── Brush ────────────────────────────────────────────────
@@ -41,9 +47,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var brushRadius: Float = 0.08
     private var editModeActive = false
     private var lastBrushWorld: SIMD3<Float>?
-    private let brushMoveThreshold: Float = 0.005
+    private let brushMoveThreshold: Float = 0.003
 
-    // ── Brush Cursor (3D ring) ───────────────────────────────
+    // ── Brush Cursor ─────────────────────────────────────────
     private var brushCursorNode: SCNNode?
 
     // ── Wallpaper ────────────────────────────────────────────
@@ -53,6 +59,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var wpAO: UIImage?
     private var isWallpaperApplied = false
     private var totalSelectedAreaSqm: Float = 0.0
+    private var wallpaperOpacity: CGFloat = 0.96 // user-controllable
 
     // ── Other ────────────────────────────────────────────────
     private var currentWallIndex: Int = 0
@@ -62,7 +69,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var pendingEvents: [[String: Any]] = []
 
     // ═══════════════════════════════════════════════════════════
-    // MATERIALS
+    // SCAN-PHASE WIREFRAME MATERIALS
     // ═══════════════════════════════════════════════════════════
 
     private lazy var matWallWire: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.65))
@@ -70,43 +77,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private lazy var matFloorWire: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.12))
     private lazy var matDoorWire: SCNMaterial = makeWire(UIColor(red:1,green:0.83,blue:0.41,alpha:0.5))
 
-    private lazy var matHidden: SCNMaterial = {
-        let m = SCNMaterial()
-        m.diffuse.contents = UIColor.clear
-        m.isDoubleSided = true; m.transparency = 0.0
-        m.writesToDepthBuffer = false; return m
-    }()
-
     private func makeWire(_ color: UIColor) -> SCNMaterial {
         let m = SCNMaterial(); m.fillMode = .lines
         m.diffuse.contents = color
         m.isDoubleSided = true; m.lightingModel = .constant; return m
     }
-
-    /// Edit mode: wallpaper at 25% opacity on selected faces (replaces gold overlay)
-    private func makePreviewMaterial() -> SCNMaterial {
-        let m = SCNMaterial()
-        m.fillMode = .fill; m.isDoubleSided = true
-        m.lightingModel = .physicallyBased
-        m.transparency = 0.25  // 25% — see-through preview
-
-        if let img = wpAlbedo {
-            m.diffuse.contents = img
-            m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
-        } else {
-            // No wallpaper loaded yet — use gold tint
-            m.diffuse.contents = UIColor(red: 1.0, green: 0.83, blue: 0.41, alpha: 1.0)
-            m.lightingModel = .constant
-        }
-        return m
-    }
-
-    /// Unselected faces in edit mode: very faint wireframe so user can see what was removed
-    private lazy var matUnselectedWire: SCNMaterial = {
-        let m = SCNMaterial(); m.fillMode = .lines
-        m.diffuse.contents = UIColor.red.withAlphaComponent(0.15)
-        m.isDoubleSided = true; m.lightingModel = .constant; return m
-    }()
 
     // ═══════════════════════════════════════════════════════════
     // INIT
@@ -139,7 +114,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     func view() -> UIView { sceneView }
 
     // ═══════════════════════════════════════════════════════════
-    // METHOD ROUTER
+    // ROUTER
     // ═══════════════════════════════════════════════════════════
 
     private func route(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
@@ -149,7 +124,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "disposeAR":    sceneView.session.pause(); result(nil)
         case "setARMode":
             if let m = call.arguments as? String { setARMode(m, result: result) }
-            else { result(FlutterError(code: "BAD", message: "mode string needed", details: nil)) }
+            else { result(FlutterError(code: "BAD", message: "mode needed", details: nil)) }
         case "startScan":    startScan(result: result)
         case "stopScan":     stopScan(result: result)
         case "enterCutMode": enterEditMode(); result(nil)
@@ -157,22 +132,32 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "setBrushMode":
             if let m = call.arguments as? String {
                 brushMode = (m == "paint") ? .paint : .erase
-                emit("boot", data: ["status": "Brush: \(m)"])
             }; result(nil)
         case "setBrushSize":
             if let s = args?["size"] as? Double {
-                brushRadius = Float(s)
-                updateBrushCursorSize()
-                emit("boot", data: ["status": "Brush size: \(Int(s * 100))cm"])
+                brushRadius = Float(s); updateCursorSize()
             }; result(nil)
-        case "undoCut":      undoSelection(); result(nil)
-        case "clearAllCuts": resetSelection(); result(nil)
+        case "setWallpaperOpacity":
+            if let o = args?["opacity"] as? Double {
+                wallpaperOpacity = CGFloat(o)
+                if isWallpaperApplied || editModeActive { rebuildAll() }
+            }; result(nil)
+        case "undoCut":      undoAlpha(); result(nil)
+        case "clearAllCuts": resetAlpha(); result(nil)
+
+        // Lasso: receives polygon points from Dart, applies cut
+        case "applyLasso":
+            if let pts = args?["points"] as? [[Double]],
+               let mode = args?["mode"] as? String {
+                applyLasso(screenPoints: pts, mode: mode)
+            }; result(nil)
+
         case "placeWallpaper", "switchWallpaper":
             placeWallpaper(args, result: result)
         case "selectWall":
             currentWallIndex = args?["wallIndex"] as? Int ?? 0
             emit("wallSelected", data: ["wallIndex": currentWallIndex]); result(nil)
-        case "clearWall":    clearAllWallpaper(); result(nil)
+        case "clearWall":    clearWallpaper(); result(nil)
         case "lockWall":
             if let i = args?["wallIndex"] as? Int, let l = args?["locked"] as? Bool {
                 emit("wallLockChanged", data: ["wallIndex": i, "locked": l])
@@ -194,7 +179,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         if st == .notDetermined {
             AVCaptureDevice.requestAccess(for: .video) { [weak self] ok in
                 DispatchQueue.main.async {
-                    if ok { self?.runIdleSession(result: result) }
+                    if ok { self?.runIdle(result: result) }
                     else {
                         self?.emit("error", data: ["message": "Camera denied"])
                         result(FlutterError(code: "CAM", message: "denied", details: nil))
@@ -206,10 +191,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             emit("error", data: ["message": "Camera denied"])
             result(FlutterError(code: "CAM", message: "denied", details: nil)); return
         }
-        runIdleSession(result: result)
+        runIdle(result: result)
     }
 
-    private func runIdleSession(result: @escaping FlutterResult) {
+    private func runIdle(result: @escaping FlutterResult) {
         guard ARWorldTrackingConfiguration.isSupported else {
             emit("error", data: ["message": "ARKit not supported"])
             result(FlutterError(code: "NOAR", message: "no ARKit", details: nil)); return
@@ -230,19 +215,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ═══════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan PHASE1-v2 <<<"])
+        emit("boot", data: ["status": ">>> startScan DEFINITIVE <<<"])
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             emit("error", data: ["message": "LiDAR mesh not supported"])
             result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil)); return
         }
-
+        // Clear
         for (_, n) in meshNodes { n.removeFromParentNode() }
-        meshNodes.removeAll(); selectedFaces.removeAll()
-        faceCentroids.removeAll(); faceCounts.removeAll()
-        wallFaces.removeAll(); wallNodes.removeAll(); undoStack.removeAll()
+        meshNodes.removeAll(); vertexAlpha.removeAll(); vertexWorldPos.removeAll()
+        wallVertices.removeAll(); vertexCounts.removeAll()
+        wallNodes.removeAll(); undoStack.removeAll()
         totalSelectedAreaSqm = 0; isWallpaperApplied = false
-        meshFrozen = false; editModeActive = false
-        removeBrushCursor()
+        meshFrozen = false; editModeActive = false; removeCursor()
         currentMode = .scanning
 
         let c = ARWorldTrackingConfiguration()
@@ -253,13 +237,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             c.frameSemantics.insert(.sceneDepth)
         }
         sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
-        emit("boot", data: ["status": "Scanning — move slowly around room"]); result(nil)
+        emit("boot", data: ["status": "Scanning — move slowly"]); result(nil)
     }
 
     private func stopScan(result: @escaping FlutterResult) {
-        meshFrozen = true
-        currentMode = .preview
+        meshFrozen = true; currentMode = .preview
 
+        // Stop mesh generation
         let plain = ARWorldTrackingConfiguration()
         plain.planeDetection = []; plain.environmentTexturing = .automatic
         sceneView.session.run(plain, options: [])
@@ -269,115 +253,106 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(nil); return
         }
 
-        // ═══════════════════════════════════════════════════════
-        // FIX #3: Only select WALL-CLASSIFIED faces, not everything
-        // ═══════════════════════════════════════════════════════
+        // Initialize per-vertex alpha: wall vertices = 1.0, others = 0.0
         for anchor in frame.anchors {
             guard let ma = anchor as? ARMeshAnchor else { continue }
             let uuid = ma.identifier
             let geo = ma.geometry
+            let vCount = geo.vertices.count
             let fEl = geo.faces
             let cOpt = geo.classification
             let bpi = fEl.bytesPerIndex
-            let count = fEl.count
+            let ipf = fEl.indexCountPerPrimitive
 
-            faceCounts[uuid] = count
-            faceCentroids[uuid] = computeCentroids(anchor: ma)
+            vertexCounts[uuid] = vCount
 
-            // Build wall face set from classification
-            var walls = Set<Int>()
-            for f in 0..<count {
+            // Compute world positions
+            let vSrc = geo.vertices
+            let transform = ma.transform
+            var worldPos: [SIMD3<Float>] = []
+            worldPos.reserveCapacity(vCount)
+            for i in 0..<vCount {
+                let p = vSrc.buffer.contents()
+                    .advanced(by: vSrc.offset + vSrc.stride * i)
+                    .assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                let w = transform * SIMD4<Float>(p.x, p.y, p.z, 1.0)
+                worldPos.append(SIMD3<Float>(w.x, w.y, w.z))
+            }
+            vertexWorldPos[uuid] = worldPos
+
+            // Find wall vertices from classification
+            var wallVerts = Set<Int>()
+            for f in 0..<fEl.count {
+                var isWall = false
                 if let c = cOpt {
                     let cv = c.buffer.contents()
                         .advanced(by: c.offset + c.stride * f)
                         .assumingMemoryBound(to: UInt8.self).pointee
-                    let cls = ARMeshClassification(rawValue: Int(cv)) ?? .none
-                    if cls == .wall { walls.insert(f) }
+                    isWall = (ARMeshClassification(rawValue: Int(cv)) == .wall)
+                }
+                if isWall {
+                    for j in 0..<ipf {
+                        let off = (f * ipf + j) * bpi
+                        let p = fEl.buffer.contents().advanced(by: off)
+                        let idx: Int
+                        if bpi == 4 { idx = Int(p.assumingMemoryBound(to: UInt32.self).pointee) }
+                        else { idx = Int(p.assumingMemoryBound(to: UInt16.self).pointee) }
+                        wallVerts.insert(idx)
+                    }
                 }
             }
+            wallVertices[uuid] = wallVerts
 
-            wallFaces[uuid] = walls
-            // Initially: only wall faces are selected
-            selectedFaces[uuid] = walls
+            // Set alpha: 1.0 for wall vertices, 0.0 for everything else
+            var alpha = [Float](repeating: 0.0, count: vCount)
+            for vi in wallVerts { alpha[vi] = 1.0 }
+            vertexAlpha[uuid] = alpha
         }
 
-        totalSelectedAreaSqm = computeSelectedArea()
-        rebuildAllMeshNodes()
+        totalSelectedAreaSqm = computeArea()
+        rebuildAll()
 
         emit("scanComplete", data: [
             "totalWallArea": totalSelectedAreaSqm,
             "meshSegments": meshNodes.count
         ])
-        emit("boot", data: ["status": "Done: \(String(format: "%.1f", totalSelectedAreaSqm)) m² walls"])
+        emit("boot", data: ["status": "Done: \(String(format: "%.1f", totalSelectedAreaSqm)) m²"])
         result(nil)
     }
 
     // ═══════════════════════════════════════════════════════════
-    // CENTROIDS
+    // AREA (sum of triangle areas weighted by average vertex alpha)
     // ═══════════════════════════════════════════════════════════
 
-    private func computeCentroids(anchor: ARMeshAnchor) -> [SIMD3<Float>] {
-        let geo = anchor.geometry
-        let vSrc = geo.vertices; let fEl = geo.faces
-        let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
-        let transform = anchor.transform
-        var centroids: [SIMD3<Float>] = []
-        centroids.reserveCapacity(fEl.count)
-
-        for f in 0..<fEl.count {
-            var sum = SIMD3<Float>(0, 0, 0)
-            for j in 0..<ipf {
-                let off = (f * ipf + j) * bpi
-                let p = fEl.buffer.contents().advanced(by: off)
-                let idx: Int
-                if bpi == 4 { idx = Int(p.assumingMemoryBound(to: UInt32.self).pointee) }
-                else { idx = Int(p.assumingMemoryBound(to: UInt16.self).pointee) }
-                let vPtr = vSrc.buffer.contents()
-                    .advanced(by: vSrc.offset + vSrc.stride * idx)
-                    .assumingMemoryBound(to: SIMD3<Float>.self)
-                let local = vPtr.pointee
-                let w = transform * SIMD4<Float>(local.x, local.y, local.z, 1.0)
-                sum += SIMD3<Float>(w.x, w.y, w.z)
-            }
-            centroids.append(sum / Float(ipf))
-        }
-        return centroids
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // AREA CALCULATION
-    // ═══════════════════════════════════════════════════════════
-
-    private func computeSelectedArea() -> Float {
+    private func computeArea() -> Float {
         guard let frame = sceneView.session.currentFrame else { return 0 }
         var total: Float = 0
+
         for anchor in frame.anchors {
             guard let ma = anchor as? ARMeshAnchor else { continue }
             let uuid = ma.identifier
-            guard let selected = selectedFaces[uuid] else { continue }
-            let geo = ma.geometry; let vSrc = geo.vertices; let fEl = geo.faces
+            guard let alpha = vertexAlpha[uuid],
+                  let wPos = vertexWorldPos[uuid] else { continue }
+            let fEl = ma.geometry.faces
             let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
-            let transform = ma.transform
 
-            for f in selected {
-                guard f < fEl.count else { continue }
-                var pos: [SIMD3<Float>] = []
+            for f in 0..<fEl.count {
+                var indices: [Int] = []
+                var avgAlpha: Float = 0
                 for j in 0..<ipf {
                     let off = (f * ipf + j) * bpi
                     let p = fEl.buffer.contents().advanced(by: off)
                     let idx: Int
                     if bpi == 4 { idx = Int(p.assumingMemoryBound(to: UInt32.self).pointee) }
                     else { idx = Int(p.assumingMemoryBound(to: UInt16.self).pointee) }
-                    let vPtr = vSrc.buffer.contents()
-                        .advanced(by: vSrc.offset + vSrc.stride * idx)
-                        .assumingMemoryBound(to: SIMD3<Float>.self)
-                    let local = vPtr.pointee
-                    let w = transform * SIMD4<Float>(local.x, local.y, local.z, 1.0)
-                    pos.append(SIMD3<Float>(w.x, w.y, w.z))
+                    indices.append(idx)
+                    if idx < alpha.count { avgAlpha += alpha[idx] }
                 }
-                if pos.count == 3 {
-                    total += simd_length(simd_cross(pos[1] - pos[0], pos[2] - pos[0])) * 0.5
-                }
+                avgAlpha /= Float(ipf)
+                // Only count triangles where average alpha > 0.5
+                guard avgAlpha > 0.5, indices.count == 3 else { continue }
+                let p0 = wPos[indices[0]], p1 = wPos[indices[1]], p2 = wPos[indices[2]]
+                total += simd_length(simd_cross(p1 - p0, p2 - p0)) * 0.5
             }
         }
         return total
@@ -388,209 +363,251 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ═══════════════════════════════════════════════════════════
 
     private func enterEditMode() {
-        editModeActive = true
-        isWallpaperApplied = false
-        createBrushCursor()
-        rebuildAllMeshNodes()
-        emit("boot", data: ["status": "Edit mode — paint or erase"])
+        editModeActive = true; isWallpaperApplied = false
+        createCursor(); rebuildAll()
+        emit("boot", data: ["status": "Edit mode — brush or lasso"])
     }
 
     private func exitEditMode() {
-        editModeActive = false
-        removeBrushCursor()
-        totalSelectedAreaSqm = computeSelectedArea()
-        rebuildAllMeshNodes()
-        emit("boot", data: ["status": "Selection: \(String(format: "%.1f", totalSelectedAreaSqm)) m²"])
+        editModeActive = false; removeCursor()
+        totalSelectedAreaSqm = computeArea()
+        rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
     }
 
-    private func undoSelection() {
+    private func undoAlpha() {
         guard let last = undoStack.popLast() else { return }
-        selectedFaces[last.0] = last.1
-        rebuildMeshNode(for: last.0)
-        totalSelectedAreaSqm = computeSelectedArea()
+        vertexAlpha[last.0] = last.1
+        rebuildMesh(for: last.0)
+        totalSelectedAreaSqm = computeArea()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
-        emit("boot", data: ["status": "Undo (\(undoStack.count) left)"])
     }
 
-    private func resetSelection() {
-        // Reset to wall-only faces
-        for (uuid, walls) in wallFaces {
-            selectedFaces[uuid] = walls
+    private func resetAlpha() {
+        for (uuid, walls) in wallVertices {
+            guard let count = vertexCounts[uuid] else { continue }
+            var alpha = [Float](repeating: 0.0, count: count)
+            for vi in walls { alpha[vi] = 1.0 }
+            vertexAlpha[uuid] = alpha
         }
         undoStack.removeAll()
-        totalSelectedAreaSqm = computeSelectedArea()
-        rebuildAllMeshNodes()
+        totalSelectedAreaSqm = computeArea()
+        rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
-        emit("boot", data: ["status": "Reset to wall-only selection"])
     }
 
     // ═══════════════════════════════════════════════════════════
-    // BRUSH CURSOR (3D ring that follows finger)
+    // BRUSH CURSOR
     // ═══════════════════════════════════════════════════════════
 
-    private func createBrushCursor() {
-        removeBrushCursor()
-        let ring = SCNTorus(ringRadius: CGFloat(brushRadius), pipeRadius: 0.003)
-        let mat = SCNMaterial()
-        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.8)
-        mat.lightingModel = .constant
-        ring.materials = [mat]
-        let node = SCNNode(geometry: ring)
-        node.isHidden = true
-        sceneView.scene.rootNode.addChildNode(node)
-        brushCursorNode = node
+    private func createCursor() {
+        removeCursor()
+        let ring = SCNTorus(ringRadius: CGFloat(brushRadius), pipeRadius: 0.002)
+        let m = SCNMaterial()
+        m.diffuse.contents = UIColor.white.withAlphaComponent(0.85)
+        m.lightingModel = .constant
+        ring.materials = [m]
+        let n = SCNNode(geometry: ring); n.isHidden = true
+        sceneView.scene.rootNode.addChildNode(n)
+        brushCursorNode = n
     }
 
-    private func removeBrushCursor() {
-        brushCursorNode?.removeFromParentNode()
-        brushCursorNode = nil
+    private func removeCursor() {
+        brushCursorNode?.removeFromParentNode(); brushCursorNode = nil
     }
 
-    private func updateBrushCursorSize() {
-        guard let node = brushCursorNode else { return }
-        if let torus = node.geometry as? SCNTorus {
-            torus.ringRadius = CGFloat(brushRadius)
-        }
+    private func updateCursorSize() {
+        (brushCursorNode?.geometry as? SCNTorus)?.ringRadius = CGFloat(brushRadius)
     }
 
-    private func moveBrushCursor(to worldPos: SCNVector3, normal: SCNVector3) {
-        guard let node = brushCursorNode else { return }
-        node.isHidden = false
-        node.position = worldPos
-        // Orient ring to face the surface normal
-        let up = SCNVector3(0, 1, 0)
-        let dot = normal.x * up.x + normal.y * up.y + normal.z * up.z
-        if abs(dot) < 0.99 {
-            node.look(at: SCNVector3(
-                worldPos.x + normal.x,
-                worldPos.y + normal.y,
-                worldPos.z + normal.z
-            ))
-        }
-    }
-
-    private func hideBrushCursor() {
-        brushCursorNode?.isHidden = true
+    private func moveCursor(to pos: SCNVector3, normal: SCNVector3) {
+        guard let n = brushCursorNode else { return }
+        n.isHidden = false; n.position = pos
+        n.look(at: SCNVector3(pos.x + normal.x, pos.y + normal.y, pos.z + normal.z))
     }
 
     // ═══════════════════════════════════════════════════════════
-    // BRUSH — Pan Gesture
+    // SOFT BRUSH (Gaussian falloff on vertices)
     // ═══════════════════════════════════════════════════════════
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
         guard editModeActive else { return }
-        let screenPt = gesture.location(in: sceneView)
+        let pt = gesture.location(in: sceneView)
 
         switch gesture.state {
         case .began:
             lastBrushWorld = nil
-            if let hit = meshHitTest(screenPt) {
-                if let uuid = anchorUUID(for: hit.node),
-                   let current = selectedFaces[uuid] {
-                    undoStack.append((uuid, current))
-                    if undoStack.count > maxUndo { undoStack.removeFirst() }
+            if let hit = firstMeshHit(pt) {
+                // Save undo for all anchors that might be affected
+                for (uuid, alpha) in vertexAlpha {
+                    undoStack.append((uuid, alpha))
                 }
-                moveBrushCursor(to: hit.worldCoordinates, normal: hit.localNormal)
-                applyBrush(at: hit.worldCoordinates)
+                if undoStack.count > maxUndo * 2 {
+                    undoStack.removeFirst(undoStack.count - maxUndo)
+                }
+                moveCursor(to: hit.worldCoordinates, normal: hit.localNormal)
+                applyGaussianBrush(at: hit.worldCoordinates)
             }
         case .changed:
-            if let hit = meshHitTest(screenPt) {
+            if let hit = firstMeshHit(pt) {
                 let wp = SIMD3<Float>(Float(hit.worldCoordinates.x),
                                       Float(hit.worldCoordinates.y),
                                       Float(hit.worldCoordinates.z))
                 if let last = lastBrushWorld, simd_distance(last, wp) < brushMoveThreshold { return }
                 lastBrushWorld = wp
-                moveBrushCursor(to: hit.worldCoordinates, normal: hit.localNormal)
-                applyBrush(at: hit.worldCoordinates)
+                moveCursor(to: hit.worldCoordinates, normal: hit.localNormal)
+                applyGaussianBrush(at: hit.worldCoordinates)
             }
         case .ended, .cancelled:
             lastBrushWorld = nil
-            hideBrushCursor()
-            totalSelectedAreaSqm = computeSelectedArea()
+            brushCursorNode?.isHidden = true
+            totalSelectedAreaSqm = computeArea()
             emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
         default: break
         }
     }
 
-    private func meshHitTest(_ pt: CGPoint) -> SCNHitTestResult? {
+    private func firstMeshHit(_ pt: CGPoint) -> SCNHitTestResult? {
         let results = sceneView.hitTest(pt, options: [
             .boundingBoxOnly: false,
             .searchMode: SCNHitTestSearchMode.closest.rawValue
         ])
-        for r in results { if anchorUUID(for: r.node) != nil { return r } }
-        return nil
-    }
-
-    private func anchorUUID(for node: SCNNode) -> UUID? {
-        var current: SCNNode? = node
-        while let n = current {
-            for (uuid, meshNode) in meshNodes {
-                if n === meshNode { return uuid }
+        for r in results {
+            var cur: SCNNode? = r.node
+            while let n = cur {
+                if meshNodes.values.contains(where: { $0 === n }) { return r }
+                cur = n.parent
             }
-            current = n.parent
         }
         return nil
     }
 
-    private func applyBrush(at worldCoords: SCNVector3) {
-        let brushPt = SIMD3<Float>(Float(worldCoords.x), Float(worldCoords.y), Float(worldCoords.z))
-        var rebuiltUUIDs: Set<UUID> = []
+    /// Gaussian brush: vertices at center get full effect, edges get partial
+    private func applyGaussianBrush(at worldCoords: SCNVector3) {
+        let center = SIMD3<Float>(Float(worldCoords.x), Float(worldCoords.y), Float(worldCoords.z))
+        let sigma = brushRadius * 0.5 // gaussian sigma
+        let twoSigmaSq = 2.0 * sigma * sigma
+        var rebuiltUUIDs = Set<UUID>()
 
-        for (uuid, centroids) in faceCentroids {
-            guard var selected = selectedFaces[uuid] else { continue }
+        for (uuid, worldPositions) in vertexWorldPos {
+            guard var alpha = vertexAlpha[uuid] else { continue }
             var changed = false
 
-            for (faceIdx, centroid) in centroids.enumerated() {
-                let dist = simd_distance(brushPt, centroid)
-                if dist <= brushRadius {
-                    if brushMode == .paint {
-                        if !selected.contains(faceIdx) {
-                            selected.insert(faceIdx); changed = true
-                        }
-                    } else {
-                        if selected.contains(faceIdx) {
-                            selected.remove(faceIdx); changed = true
-                        }
-                    }
+            for (vi, vPos) in worldPositions.enumerated() {
+                let dist = simd_distance(center, vPos)
+                guard dist <= brushRadius else { continue }
+
+                // Gaussian: 1.0 at center, ~0.13 at edge
+                let weight = exp(-(dist * dist) / twoSigmaSq)
+
+                if brushMode == .erase {
+                    let newAlpha = alpha[vi] - weight
+                    let clamped = max(0.0, newAlpha)
+                    if clamped != alpha[vi] { alpha[vi] = clamped; changed = true }
+                } else {
+                    let newAlpha = alpha[vi] + weight
+                    let clamped = min(1.0, newAlpha)
+                    if clamped != alpha[vi] { alpha[vi] = clamped; changed = true }
                 }
             }
+
             if changed {
-                selectedFaces[uuid] = selected
+                vertexAlpha[uuid] = alpha
                 rebuiltUUIDs.insert(uuid)
             }
         }
-        for uuid in rebuiltUUIDs { rebuildMeshNode(for: uuid) }
+
+        for uuid in rebuiltUUIDs { rebuildMesh(for: uuid) }
     }
 
     // ═══════════════════════════════════════════════════════════
-    // GEOMETRY BUILDERS
+    // LASSO TOOL (straight-line polygon cut from Dart)
     // ═══════════════════════════════════════════════════════════
 
-    private func rebuildAllMeshNodes() {
+    private func applyLasso(screenPoints: [[Double]], mode: String) {
+        guard screenPoints.count >= 3 else { return }
+
+        let polygon = screenPoints.map { CGPoint(x: $0[0], y: $0[1]) }
+        let isErase = (mode == "erase")
+
+        // Save undo
+        for (uuid, alpha) in vertexAlpha {
+            undoStack.append((uuid, alpha))
+        }
+
+        // For each vertex, project to screen and test if inside polygon
+        for (uuid, worldPositions) in vertexWorldPos {
+            guard var alpha = vertexAlpha[uuid] else { continue }
+            var changed = false
+
+            for (vi, wPos) in worldPositions.enumerated() {
+                let scnPos = SCNVector3(wPos.x, wPos.y, wPos.z)
+                let screenPos = sceneView.projectPoint(scnPos)
+                let sp = CGPoint(x: CGFloat(screenPos.x), y: CGFloat(screenPos.y))
+
+                // Skip if z is behind camera
+                guard screenPos.z > 0, screenPos.z < 1 else { continue }
+
+                if pointInPolygon(sp, polygon: polygon) {
+                    if isErase {
+                        if alpha[vi] > 0 { alpha[vi] = 0.0; changed = true }
+                    } else {
+                        if alpha[vi] < 1 { alpha[vi] = 1.0; changed = true }
+                    }
+                }
+            }
+
+            if changed { vertexAlpha[uuid] = alpha }
+        }
+
+        rebuildAll()
+        totalSelectedAreaSqm = computeArea()
+        emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
+        emit("boot", data: ["status": "Lasso applied"])
+    }
+
+    /// Point-in-polygon test (ray casting algorithm)
+    private func pointInPolygon(_ point: CGPoint, polygon: [CGPoint]) -> Bool {
+        var inside = false
+        let n = polygon.count
+        var j = n - 1
+        for i in 0..<n {
+            let pi = polygon[i], pj = polygon[j]
+            if (pi.y > point.y) != (pj.y > point.y) {
+                let xIntersect = pi.x + (point.y - pi.y) / (pj.y - pi.y) * (pj.x - pi.x)
+                if point.x < xIntersect { inside = !inside }
+            }
+            j = i
+        }
+        return inside
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // GEOMETRY BUILDERS (with per-vertex alpha)
+    // ═══════════════════════════════════════════════════════════
+
+    private func rebuildAll() {
         guard let frame = sceneView.session.currentFrame else { return }
         for anchor in frame.anchors {
             guard let ma = anchor as? ARMeshAnchor else { continue }
-            rebuildMeshNode(for: ma.identifier)
+            rebuildMesh(for: ma.identifier)
         }
     }
 
-    private func rebuildMeshNode(for uuid: UUID) {
+    private func rebuildMesh(for uuid: UUID) {
         guard let node = meshNodes[uuid],
               let frame = sceneView.session.currentFrame,
               let anchor = frame.anchors.first(where: { $0.identifier == uuid }) as? ARMeshAnchor
         else { return }
-        if let geo = buildGeometry(from: anchor) { node.geometry = geo }
+        if let geo = buildGeo(from: anchor) { node.geometry = geo }
     }
 
-    private func buildGeometry(from anchor: ARMeshAnchor) -> SCNGeometry? {
+    private func buildGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
         if currentMode == .scanning { return buildScanGeo(from: anchor) }
-        if editModeActive { return buildEditGeo(from: anchor) }
-        if isWallpaperApplied { return buildWallpaperGeo(from: anchor) }
-        return buildEditGeo(from: anchor) // preview without wallpaper
+        return buildAlphaGeo(from: anchor)
     }
 
-    /// Scan phase: classification wireframe
+    /// Scan phase: classification wireframe (no alpha)
     private func buildScanGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geo = anchor.geometry
         guard geo.vertices.count > 0, geo.faces.count > 0 else { return nil }
@@ -625,122 +642,166 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let g = SCNGeometry(sources: [src], elements: els); g.materials = mats; return g
     }
 
-    /// Edit phase: wallpaper preview (25% opacity) on selected, faint red wire on unselected
-    private func buildEditGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
+    /// Edit + Wallpaper phase: ALL faces included, alpha from vertex colors
+    private func buildAlphaGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geo = anchor.geometry
-        guard geo.vertices.count > 0, geo.faces.count > 0 else { return nil }
+        let vCount = geo.vertices.count
+        let fCount = geo.faces.count
+        guard vCount > 0, fCount > 0 else { return nil }
+
+        let uuid = anchor.identifier
+        guard let alpha = vertexAlpha[uuid] else { return nil }
+
+        // Vertices
         let verts = extractVerts(geo)
         let uvs = genUVs(geo, transform: anchor.transform)
-        let selected = selectedFaces[anchor.identifier] ?? Set<Int>()
-        let fEl = geo.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
 
-        var selI: [UInt32] = [], unselI: [UInt32] = []
-        for f in 0..<fEl.count {
-            let tri = readFace(fEl, f: f, bpi: bpi, ipf: ipf)
-            if selected.contains(f) { selI.append(contentsOf: tri) }
-            else { unselI.append(contentsOf: tri) }
+        // Vertex colors: white RGB, alpha from vertexAlpha
+        var colors = [SIMD4<Float>](repeating: SIMD4<Float>(1, 1, 1, 0), count: vCount)
+        for i in 0..<vCount {
+            let a = i < alpha.count ? alpha[i] : 0.0
+            colors[i] = SIMD4<Float>(1, 1, 1, a)
         }
 
-        let vSrc = SCNGeometrySource(vertices: verts)
-        let uvSrc = SCNGeometrySource(textureCoordinates: uvs)
-        var els: [SCNGeometryElement] = [], mats: [SCNMaterial] = []
-        addEl(&els, &mats, selI, makePreviewMaterial()) // wallpaper at 25%
-        addEl(&els, &mats, unselI, matUnselectedWire)   // faint red wireframe
-        guard !els.isEmpty else { return nil }
-        let g = SCNGeometry(sources: [vSrc, uvSrc], elements: els); g.materials = mats; return g
-    }
-
-    /// Wallpaper phase: full wallpaper on selected, hidden on rest
-    private func buildWallpaperGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
-        let geo = anchor.geometry
-        guard geo.vertices.count > 0, geo.faces.count > 0 else { return nil }
-        let verts = extractVerts(geo)
-        let uvs = genUVs(geo, transform: anchor.transform)
-        let selected = selectedFaces[anchor.identifier] ?? Set<Int>()
-        let fEl = geo.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
-
-        var selI: [UInt32] = []
-        for f in 0..<fEl.count {
-            if selected.contains(f) { selI.append(contentsOf: readFace(fEl, f: f, bpi: bpi, ipf: ipf)) }
+        // All face indices (we include everything — alpha hides non-selected)
+        let fEl = geo.faces
+        let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
+        var allIdx: [UInt32] = []
+        allIdx.reserveCapacity(fCount * ipf)
+        for f in 0..<fCount {
+            allIdx.append(contentsOf: readFace(fEl, f: f, bpi: bpi, ipf: ipf))
         }
 
-        let vSrc = SCNGeometrySource(vertices: verts)
+        guard !allIdx.isEmpty else { return nil }
+
+        // Sources
+        let vertSrc = SCNGeometrySource(vertices: verts)
         let uvSrc = SCNGeometrySource(textureCoordinates: uvs)
-        var els: [SCNGeometryElement] = [], mats: [SCNMaterial] = []
-        addEl(&els, &mats, selI, makeWallpaperMaterial())
-        guard !els.isEmpty else { return nil }
-        let g = SCNGeometry(sources: [vSrc, uvSrc], elements: els); g.materials = mats; return g
+
+        // Vertex color source
+        let colorData = Data(bytes: &colors, count: colors.count * MemoryLayout<SIMD4<Float>>.stride)
+        let colorSrc = SCNGeometrySource(
+            data: colorData,
+            semantic: .color,
+            vectorCount: vCount,
+            usesFloatComponents: true,
+            componentsPerVector: 4,
+            bytesPerComponent: MemoryLayout<Float>.stride,
+            dataOffset: 0,
+            dataStride: MemoryLayout<SIMD4<Float>>.stride
+        )
+
+        // Element
+        let idxData = Data(bytes: allIdx, count: allIdx.count * 4)
+        let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
+                                          primitiveCount: allIdx.count / 3, bytesPerIndex: 4)
+
+        // Material
+        let mat: SCNMaterial
+        if isWallpaperApplied {
+            mat = makeWPMat()
+        } else if editModeActive {
+            mat = makeEditMat()
+        } else {
+            mat = makeEditMat() // preview
+        }
+
+        let g = SCNGeometry(sources: [vertSrc, uvSrc, colorSrc], elements: [element])
+        g.materials = [mat]
+        return g
     }
 
-    // ── Helpers ──────────────────────────────────────────────
+    // ── Materials ────────────────────────────────────────────
+
+    /// Edit mode: wallpaper at low opacity (or gold if no wallpaper loaded)
+    private func makeEditMat() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.isDoubleSided = true; m.blendMode = .alpha
+        m.writesToDepthBuffer = true; m.readsFromDepthBuffer = true
+
+        if let img = wpAlbedo {
+            m.diffuse.contents = img
+            m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
+            m.lightingModel = .physicallyBased
+            m.transparency = 0.30 // 30% preview
+        } else {
+            m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
+            m.lightingModel = .constant
+            m.transparency = 0.25
+        }
+        return m
+    }
+
+    /// Applied wallpaper material
+    private func makeWPMat() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.isDoubleSided = true; m.blendMode = .alpha
+        m.lightingModel = .physicallyBased
+        m.transparency = wallpaperOpacity
+        m.writesToDepthBuffer = true; m.readsFromDepthBuffer = true
+
+        if let img = wpAlbedo {
+            m.diffuse.contents = img
+            m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
+        }
+        if let img = wpNormal {
+            m.normal.contents = img
+            m.normal.wrapS = .repeat; m.normal.wrapT = .repeat
+            m.normal.intensity = 0.8
+        }
+        if let img = wpRoughness {
+            m.roughness.contents = img
+            m.roughness.wrapS = .repeat; m.roughness.wrapT = .repeat
+        }
+        if let img = wpAO {
+            m.ambientOcclusion.contents = img
+            m.ambientOcclusion.wrapS = .repeat; m.ambientOcclusion.wrapT = .repeat
+        }
+        return m
+    }
+
+    // ── Geometry helpers ─────────────────────────────────────
 
     private func extractVerts(_ geo: ARMeshGeometry) -> [SCNVector3] {
-        let vSrc = geo.vertices; var v: [SCNVector3] = []
-        v.reserveCapacity(vSrc.count)
-        for i in 0..<vSrc.count {
-            let p = vSrc.buffer.contents().advanced(by: vSrc.offset + vSrc.stride * i)
+        let s = geo.vertices; var v = [SCNVector3](); v.reserveCapacity(s.count)
+        for i in 0..<s.count {
+            let p = s.buffer.contents().advanced(by: s.offset + s.stride * i)
                 .assumingMemoryBound(to: SIMD3<Float>.self).pointee
             v.append(SCNVector3(p.x, p.y, p.z))
         }; return v
     }
 
     private func genUVs(_ geo: ARMeshGeometry, transform: simd_float4x4) -> [CGPoint] {
-        let vSrc = geo.vertices; var uvs: [CGPoint] = []
-        uvs.reserveCapacity(vSrc.count)
-        let s: Float = 1.0 / 0.53
-        for i in 0..<vSrc.count {
-            let p = vSrc.buffer.contents().advanced(by: vSrc.offset + vSrc.stride * i)
+        let s = geo.vertices; var uv = [CGPoint](); uv.reserveCapacity(s.count)
+        let sc: Float = 1.0 / 0.53
+        for i in 0..<s.count {
+            let p = s.buffer.contents().advanced(by: s.offset + s.stride * i)
                 .assumingMemoryBound(to: SIMD3<Float>.self).pointee
             let w = transform * SIMD4<Float>(p.x, p.y, p.z, 1.0)
-            uvs.append(CGPoint(x: CGFloat((w.x + w.z) * s), y: CGFloat(w.y * s)))
-        }; return uvs
+            uv.append(CGPoint(x: CGFloat((w.x + w.z) * sc), y: CGFloat(w.y * sc)))
+        }; return uv
     }
 
     private func readFace(_ fEl: ARGeometryElement, f: Int, bpi: Int, ipf: Int) -> [UInt32] {
-        var tri: [UInt32] = []
+        var t = [UInt32]()
         for j in 0..<ipf {
-            let off = (f * ipf + j) * bpi
-            let p = fEl.buffer.contents().advanced(by: off)
-            if bpi == 4 { tri.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
-            else { tri.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
-        }; return tri
+            let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
+            if bpi == 4 { t.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
+            else { t.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
+        }; return t
     }
 
     private func addEl(_ els: inout [SCNGeometryElement], _ mats: inout [SCNMaterial],
-                       _ indices: [UInt32], _ mat: SCNMaterial) {
-        guard !indices.isEmpty else { return }
-        let d = Data(bytes: indices, count: indices.count * 4)
-        els.append(SCNGeometryElement(data: d, primitiveType: .triangles,
-                                       primitiveCount: indices.count / 3, bytesPerIndex: 4))
+                       _ idx: [UInt32], _ mat: SCNMaterial) {
+        guard !idx.isEmpty else { return }
+        els.append(SCNGeometryElement(data: Data(bytes: idx, count: idx.count * 4),
+                                       primitiveType: .triangles,
+                                       primitiveCount: idx.count / 3, bytesPerIndex: 4))
         mats.append(mat)
     }
 
     // ═══════════════════════════════════════════════════════════
-    // WALLPAPER MATERIAL (96% opacity for final apply)
-    // ═══════════════════════════════════════════════════════════
-
-    private func makeWallpaperMaterial() -> SCNMaterial {
-        let m = SCNMaterial()
-        m.fillMode = .fill; m.isDoubleSided = true
-        m.lightingModel = .physicallyBased; m.transparency = 0.96
-        if let img = wpAlbedo {
-            m.diffuse.contents = img; m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
-        }
-        if let img = wpNormal {
-            m.normal.contents = img; m.normal.wrapS = .repeat; m.normal.wrapT = .repeat
-            m.normal.intensity = 0.8
-        }
-        if let img = wpRoughness {
-            m.roughness.contents = img; m.roughness.wrapS = .repeat; m.roughness.wrapT = .repeat
-        }
-        if let img = wpAO {
-            m.ambientOcclusion.contents = img
-            m.ambientOcclusion.wrapS = .repeat; m.ambientOcclusion.wrapT = .repeat
-        }; return m
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // PLACE / CLEAR
+    // PLACE / CLEAR WALLPAPER
     // ═══════════════════════════════════════════════════════════
 
     private func placeWallpaper(_ args: [String: Any]?, result: @escaping FlutterResult) {
@@ -748,40 +809,39 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             emit("wallpaperPlaced", data: ["success": false, "message": "No URL"])
             result(nil); return
         }
-        let nUrl = args["normalUrl"] as? String ?? ""
-        let rUrl = args["roughnessUrl"] as? String ?? ""
-        let aUrl = args["aoUrl"] as? String ?? ""
-        let wIdx = args["wallIndex"] as? Int ?? 0
+        let nU = args["normalUrl"] as? String ?? ""
+        let rU = args["roughnessUrl"] as? String ?? ""
+        let aU = args["aoUrl"] as? String ?? ""
+        let wI = args["wallIndex"] as? Int ?? 0
 
         emit("boot", data: ["status": "Loading textures..."])
         let g = DispatchGroup()
         var a: UIImage?, n: UIImage?, r: UIImage?, o: UIImage?
         g.enter(); textureCache.loadImage(from: url) { a = $0; g.leave() }
-        if !nUrl.isEmpty { g.enter(); textureCache.loadImage(from: nUrl) { n = $0; g.leave() } }
-        if !rUrl.isEmpty { g.enter(); textureCache.loadImage(from: rUrl) { r = $0; g.leave() } }
-        if !aUrl.isEmpty { g.enter(); textureCache.loadImage(from: aUrl) { o = $0; g.leave() } }
+        if !nU.isEmpty { g.enter(); textureCache.loadImage(from: nU) { n = $0; g.leave() } }
+        if !rU.isEmpty { g.enter(); textureCache.loadImage(from: rU) { r = $0; g.leave() } }
+        if !aU.isEmpty { g.enter(); textureCache.loadImage(from: aU) { o = $0; g.leave() } }
 
         g.notify(queue: .main) { [weak self] in
             guard let self = self, let albedo = a else {
-                self?.emit("wallpaperPlaced", data: ["wallIndex": wIdx, "success": false, "message": "Load failed"])
+                self?.emit("wallpaperPlaced", data: ["wallIndex": wI, "success": false])
                 result(nil); return
             }
             self.wpAlbedo = albedo; self.wpNormal = n; self.wpRoughness = r; self.wpAO = o
             self.isWallpaperApplied = true; self.editModeActive = false
-            self.removeBrushCursor()
-            self.totalSelectedAreaSqm = self.computeSelectedArea()
-            self.rebuildAllMeshNodes()
-            self.emit("wallpaperPlaced", data: ["wallIndex": wIdx, "success": true, "area": self.totalSelectedAreaSqm])
+            self.removeCursor()
+            self.totalSelectedAreaSqm = self.computeArea()
+            self.rebuildAll()
+            self.emit("wallpaperPlaced", data: ["wallIndex": wI, "success": true, "area": self.totalSelectedAreaSqm])
             self.emit("boot", data: ["status": "Wallpaper applied ✅"])
             result(nil)
         }
     }
 
-    private func clearAllWallpaper() {
+    private func clearWallpaper() {
         isWallpaperApplied = false
         wpAlbedo = nil; wpNormal = nil; wpRoughness = nil; wpAO = nil
-        rebuildAllMeshNodes()
-        emit("wallCleared", data: ["wallIndex": 0])
+        rebuildAll(); emit("wallCleared", data: ["wallIndex": 0])
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -803,9 +863,7 @@ extension WallpaperARView: FlutterStreamHandler {
         pendingEvents.removeAll()
         emit("boot", data: ["status": "Dart listener attached"]); return nil
     }
-    func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        eventSink = nil; return nil
-    }
+    func onCancel(withArguments arguments: Any?) -> FlutterError? { eventSink = nil; return nil }
 }
 
 // MARK: - AR Delegates
@@ -814,8 +872,7 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {}
 
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
-        guard let ma = anchor as? ARMeshAnchor else { return }
-        guard !meshFrozen, currentMode == .scanning else { return }
+        guard let ma = anchor as? ARMeshAnchor, !meshFrozen, currentMode == .scanning else { return }
         guard let geo = buildScanGeo(from: ma) else { return }
         let meshNode = SCNNode(geometry: geo)
         node.addChildNode(meshNode)
@@ -838,12 +895,13 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
         guard let ma = anchor as? ARMeshAnchor else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.meshNodes[ma.identifier]?.removeFromParentNode()
-            self?.meshNodes.removeValue(forKey: ma.identifier)
-            self?.selectedFaces.removeValue(forKey: ma.identifier)
-            self?.faceCentroids.removeValue(forKey: ma.identifier)
-            self?.faceCounts.removeValue(forKey: ma.identifier)
-            self?.wallFaces.removeValue(forKey: ma.identifier)
+            let uuid = ma.identifier
+            self?.meshNodes[uuid]?.removeFromParentNode()
+            self?.meshNodes.removeValue(forKey: uuid)
+            self?.vertexAlpha.removeValue(forKey: uuid)
+            self?.vertexWorldPos.removeValue(forKey: uuid)
+            self?.wallVertices.removeValue(forKey: uuid)
+            self?.vertexCounts.removeValue(forKey: uuid)
         }
     }
 }
