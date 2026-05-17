@@ -159,7 +159,6 @@ class _ARScreenState extends State<ARScreen> {
   Future<void> _setBrushSize(double size) async {
     setState(() => _brushSize = size);
     try {
-      // Reuse existing setBrushSize channel
       await _arService.setBrushSize(size);
     } catch (e) { _log('Size error: $e'); }
   }
@@ -212,7 +211,7 @@ class _ARScreenState extends State<ARScreen> {
             child: UiKitView(
               viewType: 'com.oboia/ar_view',
               creationParams: const <String, dynamic>{},
-              creationParamsCodec: const StandardMessageCodec(),
+              creationParamsCodec: StandardMessageCodec(),  // ← removed const
             ),
           ),
 
