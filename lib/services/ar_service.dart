@@ -531,4 +531,20 @@ class ARService {
     dlog('AR-DART', 'setBrushSize -> $size');
     await _channel.invokeMethod<void>('setBrushSize', {'size': size});
   }
+
+  /// Set wallpaper opacity (0.1 to 1.0)
+  Future<void> setWallpaperOpacity(double opacity) async {
+    dlog('AR-DART', 'setWallpaperOpacity -> $opacity');
+    await _channel.invokeMethod<void>('setWallpaperOpacity', {'opacity': opacity});
+  }
+
+  /// Apply lasso polygon cut. Points are screen coordinates [[x,y], ...]
+  /// mode is 'erase' or 'paint'
+  Future<void> applyLasso(List<List<double>> points, String mode) async {
+    dlog('AR-DART', 'applyLasso ${points.length} points, mode=$mode');
+    await _channel.invokeMethod<void>('applyLasso', {
+      'points': points,
+      'mode': mode,
+    });
+  }
 }
