@@ -517,4 +517,18 @@ class ARService {
   Future<void> clearAllCuts(int wallIndex) async {
     await _channel.invokeMethod<void>('clearAllCuts', {'wallIndex': wallIndex});
   }
+
+  // ── Brush Methods ───────────────────────────────────────────────────────
+
+  /// Set brush mode: 'paint' to add selection, 'erase' to remove selection
+  Future<void> setBrushMode(String mode) async {
+    dlog('AR-DART', 'setBrushMode -> $mode');
+    await _channel.invokeMethod<void>('setBrushMode', mode);
+  }
+
+  /// Set brush radius in meters (0.02 = 2cm, 0.25 = 25cm)
+  Future<void> setBrushSize(double size) async {
+    dlog('AR-DART', 'setBrushSize -> $size');
+    await _channel.invokeMethod<void>('setBrushSize', {'size': size});
+  }
 }
