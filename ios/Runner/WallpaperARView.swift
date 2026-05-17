@@ -505,12 +505,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     /// Find which mesh anchor UUID a node belongs to
     private func anchorUUID(for node: SCNNode) -> UUID? {
-        for (uuid, meshNode) in meshNodes {
-            if meshNode === node || meshNode.childNodes.contains(where: { $0 === node }) || node.parent === meshNode || meshNode.parent?.childNodes.contains(where: { $0 === meshNode && node.isDescendant(of: meshNode.parent!) }) == true {
-                return uuid
-            }
-        }
-        // Check if node itself or parent is in meshNodes
         var current: SCNNode? = node
         while let n = current {
             for (uuid, meshNode) in meshNodes {
