@@ -547,4 +547,16 @@ class ARService {
       'mode': mode,
     });
   }
+
+  /// Pause AR session (freezes camera view, used for lasso drawing)
+  Future<void> pauseSession() async {
+    dlog('AR-DART', 'pauseSession');
+    await _channel.invokeMethod<void>('pauseSession');
+  }
+
+  /// Resume AR session (unfreezes camera view)
+  Future<void> resumeSession() async {
+    dlog('AR-DART', 'resumeSession');
+    await _channel.invokeMethod<void>('resumeSession');
+  }
 }
