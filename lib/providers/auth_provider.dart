@@ -36,10 +36,20 @@ class AuthProvider extends ChangeNotifier {
         notifyListeners();
         return;
       }
+
       _userDocSub = AuthService.instance.userDocStream(user.uid).listen((u) {
         _appUser = u;
         _loading = false;
         notifyListeners();
+      });
+
+      // Safety timeout — if Firestore never emits (offline / slow network),
+      // unblock the splash screen after 5 seconds so the app doesn't hang.
+      Future.delayed(const Duration(seconds: 5), () {
+        if (_loading) {
+          _loading = false;
+          notifyListeners();
+        }
       });
     });
   }
