@@ -738,7 +738,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 // MARK: - FlutterStreamHandler
 
 extension WallpaperARView: FlutterStreamHandler {
-    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterEventSink? {
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         eventSink = { event in events(event) }
         for e in pendingEvents { events(e) }; pendingEvents.removeAll()
         emit("boot", data: ["status": "Dart listener attached"]); return nil
