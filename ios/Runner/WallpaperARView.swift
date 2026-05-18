@@ -362,17 +362,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func createCursor() {
         removeCursor()
-        // Use a flat ring (SCNTube with tiny height) for consistent circle shape
-        let diameter = CGFloat(brushRadius * 2)
-        let ring = SCNTube(innerRadius: diameter * 0.45, outerRadius: diameter * 0.5, height: 0.001)
+        let size = CGFloat(brushRadius * 2)
+        let plane = SCNPlane(width: size, height: size)
         let mat = SCNMaterial()
-        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.9)
-        mat.lightingModel = .constant; mat.isDoubleSided = true
-        ring.materials = [mat, mat, mat] // inner, outer, edge
+        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.0)
+        mat.emission.contents = UIColor.clear
+        mat.lightingModel = .constant
+        mat.isDoubleSided = true
+        plane.materials = [mat]
 
-        let node = SCNNode(geometry: ring)
+        let node = SCNNode(geometry: plane)
         node.isHidden = true
-        // Billboard constraint: always faces the camera → always a circle
+        // Billboard constraint: always faces the camera → always a perfect circle
         let billboard = SCNBillboardConstraint()
         billboard.freeAxes = .all
         node.constraints = [billboard]
@@ -386,9 +387,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func updateCursorSize() {
-        guard let node = brushCursorNode, let tube = node.geometry as? SCNTube else { return }
+        guard let node = brushCursorNode, let plane = node.geometry as? SCNPlane else { return }
         let d = CGFloat(brushRadius * 2)
-        tube.innerRadius = d * 0.45; tube.outerRadius = d * 0.5
+        plane.width = d; plane.height = d
     }
 
     private func moveCursor(to pos: SCNVector3) {
@@ -610,7 +611,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
                                           primitiveCount: allIdx.count / 3, bytesPerIndex: 4)
 
-        // FIX #4: Use wallpaperOpacity for both edit and applied modes
         let mat: SCNMaterial
         if isWallpaperApplied { mat = makeWPMat() }
         else { mat = makeEditMat() }
@@ -624,11 +624,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private func makeEditMat() -> SCNMaterial {
         let m = SCNMaterial(); m.isDoubleSided = true; m.blendMode = .alpha
         m.writesToDepthBuffer = true; m.readsFromDepthBuffer = true
-        // FIX #4: Use wallpaperOpacity slider value
         if let img = wpAlbedo {
             m.diffuse.contents = img; m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
             m.lightingModel = .physicallyBased
-            m.transparency = wallpaperOpacity * 0.35  // dimmed in edit mode
+            m.transparency = wallpaperOpacity * 0.35
         } else {
             m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
             m.lightingModel = .constant
@@ -640,7 +639,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private func makeWPMat() -> SCNMaterial {
         let m = SCNMaterial(); m.isDoubleSided = true; m.blendMode = .alpha
         m.lightingModel = .physicallyBased
-        m.transparency = wallpaperOpacity  // FIX #4: respects slider
+        m.transparency = wallpaperOpacity
         m.writesToDepthBuffer = true; m.readsFromDepthBuffer = true
         if let img = wpAlbedo { m.diffuse.contents = img; m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat }
         if let img = wpNormal { m.normal.contents = img; m.normal.wrapS = .repeat; m.normal.wrapT = .repeat; m.normal.intensity = 0.8 }
@@ -739,7 +738,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 // MARK: - FlutterStreamHandler
 
 extension WallpaperARView: FlutterStreamHandler {
-    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterEventSink? {
         eventSink = { event in events(event) }
         for e in pendingEvents { events(e) }; pendingEvents.removeAll()
         emit("boot", data: ["status": "Dart listener attached"]); return nil
