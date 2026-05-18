@@ -1,5 +1,6 @@
-// lib/screens/ar/ar_screen.dart — v3 FIXES
+// lib/screens/ar/ar_screen.dart — v4 FINAL
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../services/ar_service.dart';
@@ -7,6 +8,7 @@ import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
 
 const Color goldColor = Color(0xFFFFD369);
+const double _closeLoopDistance = 30.0; // pixels — how close to first point to close loop
 
 class ARScreen extends StatefulWidget {
   final WallpaperModel? wallpaper;
@@ -25,11 +27,13 @@ class _ARScreenState extends State<ARScreen> {
   final List<String> _logLines = [];
   bool _isScanning = false, _scanDone = false, _wallpaperApplied = false;
   bool _editMode = false, _showLog = false;
-  String _activeTool = 'erase'; // 'paint', 'erase', 'lasso'
-  String _lassoMode = 'erase'; // sub-mode for lasso: 'paint' or 'erase'
+  String _activeTool = 'erase';
+  String _lassoMode = 'erase';
   double _brushSize = 0.08, _wallpaperOpacity = 0.96;
   double _totalWallArea = 0.0;
   List<Offset> _lassoPoints = [];
+  bool _lassoClosed = false;
+  bool _sessionPaused = false;
 
   @override
   void initState() { super.initState(); _initAR(); }
@@ -87,22 +91,33 @@ class _ARScreenState extends State<ARScreen> {
   // Actions
   Future<void> _startScan() async {
     setState(() { _isScanning = true; _scanDone = false; _wallpaperApplied = false;
-      _editMode = false; _totalWallArea = 0; _lassoPoints.clear(); });
+      _editMode = false; _totalWallArea = 0; _lassoPoints.clear(); _lassoClosed = false; });
     try { await _arService.setARMode('scanning'); await _arService.startScan(); } catch (e) { _log('Scan: $e'); }
   }
   Future<void> _stopScan() async { try { await _arService.stopScan(); } catch (e) { _log('Stop: $e'); } }
 
   Future<void> _enterEditMode() async {
-    setState(() { _editMode = true; _activeTool = 'erase'; _lassoPoints.clear(); });
+    setState(() { _editMode = true; _activeTool = 'erase'; _lassoPoints.clear(); _lassoClosed = false; });
     try { await _arService.enterCutMode(0); await _arService.setBrushMode('erase'); } catch (_) {}
   }
   Future<void> _exitEditMode() async {
-    setState(() { _editMode = false; _lassoPoints.clear(); });
+    setState(() { _editMode = false; _lassoPoints.clear(); _lassoClosed = false; });
+    if (_sessionPaused) {
+      try { await _arService.resumeSession(); _sessionPaused = false; } catch (_) {}
+    }
     try { await _arService.exitCutMode(); } catch (_) {}
   }
 
   Future<void> _setTool(String tool) async {
-    setState(() { _activeTool = tool; _lassoPoints.clear(); });
+    // If switching away from lasso, resume camera
+    if (_activeTool == 'lasso' && tool != 'lasso' && _sessionPaused) {
+      try { await _arService.resumeSession(); _sessionPaused = false; } catch (_) {}
+    }
+    // If switching TO lasso, pause camera
+    if (tool == 'lasso' && !_sessionPaused) {
+      try { await _arService.pauseSession(); _sessionPaused = true; } catch (_) {}
+    }
+    setState(() { _activeTool = tool; _lassoPoints.clear(); _lassoClosed = false; });
     if (tool == 'paint' || tool == 'erase') {
       try { await _arService.setBrushMode(tool); } catch (_) {}
     }
@@ -121,21 +136,42 @@ class _ARScreenState extends State<ARScreen> {
 
   Future<void> _applyWallpaper() async {
     if (widget.wallpaper == null) return;
+    // If session paused (from lasso), resume before applying
+    if (_sessionPaused) {
+      try { await _arService.resumeSession(); _sessionPaused = false; } catch (_) {}
+    }
     try { await _arService.placeWallpaper(wallpaper: widget.wallpaper!, wallIndex: 0, pricePerRoll: widget.pricePerRoll); } catch (e) { _log('Apply: $e'); }
   }
   Future<void> _clearWallpaper() async {
     try { await _arService.clearWall(0); setState(() => _wallpaperApplied = false); } catch (_) {}
   }
 
-  // Lasso
-  void _addLassoPoint(Offset point) { setState(() => _lassoPoints.add(point)); }
+  // Lasso — with close-loop detection
+  void _addLassoPoint(Offset point) {
+    if (_lassoClosed) return;
+    // If user taps near first point and we have 3+ points, close the loop
+    if (_lassoPoints.length >= 3) {
+      final first = _lassoPoints.first;
+      final dist = math.sqrt(math.pow(point.dx - first.dx, 2) + math.pow(point.dy - first.dy, 2));
+      if (dist < _closeLoopDistance) {
+        setState(() => _lassoClosed = true);
+        _log('Lasso loop closed (${_lassoPoints.length} points)');
+        return;
+      }
+    }
+    setState(() => _lassoPoints.add(point));
+  }
+
   Future<void> _applyLasso() async {
     if (_lassoPoints.length < 3) return;
     final pts = _lassoPoints.map((p) => [p.dx, p.dy]).toList();
     try { await _arService.applyLasso(pts, _lassoMode); } catch (e) { _log('Lasso: $e'); }
-    setState(() => _lassoPoints.clear());
+    setState(() { _lassoPoints.clear(); _lassoClosed = false; });
   }
-  void _clearLassoPoints() { setState(() => _lassoPoints.clear()); }
+
+  void _clearLassoPoints() {
+    setState(() { _lassoPoints.clear(); _lassoClosed = false; });
+  }
 
   @override
   void dispose() { _eventSub?.cancel(); _arService.disposeAR(); super.dispose(); }
@@ -151,10 +187,11 @@ class _ARScreenState extends State<ARScreen> {
 
         // Lasso overlay
         if (_editMode && _activeTool == 'lasso' && _lassoPoints.isNotEmpty)
-          Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _LassoPainter(_lassoPoints, _lassoMode)))),
+          Positioned.fill(child: IgnorePointer(
+            child: CustomPaint(painter: _LassoPainter(_lassoPoints, _lassoMode, _lassoClosed)))),
 
         // Lasso tap area
-        if (_editMode && _activeTool == 'lasso')
+        if (_editMode && _activeTool == 'lasso' && !_lassoClosed)
           Positioned.fill(child: GestureDetector(
             behavior: HitTestBehavior.translucent,
             onTapDown: (d) => _addLassoPoint(d.localPosition),
@@ -166,18 +203,13 @@ class _ARScreenState extends State<ARScreen> {
               style: IconButton.styleFrom(backgroundColor: Colors.black54),
               onPressed: () => Navigator.of(context).pop())),
 
-        // ── SCANNING ─────────────────────────────
+        // Scanning
         if (_isScanning) ...[
           Positioned(top: MediaQuery.of(context).padding.top + 8, left: 60, right: 60,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               decoration: BoxDecoration(color: Colors.white.withOpacity(0.92), borderRadius: BorderRadius.circular(12)),
               child: const Text('Scan the walls you want\nto wallpaper',
                 style: TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600), textAlign: TextAlign.center))),
-          Positioned(bottom: 100, left: 20, right: 20,
-            child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
-              child: Text(_statusText, style: const TextStyle(color: Colors.white70, fontSize: 13),
-                textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis))),
           Positioned(bottom: 30, left: 40, right: 40,
             child: ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16),
@@ -186,7 +218,7 @@ class _ARScreenState extends State<ARScreen> {
               child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // ── EDIT MODE ────────────────────────────
+        // Edit Mode
         if (_scanDone && _editMode) ...[
           // Instruction
           Positioned(top: MediaQuery.of(context).padding.top + 8, left: 50, right: 50,
@@ -194,19 +226,20 @@ class _ARScreenState extends State<ARScreen> {
               decoration: BoxDecoration(color: Colors.black.withOpacity(0.75), borderRadius: BorderRadius.circular(10)),
               child: Text(
                 _activeTool == 'lasso'
-                    ? 'Tap corners to draw shape (${_lassoPoints.length} pts)'
+                    ? (_lassoClosed
+                        ? 'Loop closed — tap Apply'
+                        : 'Tap corners (tap first point to close)')
                     : _activeTool == 'erase' ? 'Rub to remove areas' : 'Rub to add areas',
                 style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
                 textAlign: TextAlign.center))),
 
           // Toolbar
-          Positioned(bottom: _activeTool == 'lasso' && _lassoPoints.length >= 3 ? 170 : 140,
+          Positioned(bottom: (_activeTool == 'lasso' && _lassoPoints.length >= 3) ? 170 : 140,
             left: 12, right: 12,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
               decoration: BoxDecoration(color: const Color(0xE6222222), borderRadius: BorderRadius.circular(16),
                 border: Border.all(color: Colors.white12)),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
-                // Tool row
                 Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
                   _toolBtn(Icons.brush, 'Paint', _activeTool == 'paint', () => _setTool('paint')),
                   _toolBtn(Icons.auto_fix_high, 'Erase', _activeTool == 'erase', () => _setTool('erase')),
@@ -216,7 +249,6 @@ class _ARScreenState extends State<ARScreen> {
                 ]),
                 const SizedBox(height: 8),
 
-                // Lasso sub-mode toggle (paint vs erase)
                 if (_activeTool == 'lasso')
                   Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                     const Text('Lasso: ', style: TextStyle(color: Colors.white54, fontSize: 11)),
@@ -230,12 +262,9 @@ class _ARScreenState extends State<ARScreen> {
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                           decoration: BoxDecoration(color: Colors.red.withOpacity(0.3), borderRadius: BorderRadius.circular(6)),
-                          child: const Text('Clear pts', style: TextStyle(color: Colors.redAccent, fontSize: 10)),
-                        ),
-                      ),
+                          child: const Text('Clear', style: TextStyle(color: Colors.redAccent, fontSize: 10)))),
                   ]),
 
-                // Brush size (hidden for lasso)
                 if (_activeTool != 'lasso')
                   Row(children: [
                     const Icon(Icons.circle, color: Colors.white38, size: 8),
@@ -245,7 +274,6 @@ class _ARScreenState extends State<ARScreen> {
                     const Icon(Icons.circle, color: Colors.white38, size: 20),
                   ]),
 
-                // Opacity
                 Row(children: [
                   const Text('Opacity', style: TextStyle(color: Colors.white38, fontSize: 10)),
                   Expanded(child: Slider(value: _wallpaperOpacity, min: 0.1, max: 1.0,
@@ -258,18 +286,18 @@ class _ARScreenState extends State<ARScreen> {
                     style: const TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w600)),
               ]))),
 
-          // Lasso apply button
           if (_activeTool == 'lasso' && _lassoPoints.length >= 3)
             Positioned(bottom: 80, left: 40, right: 40,
               child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent,
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: _lassoClosed ? Colors.green : Colors.redAccent,
                     padding: const EdgeInsets.symmetric(vertical: 12),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
                 onPressed: _applyLasso,
                 icon: const Icon(Icons.check, color: Colors.white),
-                label: Text('Apply Lasso (${_lassoMode})', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
+                label: Text(_lassoClosed ? 'Apply Lasso (${_lassoMode})' : 'Apply (${_lassoPoints.length} pts)',
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
 
-          // Apply wallpaper
           if (widget.wallpaper != null)
             Positioned(bottom: 20, left: 40, right: 40,
               child: ElevatedButton.icon(
@@ -281,7 +309,7 @@ class _ARScreenState extends State<ARScreen> {
                 label: const Text('Apply Wallpaper', style: TextStyle(fontSize: 15, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // ── POST-APPLY ───────────────────────────
+        // Post-apply
         if (_scanDone && _wallpaperApplied && !_editMode) ...[
           if (widget.wallpaper != null)
             Positioned(top: MediaQuery.of(context).padding.top + 8, right: 12,
@@ -306,6 +334,15 @@ class _ARScreenState extends State<ARScreen> {
                   _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
                 ]),
                 const SizedBox(height: 16),
+                // Opacity slider in post-apply too
+                Row(children: [
+                  const Text('Opacity', style: TextStyle(color: Colors.white54, fontSize: 11)),
+                  Expanded(child: Slider(value: _wallpaperOpacity, min: 0.1, max: 1.0,
+                      activeColor: goldColor, inactiveColor: Colors.white12,
+                      onChanged: (v) => _setOpacity(v))),
+                  Text('${(_wallpaperOpacity * 100).toInt()}%', style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                ]),
+                const SizedBox(height: 8),
                 Row(children: [
                   Expanded(child: ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(backgroundColor: goldColor,
@@ -330,7 +367,6 @@ class _ARScreenState extends State<ARScreen> {
               ]))),
         ],
 
-        // Status (double-tap for log)
         if (!_isScanning)
           Positioned(top: MediaQuery.of(context).padding.top + 44, left: 50, right: 50,
             child: GestureDetector(onDoubleTap: () => setState(() => _showLog = !_showLog),
@@ -390,7 +426,8 @@ class _ARScreenState extends State<ARScreen> {
 class _LassoPainter extends CustomPainter {
   final List<Offset> points;
   final String mode;
-  _LassoPainter(this.points, this.mode);
+  final bool closed;
+  _LassoPainter(this.points, this.mode, this.closed);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -398,19 +435,38 @@ class _LassoPainter extends CustomPainter {
     final color = mode == 'erase' ? Colors.redAccent : Colors.greenAccent;
     final linePaint = Paint()..color = color..strokeWidth = 2.5..style = PaintingStyle.stroke;
     final dotPaint = Paint()..color = Colors.white..style = PaintingStyle.fill;
-    final fillPaint = Paint()..color = color.withOpacity(0.1)..style = PaintingStyle.fill;
+    final fillPaint = Paint()..color = color.withOpacity(closed ? 0.2 : 0.08)..style = PaintingStyle.fill;
+    final firstPointPaint = Paint()..color = Colors.yellow..style = PaintingStyle.fill;
 
-    if (points.length >= 3) {
+    if (closed && points.length >= 3) {
       final path = Path()..moveTo(points[0].dx, points[0].dy);
       for (int i = 1; i < points.length; i++) { path.lineTo(points[i].dx, points[i].dy); }
       path.close();
       canvas.drawPath(path, fillPaint);
       canvas.drawPath(path, linePaint);
     } else {
-      for (int i = 0; i < points.length - 1; i++) { canvas.drawLine(points[i], points[i + 1], linePaint); }
+      // Show lines and hint of close-loop circle around first point
+      for (int i = 0; i < points.length - 1; i++) {
+        canvas.drawLine(points[i], points[i + 1], linePaint);
+      }
+      // Hint circle around first point when 3+ points exist
+      if (points.length >= 3) {
+        final hintPaint = Paint()
+          ..color = Colors.yellow.withOpacity(0.5)
+          ..strokeWidth = 1.5
+          ..style = PaintingStyle.stroke;
+        canvas.drawCircle(points.first, _closeLoopDistance, hintPaint);
+      }
     }
-    for (final p in points) {
-      canvas.drawCircle(p, 6, dotPaint);
+
+    for (int i = 0; i < points.length; i++) {
+      final p = points[i];
+      // First point: yellow ring to show "tap here to close"
+      if (i == 0 && points.length >= 3 && !closed) {
+        canvas.drawCircle(p, 8, firstPointPaint);
+      } else {
+        canvas.drawCircle(p, 6, dotPaint);
+      }
       canvas.drawCircle(p, 6, linePaint);
     }
   }
