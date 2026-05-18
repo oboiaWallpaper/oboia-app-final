@@ -1,6 +1,5 @@
-// lib/screens/ar/ar_screen.dart — DEFINITIVE: Lasso + Soft Brush + Opacity
+// lib/screens/ar/ar_screen.dart — v3 FIXES
 import 'dart:async';
-import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../services/ar_service.dart';
@@ -26,11 +25,10 @@ class _ARScreenState extends State<ARScreen> {
   final List<String> _logLines = [];
   bool _isScanning = false, _scanDone = false, _wallpaperApplied = false;
   bool _editMode = false, _showLog = false;
-  String _brushMode = 'erase'; // 'paint', 'erase', 'lasso'
+  String _activeTool = 'erase'; // 'paint', 'erase', 'lasso'
+  String _lassoMode = 'erase'; // sub-mode for lasso: 'paint' or 'erase'
   double _brushSize = 0.08, _wallpaperOpacity = 0.96;
   double _totalWallArea = 0.0;
-
-  // Lasso points (screen coordinates)
   List<Offset> _lassoPoints = [];
 
   @override
@@ -63,16 +61,15 @@ class _ARScreenState extends State<ARScreen> {
         break;
       case 'scanComplete':
         final area = event.data['totalWallArea'];
-        setState(() {
-          _isScanning = false; _scanDone = true;
-          if (area is num) _totalWallArea = area.toDouble();
-        });
+        setState(() { _isScanning = false; _scanDone = true;
+          if (area is num) _totalWallArea = area.toDouble(); });
         _enterEditMode();
         break;
       case 'wallpaperPlaced':
         final ok = event.data['success'] as bool? ?? false;
         final area = event.data['area'];
-        if (ok) setState(() { _wallpaperApplied = true; _editMode = false; if (area is num) _totalWallArea = area.toDouble(); });
+        if (ok) setState(() { _wallpaperApplied = true; _editMode = false;
+          if (area is num) _totalWallArea = area.toDouble(); });
         break;
       case 'selectionChanged':
         final area = event.data['area'];
@@ -89,26 +86,28 @@ class _ARScreenState extends State<ARScreen> {
 
   // Actions
   Future<void> _startScan() async {
-    setState(() { _isScanning = true; _scanDone = false; _wallpaperApplied = false; _editMode = false; _totalWallArea = 0; _lassoPoints.clear(); });
+    setState(() { _isScanning = true; _scanDone = false; _wallpaperApplied = false;
+      _editMode = false; _totalWallArea = 0; _lassoPoints.clear(); });
     try { await _arService.setARMode('scanning'); await _arService.startScan(); } catch (e) { _log('Scan: $e'); }
   }
-  Future<void> _stopScan() async {
-    try { await _arService.stopScan(); } catch (e) { _log('Stop: $e'); }
-  }
+  Future<void> _stopScan() async { try { await _arService.stopScan(); } catch (e) { _log('Stop: $e'); } }
+
   Future<void> _enterEditMode() async {
-    setState(() { _editMode = true; _brushMode = 'erase'; _lassoPoints.clear(); });
+    setState(() { _editMode = true; _activeTool = 'erase'; _lassoPoints.clear(); });
     try { await _arService.enterCutMode(0); await _arService.setBrushMode('erase'); } catch (_) {}
   }
   Future<void> _exitEditMode() async {
     setState(() { _editMode = false; _lassoPoints.clear(); });
     try { await _arService.exitCutMode(); } catch (_) {}
   }
-  Future<void> _setBrushMode(String mode) async {
-    setState(() { _brushMode = mode; _lassoPoints.clear(); });
-    if (mode != 'lasso') {
-      try { await _arService.setBrushMode(mode); } catch (_) {}
+
+  Future<void> _setTool(String tool) async {
+    setState(() { _activeTool = tool; _lassoPoints.clear(); });
+    if (tool == 'paint' || tool == 'erase') {
+      try { await _arService.setBrushMode(tool); } catch (_) {}
     }
   }
+
   Future<void> _setBrushSize(double size) async {
     setState(() => _brushSize = size);
     try { await _arService.setBrushSize(size); } catch (_) {}
@@ -122,26 +121,21 @@ class _ARScreenState extends State<ARScreen> {
 
   Future<void> _applyWallpaper() async {
     if (widget.wallpaper == null) return;
-    try {
-      await _arService.placeWallpaper(wallpaper: widget.wallpaper!, wallIndex: 0, pricePerRoll: widget.pricePerRoll);
-    } catch (e) { _log('Apply: $e'); }
+    try { await _arService.placeWallpaper(wallpaper: widget.wallpaper!, wallIndex: 0, pricePerRoll: widget.pricePerRoll); } catch (e) { _log('Apply: $e'); }
   }
   Future<void> _clearWallpaper() async {
     try { await _arService.clearWall(0); setState(() => _wallpaperApplied = false); } catch (_) {}
   }
 
-  // Lasso: tap to add points
-  void _addLassoPoint(Offset point) {
-    setState(() => _lassoPoints.add(point));
-  }
+  // Lasso
+  void _addLassoPoint(Offset point) { setState(() => _lassoPoints.add(point)); }
   Future<void> _applyLasso() async {
     if (_lassoPoints.length < 3) return;
     final pts = _lassoPoints.map((p) => [p.dx, p.dy]).toList();
-    try {
-      await _arService.applyLasso(pts, _brushMode == 'lasso' ? 'erase' : 'paint');
-    } catch (e) { _log('Lasso: $e'); }
+    try { await _arService.applyLasso(pts, _lassoMode); } catch (e) { _log('Lasso: $e'); }
     setState(() => _lassoPoints.clear());
   }
+  void _clearLassoPoints() { setState(() => _lassoPoints.clear()); }
 
   @override
   void dispose() { _eventSub?.cancel(); _arService.disposeAR(); super.dispose(); }
@@ -155,23 +149,16 @@ class _ARScreenState extends State<ARScreen> {
         Positioned.fill(child: UiKitView(viewType: 'com.oboia/ar_view',
             creationParams: const <String, dynamic>{}, creationParamsCodec: StandardMessageCodec())),
 
-        // Lasso overlay (draws dots + lines on screen)
-        if (_editMode && _brushMode == 'lasso' && _lassoPoints.isNotEmpty)
-          Positioned.fill(
-            child: IgnorePointer(
-              child: CustomPaint(painter: _LassoPainter(_lassoPoints)),
-            ),
-          ),
+        // Lasso overlay
+        if (_editMode && _activeTool == 'lasso' && _lassoPoints.isNotEmpty)
+          Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _LassoPainter(_lassoPoints, _lassoMode)))),
 
-        // Lasso tap detector (covers screen when lasso active)
-        if (_editMode && _brushMode == 'lasso')
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onTapDown: (details) => _addLassoPoint(details.localPosition),
-              child: Container(color: Colors.transparent),
-            ),
-          ),
+        // Lasso tap area
+        if (_editMode && _activeTool == 'lasso')
+          Positioned.fill(child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTapDown: (d) => _addLassoPoint(d.localPosition),
+            child: Container(color: Colors.transparent))),
 
         // Back button
         Positioned(top: MediaQuery.of(context).padding.top + 8, left: 8,
@@ -206,28 +193,50 @@ class _ARScreenState extends State<ARScreen> {
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               decoration: BoxDecoration(color: Colors.black.withOpacity(0.75), borderRadius: BorderRadius.circular(10)),
               child: Text(
-                _brushMode == 'lasso' ? 'Tap to place points, then Apply'
-                    : _brushMode == 'erase' ? 'Rub to remove areas' : 'Rub to add areas',
+                _activeTool == 'lasso'
+                    ? 'Tap corners to draw shape (${_lassoPoints.length} pts)'
+                    : _activeTool == 'erase' ? 'Rub to remove areas' : 'Rub to add areas',
                 style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
                 textAlign: TextAlign.center))),
 
           // Toolbar
-          Positioned(bottom: _brushMode == 'lasso' ? 160 : 140, left: 12, right: 12,
+          Positioned(bottom: _activeTool == 'lasso' && _lassoPoints.length >= 3 ? 170 : 140,
+            left: 12, right: 12,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-              decoration: BoxDecoration(color: const Color(0xE6222222), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.white12)),
+              decoration: BoxDecoration(color: const Color(0xE6222222), borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white12)),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 // Tool row
                 Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-                  _toolBtn(Icons.brush, 'Paint', _brushMode == 'paint', () => _setBrushMode('paint')),
-                  _toolBtn(Icons.auto_fix_high, 'Erase', _brushMode == 'erase', () => _setBrushMode('erase')),
-                  _toolBtn(Icons.polyline, 'Lasso', _brushMode == 'lasso', () => _setBrushMode('lasso')),
+                  _toolBtn(Icons.brush, 'Paint', _activeTool == 'paint', () => _setTool('paint')),
+                  _toolBtn(Icons.auto_fix_high, 'Erase', _activeTool == 'erase', () => _setTool('erase')),
+                  _toolBtn(Icons.polyline, 'Lasso', _activeTool == 'lasso', () => _setTool('lasso')),
                   _toolBtn(Icons.undo, 'Undo', false, _undo),
                   _toolBtn(Icons.restart_alt, 'Reset', false, _reset),
                 ]),
                 const SizedBox(height: 8),
 
+                // Lasso sub-mode toggle (paint vs erase)
+                if (_activeTool == 'lasso')
+                  Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    const Text('Lasso: ', style: TextStyle(color: Colors.white54, fontSize: 11)),
+                    _miniToggle('Erase', _lassoMode == 'erase', () => setState(() => _lassoMode = 'erase')),
+                    const SizedBox(width: 8),
+                    _miniToggle('Paint', _lassoMode == 'paint', () => setState(() => _lassoMode = 'paint')),
+                    const SizedBox(width: 12),
+                    if (_lassoPoints.isNotEmpty)
+                      GestureDetector(
+                        onTap: _clearLassoPoints,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(color: Colors.red.withOpacity(0.3), borderRadius: BorderRadius.circular(6)),
+                          child: const Text('Clear pts', style: TextStyle(color: Colors.redAccent, fontSize: 10)),
+                        ),
+                      ),
+                  ]),
+
                 // Brush size (hidden for lasso)
-                if (_brushMode != 'lasso')
+                if (_activeTool != 'lasso')
                   Row(children: [
                     const Icon(Icons.circle, color: Colors.white38, size: 8),
                     Expanded(child: Slider(value: _brushSize, min: 0.02, max: 0.25,
@@ -236,7 +245,7 @@ class _ARScreenState extends State<ARScreen> {
                     const Icon(Icons.circle, color: Colors.white38, size: 20),
                   ]),
 
-                // Opacity slider
+                // Opacity
                 Row(children: [
                   const Text('Opacity', style: TextStyle(color: Colors.white38, fontSize: 10)),
                   Expanded(child: Slider(value: _wallpaperOpacity, min: 0.1, max: 1.0,
@@ -249,8 +258,8 @@ class _ARScreenState extends State<ARScreen> {
                     style: const TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w600)),
               ]))),
 
-          // Lasso: Apply button (when points exist)
-          if (_brushMode == 'lasso' && _lassoPoints.length >= 3)
+          // Lasso apply button
+          if (_activeTool == 'lasso' && _lassoPoints.length >= 3)
             Positioned(bottom: 80, left: 40, right: 40,
               child: ElevatedButton.icon(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent,
@@ -258,9 +267,9 @@ class _ARScreenState extends State<ARScreen> {
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
                 onPressed: _applyLasso,
                 icon: const Icon(Icons.check, color: Colors.white),
-                label: Text('Apply Lasso (${_lassoPoints.length} pts)', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
+                label: Text('Apply Lasso (${_lassoMode})', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
 
-          // Apply wallpaper button
+          // Apply wallpaper
           if (widget.wallpaper != null)
             Positioned(bottom: 20, left: 40, right: 40,
               child: ElevatedButton.icon(
@@ -321,7 +330,7 @@ class _ARScreenState extends State<ARScreen> {
               ]))),
         ],
 
-        // Status bar (double-tap for log)
+        // Status (double-tap for log)
         if (!_isScanning)
           Positioned(top: MediaQuery.of(context).padding.top + 44, left: 50, right: 50,
             child: GestureDetector(onDoubleTap: () => setState(() => _showLog = !_showLog),
@@ -360,6 +369,17 @@ class _ARScreenState extends State<ARScreen> {
         ])));
   }
 
+  Widget _miniToggle(String label, bool active, VoidCallback onTap) {
+    return GestureDetector(onTap: onTap, child: Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: active ? goldColor.withOpacity(0.3) : Colors.white10,
+        borderRadius: BorderRadius.circular(8),
+        border: active ? Border.all(color: goldColor) : null),
+      child: Text(label, style: TextStyle(color: active ? goldColor : Colors.white54, fontSize: 11, fontWeight: FontWeight.w500)),
+    ));
+  }
+
   Widget _stat(String label, String value) => Column(children: [
     Text(value, style: const TextStyle(color: goldColor, fontSize: 20, fontWeight: FontWeight.bold)),
     const SizedBox(height: 2),
@@ -367,19 +387,19 @@ class _ARScreenState extends State<ARScreen> {
   ]);
 }
 
-/// Draws lasso polygon on screen
 class _LassoPainter extends CustomPainter {
   final List<Offset> points;
-  _LassoPainter(this.points);
+  final String mode;
+  _LassoPainter(this.points, this.mode);
 
   @override
   void paint(Canvas canvas, Size size) {
     if (points.isEmpty) return;
-    final linePaint = Paint()..color = Colors.redAccent..strokeWidth = 2.5..style = PaintingStyle.stroke;
+    final color = mode == 'erase' ? Colors.redAccent : Colors.greenAccent;
+    final linePaint = Paint()..color = color..strokeWidth = 2.5..style = PaintingStyle.stroke;
     final dotPaint = Paint()..color = Colors.white..style = PaintingStyle.fill;
-    final fillPaint = Paint()..color = Colors.red.withOpacity(0.1)..style = PaintingStyle.fill;
+    final fillPaint = Paint()..color = color.withOpacity(0.1)..style = PaintingStyle.fill;
 
-    // Draw filled polygon
     if (points.length >= 3) {
       final path = Path()..moveTo(points[0].dx, points[0].dy);
       for (int i = 1; i < points.length; i++) { path.lineTo(points[i].dx, points[i].dy); }
@@ -387,13 +407,8 @@ class _LassoPainter extends CustomPainter {
       canvas.drawPath(path, fillPaint);
       canvas.drawPath(path, linePaint);
     } else {
-      // Draw lines between points
-      for (int i = 0; i < points.length - 1; i++) {
-        canvas.drawLine(points[i], points[i + 1], linePaint);
-      }
+      for (int i = 0; i < points.length - 1; i++) { canvas.drawLine(points[i], points[i + 1], linePaint); }
     }
-
-    // Draw dots at each point
     for (final p in points) {
       canvas.drawCircle(p, 6, dotPaint);
       canvas.drawCircle(p, 6, linePaint);
