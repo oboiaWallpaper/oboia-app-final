@@ -1,4 +1,5 @@
-// WallpaperARView.swift — v3 FIXES: Circle cursor, batched undo, opacity, lasso modes
+// WallpaperARView.swift — v4: Final fixes
+// Hard-edge alpha, working opacity, AR pause for lasso
 // Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
@@ -32,7 +33,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var wallVertices: [UUID: Set<Int>] = [:]
     private var vertexCounts: [UUID: Int] = [:]
 
-    // ── Undo (BATCHED: one snapshot per stroke) ──────────────
+    // ── Undo (batched) ───────────────────────────────────────
     private var undoStack: [[UUID: [Float]]] = []
     private let maxUndo = 20
 
@@ -43,7 +44,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var lastBrushWorld: SIMD3<Float>?
     private let brushMoveThreshold: Float = 0.003
 
-    // ── Circle Cursor (always faces camera) ──────────────────
+    // ── Circle Cursor ────────────────────────────────────────
     private var brushCursorNode: SCNNode?
 
     // ── Wallpaper ────────────────────────────────────────────
@@ -54,6 +55,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var isWallpaperApplied = false
     private var totalSelectedAreaSqm: Float = 0.0
     private var wallpaperOpacity: CGFloat = 0.96
+
+    // ── AR Session Pause (for lasso) ─────────────────────────
+    private var sessionPaused = false
 
     // ── Other ────────────────────────────────────────────────
     private var currentWallIndex: Int = 0
@@ -127,14 +131,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "setWallpaperOpacity":
             if let o = args?["opacity"] as? Double {
                 wallpaperOpacity = CGFloat(o)
-                if isWallpaperApplied || editModeActive { rebuildAll() }
-            }; result(nil)
+                rebuildAll()
+            }
+            result(nil)
         case "undoCut":      undoAlpha(); result(nil)
         case "clearAllCuts": resetAlpha(); result(nil)
         case "applyLasso":
             if let pts = args?["points"] as? [[Double]], let mode = args?["mode"] as? String {
                 applyLasso(screenPoints: pts, mode: mode)
             }; result(nil)
+        case "pauseSession": pauseSession(); result(nil)
+        case "resumeSession": resumeSession(); result(nil)
         case "placeWallpaper", "switchWallpaper": placeWallpaper(args, result: result)
         case "selectWall":
             currentWallIndex = args?["wallIndex"] as? Int ?? 0
@@ -149,6 +156,27 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "toggleSurfaceExclusion", "toggleObjectExclusion", "setBrushColor": result(nil)
         default: result(FlutterMethodNotImplemented)
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // AR PAUSE / RESUME (for lasso freeze)
+    // ═══════════════════════════════════════════════════════════
+
+    private func pauseSession() {
+        guard !sessionPaused else { return }
+        sceneView.session.pause()
+        sessionPaused = true
+        emit("boot", data: ["status": "View frozen for lasso"])
+    }
+
+    private func resumeSession() {
+        guard sessionPaused else { return }
+        // Resume with same config (no reset, keep mesh + tracking)
+        let c = ARWorldTrackingConfiguration()
+        c.planeDetection = []; c.environmentTexturing = .automatic
+        sceneView.session.run(c, options: [])
+        sessionPaused = false
+        emit("boot", data: ["status": "View unfrozen"])
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -193,7 +221,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ═══════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan v3 <<<"])
+        emit("boot", data: ["status": ">>> startScan v4 <<<"])
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             emit("error", data: ["message": "LiDAR not supported"])
             result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil)); return
@@ -203,7 +231,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         wallVertices.removeAll(); vertexCounts.removeAll()
         wallNodes.removeAll(); undoStack.removeAll()
         totalSelectedAreaSqm = 0; isWallpaperApplied = false
-        meshFrozen = false; editModeActive = false; removeCursor()
+        meshFrozen = false; editModeActive = false; sessionPaused = false; removeCursor()
         currentMode = .scanning
 
         let c = ARWorldTrackingConfiguration()
@@ -316,7 +344,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private func enterEditMode() {
         editModeActive = true; isWallpaperApplied = false
         createCursor(); rebuildAll()
-        emit("boot", data: ["status": "Edit mode — brush or lasso"])
+        emit("boot", data: ["status": "Edit mode"])
     }
 
     private func exitEditMode() {
@@ -324,8 +352,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         totalSelectedAreaSqm = computeArea(); rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
     }
-
-    // ── UNDO: batched — one snapshot per stroke ──────────────
 
     private func saveUndoSnapshot() {
         var snapshot = [UUID: [Float]]()
@@ -339,8 +365,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             emit("boot", data: ["status": "Nothing to undo"]); return
         }
         for (uuid, alpha) in snapshot { vertexAlpha[uuid] = alpha }
-        totalSelectedAreaSqm = computeArea()
-        rebuildAll()
+        totalSelectedAreaSqm = computeArea(); rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
         emit("boot", data: ["status": "Undo ✅ (\(undoStack.count) left)"])
     }
@@ -357,29 +382,21 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // BRUSH CURSOR (CIRCLE — always faces camera via billboard)
+    // CURSOR (Circle via Billboard)
     // ═══════════════════════════════════════════════════════════
 
     private func createCursor() {
         removeCursor()
-        let size = CGFloat(brushRadius * 2)
-        let plane = SCNPlane(width: size, height: size)
+        let diameter = CGFloat(brushRadius * 2)
+        let ring = SCNTube(innerRadius: diameter * 0.45, outerRadius: diameter * 0.5, height: 0.001)
         let mat = SCNMaterial()
-        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.0)
-        mat.emission.contents = UIColor.clear
-        mat.lightingModel = .constant
-        mat.isDoubleSided = true
-        plane.materials = [mat]
-
-        let node = SCNNode(geometry: plane)
-        node.isHidden = true
-        // Billboard constraint: always faces the camera → always a perfect circle
-        let billboard = SCNBillboardConstraint()
-        billboard.freeAxes = .all
+        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.9)
+        mat.lightingModel = .constant; mat.isDoubleSided = true
+        ring.materials = [mat, mat, mat]
+        let node = SCNNode(geometry: ring); node.isHidden = true
+        let billboard = SCNBillboardConstraint(); billboard.freeAxes = .all
         node.constraints = [billboard]
-
-        sceneView.scene.rootNode.addChildNode(node)
-        brushCursorNode = node
+        sceneView.scene.rootNode.addChildNode(node); brushCursorNode = node
     }
 
     private func removeCursor() {
@@ -387,9 +404,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func updateCursorSize() {
-        guard let node = brushCursorNode, let plane = node.geometry as? SCNPlane else { return }
+        guard let node = brushCursorNode, let tube = node.geometry as? SCNTube else { return }
         let d = CGFloat(brushRadius * 2)
-        plane.width = d; plane.height = d
+        tube.innerRadius = d * 0.45; tube.outerRadius = d * 0.5
     }
 
     private func moveCursor(to pos: SCNVector3) {
@@ -398,7 +415,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // SOFT BRUSH (Gaussian falloff)
+    // BRUSH
     // ═══════════════════════════════════════════════════════════
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
@@ -408,7 +425,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         switch gesture.state {
         case .began:
             lastBrushWorld = nil
-            saveUndoSnapshot()  // ONE snapshot per stroke
+            saveUndoSnapshot()
             if let hit = firstMeshHit(pt) {
                 moveCursor(to: hit.worldCoordinates)
                 applyGaussianBrush(at: hit.worldCoordinates)
@@ -476,14 +493,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // LASSO (polygon cut — supports PAINT and ERASE)
+    // LASSO
     // ═══════════════════════════════════════════════════════════
 
     private func applyLasso(screenPoints: [[Double]], mode: String) {
         guard screenPoints.count >= 3 else { return }
         let polygon = screenPoints.map { CGPoint(x: $0[0], y: $0[1]) }
         let isErase = (mode == "erase")
-
         saveUndoSnapshot()
 
         for (uuid, positions) in vertexWorldPos {
@@ -506,7 +522,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             if changed { vertexAlpha[uuid] = alpha }
         }
-
         rebuildAll()
         totalSelectedAreaSqm = computeArea()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
@@ -524,7 +539,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // GEOMETRY BUILDERS
+    // GEOMETRY
     // ═══════════════════════════════════════════════════════════
 
     private func rebuildAll() {
@@ -579,6 +594,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let g = SCNGeometry(sources: [src], elements: els); g.materials = mats; return g
     }
 
+    /// Alpha geometry — uses HARD THRESHOLD for straight edges
     private func buildAlphaGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geo = anchor.geometry; let vCount = geo.vertices.count; let fCount = geo.faces.count
         guard vCount > 0, fCount > 0 else { return nil }
@@ -588,16 +604,32 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let verts = extractVerts(geo)
         let uvs = genUVs(geo, transform: anchor.transform)
 
+        // ═══════════════════════════════════════════════════════
+        // HARD EDGE: Threshold alpha at 0.5 for crisp boundaries
+        // (instead of smooth gradient that causes ragged edges)
+        // ═══════════════════════════════════════════════════════
         var colors = [SIMD4<Float>](repeating: SIMD4<Float>(1,1,1,0), count: vCount)
         for i in 0..<vCount {
             let a = i < alpha.count ? alpha[i] : 0.0
-            colors[i] = SIMD4<Float>(1, 1, 1, a)
+            // Steep step at 0.5 — alpha is either fully visible or fully hidden
+            let hardA: Float = a >= 0.5 ? 1.0 : 0.0
+            colors[i] = SIMD4<Float>(1, 1, 1, hardA)
         }
 
+        // Only include faces where AT LEAST ONE vertex is selected
+        // (this trims out fully-hidden triangles, reducing visual noise at edges)
         let fEl = geo.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
-        var allIdx = [UInt32](); allIdx.reserveCapacity(fCount * ipf)
-        for f in 0..<fCount { allIdx.append(contentsOf: readFace(fEl, f: f, bpi: bpi, ipf: ipf)) }
-        guard !allIdx.isEmpty else { return nil }
+        var visIdx = [UInt32](); visIdx.reserveCapacity(fCount * ipf)
+        for f in 0..<fCount {
+            let tri = readFace(fEl, f: f, bpi: bpi, ipf: ipf)
+            // Check if any vertex of this face is visible
+            var anyVisible = false
+            for idx in tri {
+                if Int(idx) < alpha.count && alpha[Int(idx)] >= 0.5 { anyVisible = true; break }
+            }
+            if anyVisible { visIdx.append(contentsOf: tri) }
+        }
+        guard !visIdx.isEmpty else { return nil }
 
         let vertSrc = SCNGeometrySource(vertices: verts)
         let uvSrc = SCNGeometrySource(textureCoordinates: uvs)
@@ -607,19 +639,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             bytesPerComponent: MemoryLayout<Float>.stride,
             dataOffset: 0, dataStride: MemoryLayout<SIMD4<Float>>.stride)
 
-        let idxData = Data(bytes: allIdx, count: allIdx.count * 4)
+        let idxData = Data(bytes: visIdx, count: visIdx.count * 4)
         let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
-                                          primitiveCount: allIdx.count / 3, bytesPerIndex: 4)
+            primitiveCount: visIdx.count / 3, bytesPerIndex: 4)
 
-        let mat: SCNMaterial
-        if isWallpaperApplied { mat = makeWPMat() }
-        else { mat = makeEditMat() }
+        let mat: SCNMaterial = isWallpaperApplied ? makeWPMat() : makeEditMat()
 
         let g = SCNGeometry(sources: [vertSrc, uvSrc, colorSrc], elements: [element])
         g.materials = [mat]; return g
     }
-
-    // ── Materials ────────────────────────────────────────────
 
     private func makeEditMat() -> SCNMaterial {
         let m = SCNMaterial(); m.isDoubleSided = true; m.blendMode = .alpha
@@ -627,11 +655,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         if let img = wpAlbedo {
             m.diffuse.contents = img; m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
             m.lightingModel = .physicallyBased
-            m.transparency = wallpaperOpacity * 0.35
+            m.transparency = wallpaperOpacity * 0.4
         } else {
             m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
             m.lightingModel = .constant
-            m.transparency = wallpaperOpacity * 0.25
+            m.transparency = wallpaperOpacity * 0.3
         }
         return m
     }
@@ -648,8 +676,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         return m
     }
 
-    // ── Geometry helpers ─────────────────────────────────────
-
+    // Helpers
     private func extractVerts(_ geo: ARMeshGeometry) -> [SCNVector3] {
         let s = geo.vertices; var v = [SCNVector3](); v.reserveCapacity(s.count)
         for i in 0..<s.count {
@@ -658,7 +685,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             v.append(SCNVector3(p.x, p.y, p.z))
         }; return v
     }
-
     private func genUVs(_ geo: ARMeshGeometry, transform: simd_float4x4) -> [CGPoint] {
         let s = geo.vertices; var uv = [CGPoint](); uv.reserveCapacity(s.count)
         let sc: Float = 1.0 / 0.53
@@ -669,7 +695,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             uv.append(CGPoint(x: CGFloat((w.x + w.z) * sc), y: CGFloat(w.y * sc)))
         }; return uv
     }
-
     private func readFace(_ fEl: ARGeometryElement, f: Int, bpi: Int, ipf: Int) -> [UInt32] {
         var t = [UInt32]()
         for j in 0..<ipf {
@@ -678,7 +703,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             else { t.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
         }; return t
     }
-
     private func addEl(_ els: inout [SCNGeometryElement], _ mats: inout [SCNMaterial], _ idx: [UInt32], _ mat: SCNMaterial) {
         guard !idx.isEmpty else { return }
         els.append(SCNGeometryElement(data: Data(bytes: idx, count: idx.count * 4),
@@ -687,7 +711,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // PLACE / CLEAR
+    // WALLPAPER PLACE / CLEAR
     // ═══════════════════════════════════════════════════════════
 
     private func placeWallpaper(_ args: [String: Any]?, result: @escaping FlutterResult) {
@@ -725,17 +749,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         rebuildAll(); emit("wallCleared", data: ["wallIndex": 0])
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // EVENTS
-    // ═══════════════════════════════════════════════════════════
-
+    // Events
     private func emit(_ type: String, data: [String: Any] = [:]) {
         let payload: [String: Any] = ["type": type, "data": data]
         if let sink = eventSink { sink(payload) } else { pendingEvents.append(payload) }
     }
 }
-
-// MARK: - FlutterStreamHandler
 
 extension WallpaperARView: FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
@@ -745,8 +764,6 @@ extension WallpaperARView: FlutterStreamHandler {
     }
     func onCancel(withArguments arguments: Any?) -> FlutterError? { eventSink = nil; return nil }
 }
-
-// MARK: - AR Delegates
 
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {}
@@ -784,8 +801,6 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
         }
     }
 }
-
-// MARK: - UIColor Hex
 
 extension UIColor {
     convenience init?(hex: String) {
