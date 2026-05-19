@@ -1,5 +1,6 @@
-// WallpaperARView.swift — v4: Final fixes
-// Hard-edge alpha, working opacity, AR pause for lasso
+// WallpaperARView.swift — v5 FINAL
+// Frozen-matrix lasso (no pause/resume, no tracking disruption)
+// Force-fresh opacity materials (no caching)
 // Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
@@ -23,31 +24,38 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private let textureCache = TextureCache.shared
     private let eraserTool = EraserTool()
 
-    // ── Mesh ─────────────────────────────────────────────────
+    // Mesh
     private var meshNodes: [UUID: SCNNode] = [:]
     private var meshFrozen = false
 
-    // ── Per-Vertex Alpha ─────────────────────────────────────
+    // Per-vertex alpha
     private var vertexAlpha: [UUID: [Float]] = [:]
     private var vertexWorldPos: [UUID: [SIMD3<Float>]] = [:]
     private var wallVertices: [UUID: Set<Int>] = [:]
     private var vertexCounts: [UUID: Int] = [:]
 
-    // ── Undo (batched) ───────────────────────────────────────
+    // Undo (batched)
     private var undoStack: [[UUID: [Float]]] = []
     private let maxUndo = 20
 
-    // ── Brush ────────────────────────────────────────────────
+    // Brush
     private var brushMode: BrushMode = .erase
     private var brushRadius: Float = 0.08
     private var editModeActive = false
     private var lastBrushWorld: SIMD3<Float>?
     private let brushMoveThreshold: Float = 0.003
 
-    // ── Circle Cursor ────────────────────────────────────────
+    // Cursor
     private var brushCursorNode: SCNNode?
 
-    // ── Wallpaper ────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+    // FROZEN MATRIX FOR LASSO — captured when lasso starts
+    // ═══════════════════════════════════════════════════════════
+    private var frozenCameraTransform: simd_float4x4?
+    private var frozenProjectionMatrix: simd_float4x4?
+    private var frozenViewportSize: CGSize = .zero
+
+    // Wallpaper
     private var wpAlbedo: UIImage?
     private var wpNormal: UIImage?
     private var wpRoughness: UIImage?
@@ -56,10 +64,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var totalSelectedAreaSqm: Float = 0.0
     private var wallpaperOpacity: CGFloat = 0.96
 
-    // ── AR Session Pause (for lasso) ─────────────────────────
-    private var sessionPaused = false
-
-    // ── Other ────────────────────────────────────────────────
+    // Other
     private var currentWallIndex: Int = 0
     private var wallNodes: [String: SCNNode] = [:]
     private var panGesture: UIPanGestureRecognizer?
@@ -128,20 +133,47 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "setBrushSize":
             if let s = args?["size"] as? Double { brushRadius = Float(s); updateCursorSize() }
             result(nil)
+
+        // ═══════════════════════════════════════════════════════
+        // OPACITY: Force fresh material rebuild
+        // ═══════════════════════════════════════════════════════
         case "setWallpaperOpacity":
             if let o = args?["opacity"] as? Double {
                 wallpaperOpacity = CGFloat(o)
-                rebuildAll()
+                forceRefreshMaterials()  // ← force fresh, no caching
+                emit("boot", data: ["status": "Opacity: \(Int(o * 100))%"])
             }
             result(nil)
+
         case "undoCut":      undoAlpha(); result(nil)
         case "clearAllCuts": resetAlpha(); result(nil)
+
+        // ═══════════════════════════════════════════════════════
+        // LASSO LIFECYCLE: Capture matrix on start, no pause
+        // ═══════════════════════════════════════════════════════
+        case "captureCameraSnapshot":
+            captureCameraSnapshot()
+            result(nil)
+        case "clearCameraSnapshot":
+            frozenCameraTransform = nil
+            frozenProjectionMatrix = nil
+            result(nil)
         case "applyLasso":
             if let pts = args?["points"] as? [[Double]], let mode = args?["mode"] as? String {
-                applyLasso(screenPoints: pts, mode: mode)
-            }; result(nil)
-        case "pauseSession": pauseSession(); result(nil)
-        case "resumeSession": resumeSession(); result(nil)
+                applyLassoWithFrozenMatrix(screenPoints: pts, mode: mode)
+            }
+            result(nil)
+
+        // Legacy pause/resume names from Dart now trigger capture/clear of frozen matrix
+        // (no actual session pause — keeps AR tracking alive)
+        case "pauseSession":
+            captureCameraSnapshot()
+            result(nil)
+        case "resumeSession":
+            frozenCameraTransform = nil
+            frozenProjectionMatrix = nil
+            result(nil)
+
         case "placeWallpaper", "switchWallpaper": placeWallpaper(args, result: result)
         case "selectWall":
             currentWallIndex = args?["wallIndex"] as? Int ?? 0
@@ -159,24 +191,40 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // AR PAUSE / RESUME (for lasso freeze)
+    // FROZEN-MATRIX CAPTURE (called when user taps Lasso tool)
     // ═══════════════════════════════════════════════════════════
 
-    private func pauseSession() {
-        guard !sessionPaused else { return }
-        sceneView.session.pause()
-        sessionPaused = true
-        emit("boot", data: ["status": "View frozen for lasso"])
+    private func captureCameraSnapshot() {
+        guard let frame = sceneView.session.currentFrame else {
+            emit("boot", data: ["status": "Cannot capture — no AR frame"])
+            return
+        }
+        frozenCameraTransform = frame.camera.transform
+        frozenViewportSize = sceneView.bounds.size
+        frozenProjectionMatrix = frame.camera.projectionMatrix(
+            for: .portrait,
+            viewportSize: frozenViewportSize,
+            zNear: 0.001,
+            zFar: 1000
+        )
+        emit("boot", data: ["status": "Lasso angle captured"])
     }
 
-    private func resumeSession() {
-        guard sessionPaused else { return }
-        // Resume with same config (no reset, keep mesh + tracking)
-        let c = ARWorldTrackingConfiguration()
-        c.planeDetection = []; c.environmentTexturing = .automatic
-        sceneView.session.run(c, options: [])
-        sessionPaused = false
-        emit("boot", data: ["status": "View unfrozen"])
+    // ═══════════════════════════════════════════════════════════
+    // OPACITY: FORCE-FRESH MATERIALS (no caching)
+    // ═══════════════════════════════════════════════════════════
+
+    private func forceRefreshMaterials() {
+        // Nuke all geometry caches and rebuild every mesh from scratch
+        guard let frame = sceneView.session.currentFrame else { return }
+        for anchor in frame.anchors {
+            guard let ma = anchor as? ARMeshAnchor,
+                  let node = meshNodes[ma.identifier] else { continue }
+            node.geometry = nil  // ← force release of cached geometry/material
+            if let freshGeo = buildGeo(from: ma) {
+                node.geometry = freshGeo
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -221,7 +269,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ═══════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan v4 <<<"])
+        emit("boot", data: ["status": ">>> startScan v5 <<<"])
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             emit("error", data: ["message": "LiDAR not supported"])
             result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil)); return
@@ -231,7 +279,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         wallVertices.removeAll(); vertexCounts.removeAll()
         wallNodes.removeAll(); undoStack.removeAll()
         totalSelectedAreaSqm = 0; isWallpaperApplied = false
-        meshFrozen = false; editModeActive = false; sessionPaused = false; removeCursor()
+        meshFrozen = false; editModeActive = false; removeCursor()
+        frozenCameraTransform = nil; frozenProjectionMatrix = nil
         currentMode = .scanning
 
         let c = ARWorldTrackingConfiguration()
@@ -349,6 +398,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func exitEditMode() {
         editModeActive = false; removeCursor()
+        frozenCameraTransform = nil; frozenProjectionMatrix = nil
         totalSelectedAreaSqm = computeArea(); rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
     }
@@ -367,7 +417,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         for (uuid, alpha) in snapshot { vertexAlpha[uuid] = alpha }
         totalSelectedAreaSqm = computeArea(); rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
-        emit("boot", data: ["status": "Undo ✅ (\(undoStack.count) left)"])
+        emit("boot", data: ["status": "Undo ✅"])
     }
 
     private func resetAlpha() {
@@ -399,9 +449,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.scene.rootNode.addChildNode(node); brushCursorNode = node
     }
 
-    private func removeCursor() {
-        brushCursorNode?.removeFromParentNode(); brushCursorNode = nil
-    }
+    private func removeCursor() { brushCursorNode?.removeFromParentNode(); brushCursorNode = nil }
 
     private func updateCursorSize() {
         guard let node = brushCursorNode, let tube = node.geometry as? SCNTube else { return }
@@ -473,12 +521,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         for (uuid, positions) in vertexWorldPos {
             guard var alpha = vertexAlpha[uuid] else { continue }
             var changed = false
-
             for (vi, vPos) in positions.enumerated() {
                 let dist = simd_distance(center, vPos)
                 guard dist <= brushRadius else { continue }
                 let weight = exp(-(dist * dist) / twoSigmaSq)
-
                 if brushMode == .erase {
                     let newA = max(0.0, alpha[vi] - weight)
                     if newA != alpha[vi] { alpha[vi] = newA; changed = true }
@@ -493,24 +539,66 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // LASSO
+    // LASSO WITH FROZEN MATRIX (the fix)
     // ═══════════════════════════════════════════════════════════
 
-    private func applyLasso(screenPoints: [[Double]], mode: String) {
+    private func applyLassoWithFrozenMatrix(screenPoints: [[Double]], mode: String) {
         guard screenPoints.count >= 3 else { return }
+
+        // Use frozen matrix if available, otherwise fall back to live matrix
+        let usingFrozen = (frozenCameraTransform != nil && frozenProjectionMatrix != nil)
+        let viewMatrix: simd_float4x4
+        let projMatrix: simd_float4x4
+        let viewport: CGSize
+
+        if usingFrozen, let cam = frozenCameraTransform, let proj = frozenProjectionMatrix {
+            // Frozen view matrix is inverse of camera transform
+            viewMatrix = simd_inverse(cam)
+            projMatrix = proj
+            viewport = frozenViewportSize
+        } else {
+            guard let frame = sceneView.session.currentFrame else { return }
+            viewMatrix = simd_inverse(frame.camera.transform)
+            projMatrix = frame.camera.projectionMatrix(
+                for: .portrait,
+                viewportSize: sceneView.bounds.size,
+                zNear: 0.001,
+                zFar: 1000
+            )
+            viewport = sceneView.bounds.size
+        }
+
         let polygon = screenPoints.map { CGPoint(x: $0[0], y: $0[1]) }
         let isErase = (mode == "erase")
         saveUndoSnapshot()
+
+        let vpW = Float(viewport.width)
+        let vpH = Float(viewport.height)
 
         for (uuid, positions) in vertexWorldPos {
             guard var alpha = vertexAlpha[uuid] else { continue }
             var changed = false
 
             for (vi, wPos) in positions.enumerated() {
-                let scnPos = SCNVector3(wPos.x, wPos.y, wPos.z)
-                let screenPos = sceneView.projectPoint(scnPos)
-                guard screenPos.z > 0, screenPos.z < 1 else { continue }
-                let sp = CGPoint(x: CGFloat(screenPos.x), y: CGFloat(screenPos.y))
+                // Manual projection: world → view → clip → NDC → screen
+                let worldH = SIMD4<Float>(wPos.x, wPos.y, wPos.z, 1.0)
+                let viewSpace = viewMatrix * worldH
+                let clipSpace = projMatrix * viewSpace
+
+                guard clipSpace.w > 0 else { continue }  // behind camera
+
+                let ndcX = clipSpace.x / clipSpace.w
+                let ndcY = clipSpace.y / clipSpace.w
+                let ndcZ = clipSpace.z / clipSpace.w
+
+                guard ndcZ > -1, ndcZ < 1 else { continue }
+                guard abs(ndcX) <= 1.5, abs(ndcY) <= 1.5 else { continue }  // off-screen tolerance
+
+                // NDC to screen (portrait orientation)
+                let screenX = (ndcX + 1.0) * 0.5 * vpW
+                let screenY = (1.0 - (ndcY + 1.0) * 0.5) * vpH
+
+                let sp = CGPoint(x: CGFloat(screenX), y: CGFloat(screenY))
 
                 if pointInPolygon(sp, polygon: polygon) {
                     if isErase {
@@ -522,10 +610,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             if changed { vertexAlpha[uuid] = alpha }
         }
+
+        // Clear frozen matrix after applying (next lasso will re-capture)
+        frozenCameraTransform = nil
+        frozenProjectionMatrix = nil
+
         rebuildAll()
         totalSelectedAreaSqm = computeArea()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
-        emit("boot", data: ["status": "Lasso applied"])
+        emit("boot", data: ["status": usingFrozen ? "Lasso applied (frozen)" : "Lasso applied (live)"])
     }
 
     private func pointInPolygon(_ point: CGPoint, polygon: [CGPoint]) -> Bool {
@@ -535,7 +628,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             if (pi.y > point.y) != (pj.y > point.y) {
                 if point.x < pi.x + (point.y - pi.y) / (pj.y - pi.y) * (pj.x - pi.x) { inside = !inside }
             }; j = i
-        }; return inside
+        }
+        return inside
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -594,7 +688,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let g = SCNGeometry(sources: [src], elements: els); g.materials = mats; return g
     }
 
-    /// Alpha geometry — uses HARD THRESHOLD for straight edges
     private func buildAlphaGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geo = anchor.geometry; let vCount = geo.vertices.count; let fCount = geo.faces.count
         guard vCount > 0, fCount > 0 else { return nil }
@@ -604,25 +697,19 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let verts = extractVerts(geo)
         let uvs = genUVs(geo, transform: anchor.transform)
 
-        // ═══════════════════════════════════════════════════════
-        // HARD EDGE: Threshold alpha at 0.5 for crisp boundaries
-        // (instead of smooth gradient that causes ragged edges)
-        // ═══════════════════════════════════════════════════════
+        // Hard threshold for straight edges
         var colors = [SIMD4<Float>](repeating: SIMD4<Float>(1,1,1,0), count: vCount)
         for i in 0..<vCount {
             let a = i < alpha.count ? alpha[i] : 0.0
-            // Steep step at 0.5 — alpha is either fully visible or fully hidden
             let hardA: Float = a >= 0.5 ? 1.0 : 0.0
             colors[i] = SIMD4<Float>(1, 1, 1, hardA)
         }
 
-        // Only include faces where AT LEAST ONE vertex is selected
-        // (this trims out fully-hidden triangles, reducing visual noise at edges)
+        // Only include visible triangles
         let fEl = geo.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
         var visIdx = [UInt32](); visIdx.reserveCapacity(fCount * ipf)
         for f in 0..<fCount {
             let tri = readFace(fEl, f: f, bpi: bpi, ipf: ipf)
-            // Check if any vertex of this face is visible
             var anyVisible = false
             for idx in tri {
                 if Int(idx) < alpha.count && alpha[Int(idx)] >= 0.5 { anyVisible = true; break }
@@ -643,6 +730,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
             primitiveCount: visIdx.count / 3, bytesPerIndex: 4)
 
+        // ALWAYS create fresh material (no caching → opacity always reflects current value)
         let mat: SCNMaterial = isWallpaperApplied ? makeWPMat() : makeEditMat()
 
         let g = SCNGeometry(sources: [vertSrc, uvSrc, colorSrc], elements: [element])
@@ -683,8 +771,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             let p = s.buffer.contents().advanced(by: s.offset + s.stride * i)
                 .assumingMemoryBound(to: SIMD3<Float>.self).pointee
             v.append(SCNVector3(p.x, p.y, p.z))
-        }; return v
+        }
+        return v
     }
+
     private func genUVs(_ geo: ARMeshGeometry, transform: simd_float4x4) -> [CGPoint] {
         let s = geo.vertices; var uv = [CGPoint](); uv.reserveCapacity(s.count)
         let sc: Float = 1.0 / 0.53
@@ -693,16 +783,20 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 .assumingMemoryBound(to: SIMD3<Float>.self).pointee
             let w = transform * SIMD4<Float>(p.x, p.y, p.z, 1.0)
             uv.append(CGPoint(x: CGFloat((w.x + w.z) * sc), y: CGFloat(w.y * sc)))
-        }; return uv
+        }
+        return uv
     }
+
     private func readFace(_ fEl: ARGeometryElement, f: Int, bpi: Int, ipf: Int) -> [UInt32] {
         var t = [UInt32]()
         for j in 0..<ipf {
             let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
             if bpi == 4 { t.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
             else { t.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
-        }; return t
+        }
+        return t
     }
+
     private func addEl(_ els: inout [SCNGeometryElement], _ mats: inout [SCNMaterial], _ idx: [UInt32], _ mat: SCNMaterial) {
         guard !idx.isEmpty else { return }
         els.append(SCNGeometryElement(data: Data(bytes: idx, count: idx.count * 4),
@@ -711,7 +805,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // WALLPAPER PLACE / CLEAR
+    // PLACE / CLEAR
     // ═══════════════════════════════════════════════════════════
 
     private func placeWallpaper(_ args: [String: Any]?, result: @escaping FlutterResult) {
@@ -737,7 +831,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             self.wpAlbedo = albedo; self.wpNormal = n; self.wpRoughness = r; self.wpAO = o
             self.isWallpaperApplied = true; self.editModeActive = false; self.removeCursor()
-            self.totalSelectedAreaSqm = self.computeArea(); self.rebuildAll()
+            self.frozenCameraTransform = nil; self.frozenProjectionMatrix = nil
+            self.totalSelectedAreaSqm = self.computeArea()
+            self.forceRefreshMaterials()
             self.emit("wallpaperPlaced", data: ["wallIndex": wI, "success": true, "area": self.totalSelectedAreaSqm])
             self.emit("boot", data: ["status": "Wallpaper applied ✅"]); result(nil)
         }
@@ -756,6 +852,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 }
 
+// MARK: - FlutterStreamHandler
+
 extension WallpaperARView: FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         eventSink = { event in events(event) }
@@ -764,6 +862,8 @@ extension WallpaperARView: FlutterStreamHandler {
     }
     func onCancel(withArguments arguments: Any?) -> FlutterError? { eventSink = nil; return nil }
 }
+
+// MARK: - AR Delegates
 
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {}
