@@ -538,14 +538,37 @@ class ARService {
     await _channel.invokeMethod<void>('setWallpaperOpacity', {'opacity': opacity});
   }
 
-  /// Apply lasso polygon cut. Points are screen coordinates [[x,y], ...]
-  /// mode is 'erase' or 'paint'
-  Future<void> applyLasso(List<List<double>> points, String mode) async {
-    dlog('AR-DART', 'applyLasso ${points.length} points, mode=$mode');
-    await _channel.invokeMethod<void>('applyLasso', {
-      'points': points,
-      'mode': mode,
-    });
+  // ── Lasso Methods ───────────────────────────────────────────────────────
+
+  /// Enter lasso mode — Swift starts tracking 3D anchored points
+  Future<void> lassoStart() async {
+    dlog('AR-DART', 'lassoStart');
+    await _channel.invokeMethod<void>('lassoStart');
+  }
+
+  /// Exit lasso mode — Swift clears all lasso state
+  Future<void> lassoEnd() async {
+    dlog('AR-DART', 'lassoEnd');
+    await _channel.invokeMethod<void>('lassoEnd');
+  }
+
+  /// Add a lasso point at the given screen coordinates.
+  /// Swift raycasts to wall and stores 3D world position.
+  Future<void> lassoAddPoint(double x, double y) async {
+    dlog('AR-DART', 'lassoAddPoint x=$x y=$y');
+    await _channel.invokeMethod<void>('lassoAddPoint', {'x': x, 'y': y});
+  }
+
+  /// Clear lasso points but stay in lasso mode
+  Future<void> lassoClear() async {
+    dlog('AR-DART', 'lassoClear');
+    await _channel.invokeMethod<void>('lassoClear');
+  }
+
+  /// Apply lasso cut/paint. mode = 'erase' or 'paint'
+  Future<void> lassoApply(String mode) async {
+    dlog('AR-DART', 'lassoApply mode=$mode');
+    await _channel.invokeMethod<void>('lassoApply', {'mode': mode});
   }
 
   /// Pause AR session (freezes camera view, used for lasso drawing)
