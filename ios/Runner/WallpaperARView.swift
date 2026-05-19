@@ -1,6 +1,11 @@
-// WallpaperARView.swift — v8
-// Restored working scan/brush/wallpaper from v5 era
-// NEW: World-anchored lasso (3D points, AR stays live, points stick to wall)
+// WallpaperARView.swift — v9 (targeted fixes only)
+//
+// Changes from v8:
+//   • Lasso taps: fallback to ARKit raycastQuery on miss → catches taps on flat wall surfaces
+//   • Brush cursor: SCNPlane with circle texture (replaces SCNTube → always perfect circle)
+//   • Opacity: log + force rebuild + verify mesh exists
+//   • Lasso dots: thicker spheres, brighter color for visibility
+//
 // Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
@@ -45,19 +50,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private let brushMoveThreshold: Float = 0.003
     private var brushCursorNode: SCNNode?
 
-    // ═══════════════════════════════════════════════════════════
-    // WORLD-ANCHORED LASSO STATE
-    // ═══════════════════════════════════════════════════════════
+    // Lasso state
     private var lassoModeActive = false
-    /// 3D world positions of lasso corner points (anchored to wall)
     private var lassoWorldPoints: [SIMD3<Float>] = []
-    /// Visual dot nodes shown in 3D scene at each lasso point
     private var lassoDotNodes: [SCNNode] = []
-    /// Visual line nodes connecting consecutive lasso points
     private var lassoLineNodes: [SCNNode] = []
-    /// Whether the loop is closed (user tapped first point again)
     private var lassoClosed = false
-    /// Throttle screen-position updates to ~30 fps
     private var lastLassoScreenUpdate: TimeInterval = 0
 
     // Wallpaper
@@ -75,10 +73,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var eventSink: ((Any) -> Void)?
     private var pendingEvents: [[String: Any]] = []
 
-    // ═══════════════════════════════════════════════════════════
-    // MATERIALS
-    // ═══════════════════════════════════════════════════════════
-
+    // Materials
     private lazy var matWallWire: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.65))
     private lazy var matCeilWire: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.25))
     private lazy var matFloorWire: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.12))
@@ -89,9 +84,24 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         m.diffuse.contents = color; m.isDoubleSided = true; m.lightingModel = .constant; return m
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // INIT
-    // ═══════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════
+    // CIRCLE CURSOR TEXTURE (generated once, used for billboard plane)
+    // FIX #2: replaces SCNTube which rendered as oval at glancing angles
+    // ════════════════════════════════════════════════════════════
+    private static let cursorRingImage: UIImage = {
+        let size = CGSize(width: 256, height: 256)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            let cg = ctx.cgContext
+            cg.setStrokeColor(UIColor.white.cgColor)
+            cg.setLineWidth(12)
+            // Soft glow
+            cg.setShadow(offset: .zero, blur: 8, color: UIColor.black.withAlphaComponent(0.6).cgColor)
+            let inset: CGFloat = 16
+            let rect = CGRect(x: inset, y: inset, width: size.width - inset * 2, height: size.height - inset * 2)
+            cg.strokeEllipse(in: rect)
+        }
+    }()
 
     init(frame: CGRect, viewId: Int64, messenger: FlutterBinaryMessenger, args: Any?) {
         sceneView = ARSCNView(frame: UIScreen.main.bounds)
@@ -117,10 +127,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     func view() -> UIView { sceneView }
 
-    // ═══════════════════════════════════════════════════════════
     // ROUTER
-    // ═══════════════════════════════════════════════════════════
-
     private func route(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any]
         switch call.method {
@@ -142,46 +149,24 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "setWallpaperOpacity":
             if let o = args?["opacity"] as? Double {
                 wallpaperOpacity = CGFloat(o)
+                // FIX #3: Force every mesh node to rebuild geometry with new material
+                emit("boot", data: ["status": "Opacity → \(Int(o * 100))% (\(meshNodes.count) meshes)"])
                 forceRefreshMaterials()
-                emit("boot", data: ["status": "Opacity: \(Int(o * 100))%"])
             }
             result(nil)
         case "undoCut":      undoAlpha(); result(nil)
         case "clearAllCuts": resetAlpha(); result(nil)
-
-        // ═══════════════════════════════════════════════════════
-        // LASSO COMMANDS
-        // ═══════════════════════════════════════════════════════
-        case "lassoStart":
-            // User tapped Lasso tool → enter lasso mode, clear any previous state
-            startLassoMode()
-            result(nil)
-        case "lassoEnd":
-            // User switched tools or backed out → clear lasso, keep nothing
-            endLassoMode()
-            result(nil)
+        case "lassoStart":   startLassoMode(); result(nil)
+        case "lassoEnd":     endLassoMode(); result(nil)
         case "lassoAddPoint":
-            // User tapped a screen position → raycast to find 3D world point
             if let x = args?["x"] as? Double, let y = args?["y"] as? Double {
                 addLassoPointAtScreen(CGPoint(x: x, y: y), result: result)
-            } else {
-                result(nil)
-            }
-        case "lassoClear":
-            // User pressed "Clear pts" button → clear points but stay in lasso mode
-            clearLassoPoints()
-            result(nil)
+            } else { result(nil) }
+        case "lassoClear":   clearLassoPoints(); result(nil)
         case "lassoApply":
-            // User pressed Apply → cut/paint inside polygon
-            if let mode = args?["mode"] as? String {
-                applyLasso(mode: mode)
-            }
+            if let mode = args?["mode"] as? String { applyLasso(mode: mode) }
             result(nil)
-
-        // Legacy pause/resume (no-op for back compat)
-        case "pauseSession", "resumeSession":
-            result(nil)
-
+        case "pauseSession", "resumeSession": result(nil)
         case "placeWallpaper", "switchWallpaper": placeWallpaper(args, result: result)
         case "selectWall":
             currentWallIndex = args?["wallIndex"] as? Int ?? 0
@@ -198,26 +183,26 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // OPACITY: FORCE FRESH MATERIALS
-    // ═══════════════════════════════════════════════════════════
-
+    // FIX #3: Force refresh — always rebuild ALL mesh geometries with fresh materials
     private func forceRefreshMaterials() {
-        guard let frame = sceneView.session.currentFrame else { return }
+        guard let frame = sceneView.session.currentFrame else {
+            emit("boot", data: ["status": "Opacity: no frame yet"])
+            return
+        }
+        var rebuiltCount = 0
         for anchor in frame.anchors {
             guard let ma = anchor as? ARMeshAnchor,
                   let node = meshNodes[ma.identifier] else { continue }
-            node.geometry = nil
+            node.geometry = nil  // release cached geometry/material
             if let freshGeo = buildGeo(from: ma) {
                 node.geometry = freshGeo
+                rebuiltCount += 1
             }
         }
+        emit("boot", data: ["status": "Opacity \(Int(wallpaperOpacity*100))% (\(rebuiltCount) rebuilt)"])
     }
 
-    // ═══════════════════════════════════════════════════════════
     // AR LIFECYCLE
-    // ═══════════════════════════════════════════════════════════
-
     private func initAR(result: @escaping FlutterResult) {
         let st = AVCaptureDevice.authorizationStatus(for: .video)
         if st == .notDetermined {
@@ -251,12 +236,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         emit("arModeChanged", data: ["mode": mode]); result(nil)
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // SCAN
-    // ═══════════════════════════════════════════════════════════
-
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan v8 <<<"])
+        emit("boot", data: ["status": ">>> startScan v9 <<<"])
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             emit("error", data: ["message": "LiDAR not supported"])
             result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil)); return
@@ -282,7 +263,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         meshFrozen = true; currentMode = .preview
 
         let plain = ARWorldTrackingConfiguration()
-        plain.planeDetection = []; plain.environmentTexturing = .automatic
+        plain.planeDetection = [.vertical]  // KEEP vertical plane detection for lasso raycast fallback
+        plain.environmentTexturing = .automatic
         sceneView.session.run(plain, options: [])
 
         guard let frame = sceneView.session.currentFrame else {
@@ -342,10 +324,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // AREA
-    // ═══════════════════════════════════════════════════════════
-
     private func computeArea() -> Float {
         guard let frame = sceneView.session.currentFrame else { return 0 }
         var total: Float = 0
@@ -372,10 +350,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
         return total
     }
-
-    // ═══════════════════════════════════════════════════════════
-    // EDIT MODE
-    // ═══════════════════════════════════════════════════════════
 
     private func enterEditMode() {
         editModeActive = true; isWallpaperApplied = false
@@ -417,30 +391,39 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         rebuildAll(); emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // CURSOR
-    // ═══════════════════════════════════════════════════════════
-
+    // ════════════════════════════════════════════════════════════
+    // FIX #2: BRUSH CURSOR — SCNPlane with circle texture + billboard
+    // Always renders as a perfect circle regardless of viewing angle
+    // ════════════════════════════════════════════════════════════
     private func createCursor() {
         removeCursor()
         let diameter = CGFloat(brushRadius * 2)
-        let ring = SCNTube(innerRadius: diameter * 0.45, outerRadius: diameter * 0.5, height: 0.001)
+        let plane = SCNPlane(width: diameter, height: diameter)
         let mat = SCNMaterial()
-        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.9)
-        mat.lightingModel = .constant; mat.isDoubleSided = true
-        ring.materials = [mat, mat, mat]
-        let node = SCNNode(geometry: ring); node.isHidden = true
-        let billboard = SCNBillboardConstraint(); billboard.freeAxes = .all
+        mat.diffuse.contents = WallpaperARView.cursorRingImage
+        mat.lightingModel = .constant
+        mat.isDoubleSided = true
+        mat.blendMode = .alpha
+        mat.writesToDepthBuffer = false
+        mat.readsFromDepthBuffer = false
+        plane.materials = [mat]
+
+        let node = SCNNode(geometry: plane)
+        node.isHidden = true
+        node.renderingOrder = 500  // on top of mesh
+        let billboard = SCNBillboardConstraint()
+        billboard.freeAxes = .all
         node.constraints = [billboard]
-        sceneView.scene.rootNode.addChildNode(node); brushCursorNode = node
+        sceneView.scene.rootNode.addChildNode(node)
+        brushCursorNode = node
     }
 
     private func removeCursor() { brushCursorNode?.removeFromParentNode(); brushCursorNode = nil }
 
     private func updateCursorSize() {
-        guard let node = brushCursorNode, let tube = node.geometry as? SCNTube else { return }
+        guard let node = brushCursorNode, let plane = node.geometry as? SCNPlane else { return }
         let d = CGFloat(brushRadius * 2)
-        tube.innerRadius = d * 0.45; tube.outerRadius = d * 0.5
+        plane.width = d; plane.height = d
     }
 
     private func moveCursor(to pos: SCNVector3) {
@@ -448,13 +431,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         n.isHidden = false; n.position = pos
     }
 
-    // ═══════════════════════════════════════════════════════════
     // BRUSH
-    // ═══════════════════════════════════════════════════════════
-
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
         guard editModeActive else { return }
-        // Disable brush when in lasso mode — taps handled separately by Dart
         guard !lassoModeActive else { return }
         let pt = gesture.location(in: sceneView)
 
@@ -526,9 +505,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         for uuid in rebuilt { rebuildMesh(for: uuid) }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // WORLD-ANCHORED LASSO IMPLEMENTATION
-    // ═══════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════
+    // LASSO
+    // ════════════════════════════════════════════════════════════
 
     private func startLassoMode() {
         lassoModeActive = true
@@ -556,64 +535,127 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         broadcastLassoScreenPositions()
     }
 
-    /// User tapped a screen point while in lasso mode.
-    /// Raycast to find 3D world point on the wall, add to lasso.
+    // ════════════════════════════════════════════════════════════
+    // FIX #1: LASSO TAP — multi-strategy raycast for reliable hits
+    // Strategy 1: SCNHitTest against mesh
+    // Strategy 2: ARKit raycastQuery against existing/estimated planes
+    // Strategy 3: Find nearest mesh vertex within tolerance
+    // ════════════════════════════════════════════════════════════
     private func addLassoPointAtScreen(_ pt: CGPoint, result: @escaping FlutterResult) {
         guard lassoModeActive else { result(nil); return }
         guard !lassoClosed else { result(nil); return }
 
-        // Raycast to mesh
-        guard let hit = firstMeshHit(pt) else {
-            emit("boot", data: ["status": "Tap on wall surface"])
-            result(nil); return
-        }
-        let world = SIMD3<Float>(Float(hit.worldCoordinates.x),
+        // Try in order: mesh hit → plane raycast → nearest vertex
+        var world: SIMD3<Float>?
+        var method = ""
+
+        if let hit = firstMeshHit(pt) {
+            world = SIMD3<Float>(Float(hit.worldCoordinates.x),
                                   Float(hit.worldCoordinates.y),
                                   Float(hit.worldCoordinates.z))
+            method = "mesh"
+        } else if let raycastWorld = raycastViaARKit(pt) {
+            world = raycastWorld
+            method = "plane"
+        } else if let nearestWorld = nearestMeshVertexToScreenPoint(pt, maxScreenDist: 60) {
+            world = nearestWorld
+            method = "vertex"
+        }
 
-        // Check: did user tap near first point to close loop?
+        guard let pickedWorld = world else {
+            emit("boot", data: ["status": "Tap missed — try wall surface"])
+            result(nil); return
+        }
+
+        // Close-loop check
         if lassoWorldPoints.count >= 3 {
             let first = lassoWorldPoints[0]
-            // Close if within 8cm in 3D space (forgiving)
-            if simd_distance(first, world) < 0.08 {
+            if simd_distance(first, pickedWorld) < 0.10 {  // 10cm tolerance
                 lassoClosed = true
-                // Add closing line back to first point
                 addLassoLineFromLast(to: first, isClosing: true)
-                emit("lassoState", data: [
-                    "active": true, "closed": true, "count": lassoWorldPoints.count
-                ])
+                emit("lassoState", data: ["active": true, "closed": true, "count": lassoWorldPoints.count])
                 emit("boot", data: ["status": "Loop closed — tap Apply"])
                 broadcastLassoScreenPositions()
                 result(nil); return
             }
         }
 
-        // Add new lasso point
-        lassoWorldPoints.append(world)
-        addLassoDot(at: world)
+        // Add point
+        lassoWorldPoints.append(pickedWorld)
+        addLassoDot(at: pickedWorld)
         if lassoWorldPoints.count >= 2 {
             let prev = lassoWorldPoints[lassoWorldPoints.count - 2]
-            addLassoLineFromLast(from: prev, to: world, isClosing: false)
+            addLassoLineFromLast(from: prev, to: pickedWorld, isClosing: false)
         }
         emit("lassoState", data: [
             "active": true, "closed": false, "count": lassoWorldPoints.count
         ])
+        emit("boot", data: ["status": "Pt added (\(method)) · \(lassoWorldPoints.count)"])
         broadcastLassoScreenPositions()
         result(nil)
     }
 
+    /// ARKit raycast against detected/estimated planes
+    private func raycastViaARKit(_ pt: CGPoint) -> SIMD3<Float>? {
+        // Try existing plane geometry first, then estimated plane
+        if let query = sceneView.raycastQuery(from: pt, allowing: .existingPlaneGeometry, alignment: .vertical) {
+            if let r = sceneView.session.raycast(query).first {
+                return SIMD3<Float>(r.worldTransform.columns.3.x,
+                                    r.worldTransform.columns.3.y,
+                                    r.worldTransform.columns.3.z)
+            }
+        }
+        if let query = sceneView.raycastQuery(from: pt, allowing: .estimatedPlane, alignment: .vertical) {
+            if let r = sceneView.session.raycast(query).first {
+                return SIMD3<Float>(r.worldTransform.columns.3.x,
+                                    r.worldTransform.columns.3.y,
+                                    r.worldTransform.columns.3.z)
+            }
+        }
+        // Any-alignment fallback
+        if let query = sceneView.raycastQuery(from: pt, allowing: .estimatedPlane, alignment: .any) {
+            if let r = sceneView.session.raycast(query).first {
+                return SIMD3<Float>(r.worldTransform.columns.3.x,
+                                    r.worldTransform.columns.3.y,
+                                    r.worldTransform.columns.3.z)
+            }
+        }
+        return nil
+    }
+
+    /// Find mesh vertex whose screen projection is nearest to the tap, within tolerance
+    private func nearestMeshVertexToScreenPoint(_ pt: CGPoint, maxScreenDist: CGFloat) -> SIMD3<Float>? {
+        var bestDist: CGFloat = maxScreenDist
+        var bestWorld: SIMD3<Float>?
+        for (_, positions) in vertexWorldPos {
+            for wp in positions {
+                let sp = sceneView.projectPoint(SCNVector3(wp.x, wp.y, wp.z))
+                guard sp.z > 0 && sp.z < 1 else { continue }
+                let dx = CGFloat(sp.x) - pt.x
+                let dy = CGFloat(sp.y) - pt.y
+                let d = sqrt(dx*dx + dy*dy)
+                if d < bestDist {
+                    bestDist = d
+                    bestWorld = wp
+                }
+            }
+        }
+        return bestWorld
+    }
+
     private func addLassoDot(at world: SIMD3<Float>) {
-        // Small sphere at world position, billboarded to face camera
-        let sphere = SCNSphere(radius: 0.015)
+        // Bigger, brighter sphere with billboard so it's always visible
+        let sphere = SCNSphere(radius: 0.025)  // 2.5cm — clearly visible
         let mat = SCNMaterial()
         mat.diffuse.contents = UIColor.systemRed
+        mat.emission.contents = UIColor.systemRed.withAlphaComponent(0.6)  // glow
         mat.lightingModel = .constant
-        mat.readsFromDepthBuffer = false  // always visible on top
+        mat.readsFromDepthBuffer = false
         mat.writesToDepthBuffer = false
         sphere.materials = [mat]
         let node = SCNNode(geometry: sphere)
         node.position = SCNVector3(world.x, world.y, world.z)
-        node.renderingOrder = 1000  // draw on top of everything
+        node.renderingOrder = 1000
         sceneView.scene.rootNode.addChildNode(node)
         lassoDotNodes.append(node)
     }
@@ -624,32 +666,28 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func addLassoLineFromLast(from a: SIMD3<Float>, to b: SIMD3<Float>, isClosing: Bool) {
-        // Build a thin cylinder between the two points
         let dir = b - a
         let length = simd_length(dir)
         guard length > 0.001 else { return }
 
-        let cyl = SCNCylinder(radius: 0.004, height: CGFloat(length))
+        let cyl = SCNCylinder(radius: 0.006, height: CGFloat(length))  // 6mm thick
         let mat = SCNMaterial()
         mat.diffuse.contents = isClosing ? UIColor.systemYellow : UIColor.systemRed
+        mat.emission.contents = (isClosing ? UIColor.systemYellow : UIColor.systemRed).withAlphaComponent(0.5)
         mat.lightingModel = .constant
         mat.readsFromDepthBuffer = false
         mat.writesToDepthBuffer = false
         cyl.materials = [mat]
 
         let node = SCNNode(geometry: cyl)
-        // Position cylinder midpoint
         let mid = (a + b) * 0.5
         node.position = SCNVector3(mid.x, mid.y, mid.z)
-        // Orient cylinder along direction a→b
-        // SCNCylinder is along Y axis by default. Rotate Y to point along dir.
         let up = SIMD3<Float>(0, 1, 0)
         let normalized = simd_normalize(dir)
         let dot = simd_dot(up, normalized)
         if dot > 0.9999 {
-            // Already aligned
+            // aligned
         } else if dot < -0.9999 {
-            // Opposite direction — rotate 180 around X
             node.eulerAngles = SCNVector3(Float.pi, 0, 0)
         } else {
             let axis = simd_normalize(simd_cross(up, normalized))
@@ -661,9 +699,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         lassoLineNodes.append(node)
     }
 
-    /// Called each AR frame. Throttles to 30fps.
-    /// Sends current screen positions of lasso points to Dart so Dart can draw
-    /// "close hint" UI elements like a yellow ring around the first point.
     private func broadcastLassoScreenPositions() {
         let now = CACurrentMediaTime()
         guard now - lastLassoScreenUpdate > 0.033 else { return }
@@ -673,24 +708,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         for wp in lassoWorldPoints {
             let scnPos = SCNVector3(wp.x, wp.y, wp.z)
             let sp = sceneView.projectPoint(scnPos)
-            // z range [0,1] = visible
             let visible = sp.z > 0 && sp.z < 1
             screenPts.append([Double(sp.x), Double(sp.y), visible ? 1.0 : 0.0])
         }
         emit("lassoScreenPoints", data: ["points": screenPts])
     }
 
-    /// Apply lasso cut/paint using the 3D world points.
-    /// Uses CURRENT camera matrix for projection (since AR is live, this gives
-    /// the user-current view of which vertices are inside).
     private func applyLasso(mode: String) {
         guard lassoWorldPoints.count >= 3 else {
             emit("boot", data: ["status": "Need 3+ points"]); return
         }
-        guard let frame = sceneView.session.currentFrame else { return }
         let isErase = (mode == "erase")
 
-        // Project lasso world points to current screen
         var polygon: [CGPoint] = []
         polygon.reserveCapacity(lassoWorldPoints.count)
         for wp in lassoWorldPoints {
@@ -700,7 +729,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         saveUndoSnapshot()
 
-        // For each mesh vertex, project to current screen, test polygon membership
         for (uuid, positions) in vertexWorldPos {
             guard var alpha = vertexAlpha[uuid] else { continue }
             var changed = false
@@ -719,7 +747,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             if changed { vertexAlpha[uuid] = alpha }
         }
 
-        // Clear lasso visuals but stay in lasso mode for next polygon
         let wasClosedJustNow = lassoClosed
         clearLassoPoints()
 
@@ -740,10 +767,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         return inside
     }
 
-    // ═══════════════════════════════════════════════════════════
     // GEOMETRY
-    // ═══════════════════════════════════════════════════════════
-
     private func rebuildAll() {
         guard let frame = sceneView.session.currentFrame else { return }
         for anchor in frame.anchors {
@@ -805,7 +829,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let verts = extractVerts(geo)
         let uvs = genUVs(geo, transform: anchor.transform)
 
-        // Hard threshold for crisp edges
         var colors = [SIMD4<Float>](repeating: SIMD4<Float>(1,1,1,0), count: vCount)
         for i in 0..<vCount {
             let a = i < alpha.count ? alpha[i] : 0.0
@@ -852,7 +875,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         } else {
             m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
             m.lightingModel = .constant
-            m.transparency = wallpaperOpacity * 0.3
+            m.transparency = wallpaperOpacity * 0.6  // make selection visibility scale with slider
         }
         return m
     }
@@ -908,10 +931,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         mats.append(mat)
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // PLACE / CLEAR WALLPAPER
-    // ═══════════════════════════════════════════════════════════
-
     private func placeWallpaper(_ args: [String: Any]?, result: @escaping FlutterResult) {
         guard let args = args, let url = args["albedoUrl"] as? String, !url.isEmpty else {
             emit("wallpaperPlaced", data: ["success": false, "message": "No URL"]); result(nil); return
@@ -955,8 +974,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 }
 
-// MARK: - FlutterStreamHandler
-
 extension WallpaperARView: FlutterStreamHandler {
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         eventSink = { event in events(event) }
@@ -966,11 +983,8 @@ extension WallpaperARView: FlutterStreamHandler {
     func onCancel(withArguments arguments: Any?) -> FlutterError? { eventSink = nil; return nil }
 }
 
-// MARK: - AR Delegates
-
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Broadcast lasso screen positions on each frame (throttled internally)
         if lassoModeActive && !lassoWorldPoints.isEmpty {
             broadcastLassoScreenPositions()
         }
