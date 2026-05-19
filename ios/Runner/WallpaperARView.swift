@@ -1,6 +1,6 @@
-// WallpaperARView.swift — v5 FINAL
-// Frozen-matrix lasso (no pause/resume, no tracking disruption)
-// Force-fresh opacity materials (no caching)
+// WallpaperARView.swift — v6 DEFINITIVE
+// Frozen screen positions + UIImage snapshot overlay (perfect lasso alignment)
+// SDF-based smooth alpha + fwidth shader anti-aliasing (ruler-straight smooth edges)
 // Replace: ios/Runner/WallpaperARView.swift
 
 import ARKit
@@ -49,11 +49,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var brushCursorNode: SCNNode?
 
     // ═══════════════════════════════════════════════════════════
-    // FROZEN MATRIX FOR LASSO — captured when lasso starts
+    // FROZEN STATE FOR LASSO
     // ═══════════════════════════════════════════════════════════
-    private var frozenCameraTransform: simd_float4x4?
-    private var frozenProjectionMatrix: simd_float4x4?
-    private var frozenViewportSize: CGSize = .zero
+    /// Screen position of every vertex at the moment lasso was activated.
+    /// nil = vertex wasn't visible at that moment.
+    private var frozenVertexScreenPositions: [UUID: [CGPoint?]] = [:]
+    /// Snapshot UIImageView shown on top of ARSCNView while lasso is active
+    /// (so user sees a static image they can draw over without misalignment)
+    private var snapshotImageView: UIImageView?
 
     // Wallpaper
     private var wpAlbedo: UIImage?
@@ -70,6 +73,22 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var panGesture: UIPanGestureRecognizer?
     private var eventSink: ((Any) -> Void)?
     private var pendingEvents: [[String: Any]] = []
+
+    // ═══════════════════════════════════════════════════════════
+    // SHADER MODIFIER (fwidth-based anti-aliasing for crisp smooth edges)
+    // ═══════════════════════════════════════════════════════════
+    private static let fragmentShaderModifier: String = """
+    #pragma transparent
+    float vAlpha = _surface.diffuse.a;
+    float aaWidth = max(fwidth(vAlpha), 0.001);
+    float mask = smoothstep(0.5 - aaWidth, 0.5 + aaWidth, vAlpha);
+    if (mask < 0.01) {
+        discard_fragment();
+    }
+    if (vAlpha > 0.001) {
+        _output.color.a = _output.color.a * mask / vAlpha;
+    }
+    """
 
     // ═══════════════════════════════════════════════════════════
     // MATERIALS
@@ -133,45 +152,29 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "setBrushSize":
             if let s = args?["size"] as? Double { brushRadius = Float(s); updateCursorSize() }
             result(nil)
-
-        // ═══════════════════════════════════════════════════════
-        // OPACITY: Force fresh material rebuild
-        // ═══════════════════════════════════════════════════════
         case "setWallpaperOpacity":
             if let o = args?["opacity"] as? Double {
                 wallpaperOpacity = CGFloat(o)
-                forceRefreshMaterials()  // ← force fresh, no caching
+                forceRefreshMaterials()
                 emit("boot", data: ["status": "Opacity: \(Int(o * 100))%"])
             }
             result(nil)
-
         case "undoCut":      undoAlpha(); result(nil)
         case "clearAllCuts": resetAlpha(); result(nil)
 
-        // ═══════════════════════════════════════════════════════
-        // LASSO LIFECYCLE: Capture matrix on start, no pause
-        // ═══════════════════════════════════════════════════════
-        case "captureCameraSnapshot":
-            captureCameraSnapshot()
-            result(nil)
-        case "clearCameraSnapshot":
-            frozenCameraTransform = nil
-            frozenProjectionMatrix = nil
-            result(nil)
         case "applyLasso":
             if let pts = args?["points"] as? [[Double]], let mode = args?["mode"] as? String {
-                applyLassoWithFrozenMatrix(screenPoints: pts, mode: mode)
+                applyLassoWithSDF(screenPoints: pts, mode: mode)
             }
             result(nil)
 
-        // Legacy pause/resume names from Dart now trigger capture/clear of frozen matrix
-        // (no actual session pause — keeps AR tracking alive)
+        // pauseSession → enter lasso mode (freeze screen, capture positions, show snapshot)
         case "pauseSession":
-            captureCameraSnapshot()
+            enterLassoMode()
             result(nil)
+        // resumeSession → exit lasso mode (release snapshot, clear positions)
         case "resumeSession":
-            frozenCameraTransform = nil
-            frozenProjectionMatrix = nil
+            exitLassoMode()
             result(nil)
 
         case "placeWallpaper", "switchWallpaper": placeWallpaper(args, result: result)
@@ -191,36 +194,71 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // FROZEN-MATRIX CAPTURE (called when user taps Lasso tool)
+    // LASSO FREEZE/RELEASE
     // ═══════════════════════════════════════════════════════════
 
-    private func captureCameraSnapshot() {
-        guard let frame = sceneView.session.currentFrame else {
-            emit("boot", data: ["status": "Cannot capture — no AR frame"])
-            return
+    private func enterLassoMode() {
+        // CRITICAL: projectPoint and snapshot must both run on main thread,
+        // and projectPoint must run AT THE SAME FRAME as the snapshot
+        // so the captured positions match the captured image exactly.
+        let work: () -> Void = { [weak self] in
+            guard let self = self else { return }
+
+            // Step 1: Capture screen position of every vertex
+            self.frozenVertexScreenPositions.removeAll()
+            for (uuid, worldPositions) in self.vertexWorldPos {
+                var screenPts: [CGPoint?] = []
+                screenPts.reserveCapacity(worldPositions.count)
+                for wPos in worldPositions {
+                    let scnPos = SCNVector3(wPos.x, wPos.y, wPos.z)
+                    let sp = self.sceneView.projectPoint(scnPos)
+                    if sp.z > 0 && sp.z < 1 {
+                        screenPts.append(CGPoint(x: CGFloat(sp.x), y: CGFloat(sp.y)))
+                    } else {
+                        screenPts.append(nil)
+                    }
+                }
+                self.frozenVertexScreenPositions[uuid] = screenPts
+            }
+
+            // Step 2: Same frame — capture UIImage snapshot, display as overlay
+            let snapshot = self.sceneView.snapshot()
+            let imageView = UIImageView(frame: self.sceneView.bounds)
+            imageView.image = snapshot
+            imageView.contentMode = .scaleAspectFill
+            imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            imageView.isUserInteractionEnabled = false
+            self.sceneView.addSubview(imageView)
+            self.snapshotImageView = imageView
+
+            self.emit("boot", data: ["status": "Lasso angle frozen ✓"])
         }
-        frozenCameraTransform = frame.camera.transform
-        frozenViewportSize = sceneView.bounds.size
-        frozenProjectionMatrix = frame.camera.projectionMatrix(
-            for: .portrait,
-            viewportSize: frozenViewportSize,
-            zNear: 0.001,
-            zFar: 1000
-        )
-        emit("boot", data: ["status": "Lasso angle captured"])
+
+        if Thread.isMainThread { work() }
+        else { DispatchQueue.main.sync(execute: work) }
+    }
+
+    private func exitLassoMode() {
+        frozenVertexScreenPositions.removeAll()
+        let work: () -> Void = { [weak self] in
+            self?.snapshotImageView?.removeFromSuperview()
+            self?.snapshotImageView = nil
+        }
+        if Thread.isMainThread { work() }
+        else { DispatchQueue.main.sync(execute: work) }
+        emit("boot", data: ["status": "Lasso released"])
     }
 
     // ═══════════════════════════════════════════════════════════
-    // OPACITY: FORCE-FRESH MATERIALS (no caching)
+    // OPACITY: FORCE-FRESH MATERIALS
     // ═══════════════════════════════════════════════════════════
 
     private func forceRefreshMaterials() {
-        // Nuke all geometry caches and rebuild every mesh from scratch
         guard let frame = sceneView.session.currentFrame else { return }
         for anchor in frame.anchors {
             guard let ma = anchor as? ARMeshAnchor,
                   let node = meshNodes[ma.identifier] else { continue }
-            node.geometry = nil  // ← force release of cached geometry/material
+            node.geometry = nil
             if let freshGeo = buildGeo(from: ma) {
                 node.geometry = freshGeo
             }
@@ -269,7 +307,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ═══════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan v5 <<<"])
+        emit("boot", data: ["status": ">>> startScan v6 <<<"])
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             emit("error", data: ["message": "LiDAR not supported"])
             result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil)); return
@@ -280,7 +318,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         wallNodes.removeAll(); undoStack.removeAll()
         totalSelectedAreaSqm = 0; isWallpaperApplied = false
         meshFrozen = false; editModeActive = false; removeCursor()
-        frozenCameraTransform = nil; frozenProjectionMatrix = nil
+        exitLassoMode()
         currentMode = .scanning
 
         let c = ARWorldTrackingConfiguration()
@@ -398,7 +436,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func exitEditMode() {
         editModeActive = false; removeCursor()
-        frozenCameraTransform = nil; frozenProjectionMatrix = nil
+        exitLassoMode()
         totalSelectedAreaSqm = computeArea(); rebuildAll()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
     }
@@ -432,7 +470,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // CURSOR (Circle via Billboard)
+    // CURSOR
     // ═══════════════════════════════════════════════════════════
 
     private func createCursor() {
@@ -468,6 +506,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
         guard editModeActive else { return }
+        // Disable brush while in lasso mode (snapshot covers the view)
+        guard snapshotImageView == nil else { return }
         let pt = gesture.location(in: sceneView)
 
         switch gesture.state {
@@ -539,86 +579,90 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // LASSO WITH FROZEN MATRIX (the fix)
+    // LASSO WITH SDF (Signed Distance Field) — ruler-straight smooth edges
     // ═══════════════════════════════════════════════════════════
 
-    private func applyLassoWithFrozenMatrix(screenPoints: [[Double]], mode: String) {
+    private func applyLassoWithSDF(screenPoints: [[Double]], mode: String) {
         guard screenPoints.count >= 3 else { return }
-
-        // Use frozen matrix if available, otherwise fall back to live matrix
-        let usingFrozen = (frozenCameraTransform != nil && frozenProjectionMatrix != nil)
-        let viewMatrix: simd_float4x4
-        let projMatrix: simd_float4x4
-        let viewport: CGSize
-
-        if usingFrozen, let cam = frozenCameraTransform, let proj = frozenProjectionMatrix {
-            // Frozen view matrix is inverse of camera transform
-            viewMatrix = simd_inverse(cam)
-            projMatrix = proj
-            viewport = frozenViewportSize
-        } else {
-            guard let frame = sceneView.session.currentFrame else { return }
-            viewMatrix = simd_inverse(frame.camera.transform)
-            projMatrix = frame.camera.projectionMatrix(
-                for: .portrait,
-                viewportSize: sceneView.bounds.size,
-                zNear: 0.001,
-                zFar: 1000
-            )
-            viewport = sceneView.bounds.size
+        guard !frozenVertexScreenPositions.isEmpty else {
+            emit("boot", data: ["status": "No frozen positions — re-tap Lasso"])
+            return
         }
 
         let polygon = screenPoints.map { CGPoint(x: $0[0], y: $0[1]) }
         let isErase = (mode == "erase")
+        // Gradient width in screen pixels: vertices within this distance from polygon edge
+        // get a smooth alpha transition. Wider = softer mesh interpolation feeding the shader.
+        let aaWidth: CGFloat = 20.0
+
         saveUndoSnapshot()
 
-        let vpW = Float(viewport.width)
-        let vpH = Float(viewport.height)
-
-        for (uuid, positions) in vertexWorldPos {
+        for (uuid, frozenScreens) in frozenVertexScreenPositions {
             guard var alpha = vertexAlpha[uuid] else { continue }
             var changed = false
 
-            for (vi, wPos) in positions.enumerated() {
-                // Manual projection: world → view → clip → NDC → screen
-                let worldH = SIMD4<Float>(wPos.x, wPos.y, wPos.z, 1.0)
-                let viewSpace = viewMatrix * worldH
-                let clipSpace = projMatrix * viewSpace
+            for (vi, spOpt) in frozenScreens.enumerated() {
+                guard let sp = spOpt else { continue }  // vertex wasn't visible at lasso start
 
-                guard clipSpace.w > 0 else { continue }  // behind camera
+                // Signed distance: negative = inside polygon, positive = outside
+                let sdf = signedDistanceToPolygon(sp, polygon: polygon)
 
-                let ndcX = clipSpace.x / clipSpace.w
-                let ndcY = clipSpace.y / clipSpace.w
-                let ndcZ = clipSpace.z / clipSpace.w
+                // Normalize SDF to [-1, +1] over the gradient zone
+                let normalized = max(-1.0, min(1.0, sdf / aaWidth))
+                // alphaMask: 0 deep inside polygon, 0.5 at edge, 1 outside polygon
+                let alphaMask = Float((normalized + 1.0) / 2.0)
 
-                guard ndcZ > -1, ndcZ < 1 else { continue }
-                guard abs(ndcX) <= 1.5, abs(ndcY) <= 1.5 else { continue }  // off-screen tolerance
-
-                // NDC to screen (portrait orientation)
-                let screenX = (ndcX + 1.0) * 0.5 * vpW
-                let screenY = (1.0 - (ndcY + 1.0) * 0.5) * vpH
-
-                let sp = CGPoint(x: CGFloat(screenX), y: CGFloat(screenY))
-
-                if pointInPolygon(sp, polygon: polygon) {
-                    if isErase {
-                        if alpha[vi] > 0 { alpha[vi] = 0.0; changed = true }
-                    } else {
-                        if alpha[vi] < 1 { alpha[vi] = 1.0; changed = true }
-                    }
+                let newAlpha: Float
+                if isErase {
+                    // Erase inside polygon → take min (preserves outside parts)
+                    newAlpha = min(alpha[vi], alphaMask)
+                } else {
+                    // Paint inside polygon → take max with inverted mask
+                    newAlpha = max(alpha[vi], 1.0 - alphaMask)
+                }
+                if abs(newAlpha - alpha[vi]) > 0.001 {
+                    alpha[vi] = newAlpha
+                    changed = true
                 }
             }
             if changed { vertexAlpha[uuid] = alpha }
         }
 
-        // Clear frozen matrix after applying (next lasso will re-capture)
-        frozenCameraTransform = nil
-        frozenProjectionMatrix = nil
+        // Auto-release lasso state so user sees the result
+        exitLassoMode()
 
         rebuildAll()
         totalSelectedAreaSqm = computeArea()
         emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
-        emit("boot", data: ["status": usingFrozen ? "Lasso applied (frozen)" : "Lasso applied (live)"])
+        emit("boot", data: ["status": "Lasso applied ✅"])
+    }
+
+    /// Signed distance from point to polygon edge.
+    /// Negative if inside, positive if outside. Magnitude = distance to nearest edge.
+    private func signedDistanceToPolygon(_ point: CGPoint, polygon: [CGPoint]) -> CGFloat {
+        guard polygon.count >= 3 else { return 0 }
+        var minDist = CGFloat.greatestFiniteMagnitude
+        let n = polygon.count
+        for i in 0..<n {
+            let a = polygon[i]
+            let b = polygon[(i + 1) % n]
+            let d = distanceFromPointToSegment(point: point, a: a, b: b)
+            if d < minDist { minDist = d }
+        }
+        let inside = pointInPolygon(point, polygon: polygon)
+        return inside ? -minDist : minDist
+    }
+
+    private func distanceFromPointToSegment(point P: CGPoint, a: CGPoint, b: CGPoint) -> CGFloat {
+        let abx = b.x - a.x; let aby = b.y - a.y
+        let apx = P.x - a.x; let apy = P.y - a.y
+        let abSq = abx * abx + aby * aby
+        if abSq < 1e-6 { return hypot(apx, apy) }
+        var t = (apx * abx + apy * aby) / abSq
+        t = max(0, min(1, t))
+        let cx = a.x + t * abx
+        let cy = a.y + t * aby
+        return hypot(P.x - cx, P.y - cy)
     }
 
     private func pointInPolygon(_ point: CGPoint, polygon: [CGPoint]) -> Bool {
@@ -688,6 +732,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let g = SCNGeometry(sources: [src], elements: els); g.materials = mats; return g
     }
 
+    /// Alpha geometry — smooth gradient (no hard threshold) + fragment shader anti-aliasing
     private func buildAlphaGeo(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geo = anchor.geometry; let vCount = geo.vertices.count; let fCount = geo.faces.count
         guard vCount > 0, fCount > 0 else { return nil }
@@ -697,22 +742,22 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let verts = extractVerts(geo)
         let uvs = genUVs(geo, transform: anchor.transform)
 
-        // Hard threshold for straight edges
+        // Use RAW alpha values — no hard threshold
+        // The fragment shader (fwidth + smoothstep) will handle anti-aliasing
         var colors = [SIMD4<Float>](repeating: SIMD4<Float>(1,1,1,0), count: vCount)
         for i in 0..<vCount {
             let a = i < alpha.count ? alpha[i] : 0.0
-            let hardA: Float = a >= 0.5 ? 1.0 : 0.0
-            colors[i] = SIMD4<Float>(1, 1, 1, hardA)
+            colors[i] = SIMD4<Float>(1, 1, 1, a)
         }
 
-        // Only include visible triangles
+        // Include triangles where ANY vertex has visible alpha (lets shader anti-alias gradient zone)
         let fEl = geo.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
         var visIdx = [UInt32](); visIdx.reserveCapacity(fCount * ipf)
         for f in 0..<fCount {
             let tri = readFace(fEl, f: f, bpi: bpi, ipf: ipf)
             var anyVisible = false
             for idx in tri {
-                if Int(idx) < alpha.count && alpha[Int(idx)] >= 0.5 { anyVisible = true; break }
+                if Int(idx) < alpha.count && alpha[Int(idx)] > 0.01 { anyVisible = true; break }
             }
             if anyVisible { visIdx.append(contentsOf: tri) }
         }
@@ -730,7 +775,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
             primitiveCount: visIdx.count / 3, bytesPerIndex: 4)
 
-        // ALWAYS create fresh material (no caching → opacity always reflects current value)
         let mat: SCNMaterial = isWallpaperApplied ? makeWPMat() : makeEditMat()
 
         let g = SCNGeometry(sources: [vertSrc, uvSrc, colorSrc], elements: [element])
@@ -749,6 +793,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             m.lightingModel = .constant
             m.transparency = wallpaperOpacity * 0.3
         }
+        // NO shader modifier in edit mode — keep brush gradient natural and visible
         return m
     }
 
@@ -761,6 +806,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         if let img = wpNormal { m.normal.contents = img; m.normal.wrapS = .repeat; m.normal.wrapT = .repeat; m.normal.intensity = 0.8 }
         if let img = wpRoughness { m.roughness.contents = img; m.roughness.wrapS = .repeat; m.roughness.wrapT = .repeat }
         if let img = wpAO { m.ambientOcclusion.contents = img; m.ambientOcclusion.wrapS = .repeat; m.ambientOcclusion.wrapT = .repeat }
+        // Anti-aliased crisp edges ONLY for applied wallpaper
+        m.shaderModifiers = [.fragment: WallpaperARView.fragmentShaderModifier]
         return m
     }
 
@@ -831,7 +878,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             self.wpAlbedo = albedo; self.wpNormal = n; self.wpRoughness = r; self.wpAO = o
             self.isWallpaperApplied = true; self.editModeActive = false; self.removeCursor()
-            self.frozenCameraTransform = nil; self.frozenProjectionMatrix = nil
+            self.exitLassoMode()
             self.totalSelectedAreaSqm = self.computeArea()
             self.forceRefreshMaterials()
             self.emit("wallpaperPlaced", data: ["wallIndex": wI, "success": true, "area": self.totalSelectedAreaSqm])
@@ -845,7 +892,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         rebuildAll(); emit("wallCleared", data: ["wallIndex": 0])
     }
 
-    // Events
     private func emit(_ type: String, data: [String: Any] = [:]) {
         let payload: [String: Any] = ["type": type, "data": data]
         if let sink = eventSink { sink(payload) } else { pendingEvents.append(payload) }
