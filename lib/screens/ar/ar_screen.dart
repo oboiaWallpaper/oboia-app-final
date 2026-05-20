@@ -33,6 +33,9 @@ class _ARScreenState extends State<ARScreen> {
   double _brushSize = 0.08, _wallpaperOpacity = 0.96;
   double _totalWallArea = 0.0;
 
+  // EDIT 1: freehand pen toggle state
+  bool _lassoFreehand = false; // false = tap mode, true = pen/freehand mode
+
   // Lasso state from Swift
   int _lassoPointCount = 0;
   bool _lassoClosed = false;
@@ -167,6 +170,14 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.lassoClear(); } catch (_) {}
   }
 
+  // EDIT 2: freehand pen toggle helper
+  Future<void> _toggleLassoFreehand() async {
+    setState(() => _lassoFreehand = !_lassoFreehand);
+    try {
+      await ARService.instance.lassoSetFreehand(_lassoFreehand);
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
     _eventSub?.cancel();
@@ -188,8 +199,8 @@ class _ARScreenState extends State<ARScreen> {
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // Lasso tap detector
-        if (_editMode && _activeTool == 'lasso' && !_lassoClosed)
+        // EDIT 4: Lasso tap detector — only active in tap mode (not freehand)
+        if (_editMode && _activeTool == 'lasso' && !_lassoClosed && !_lassoFreehand)
           Positioned.fill(child: GestureDetector(
             behavior: HitTestBehavior.translucent,
             onTapDown: (d) => _handleLassoTap(d.localPosition),
@@ -226,7 +237,9 @@ class _ARScreenState extends State<ARScreen> {
                 _activeTool == 'lasso'
                     ? (_lassoClosed
                         ? 'Loop closed — tap Apply'
-                        : 'Tap on wall (tap first point to close) · $_lassoPointCount pts')
+                        : _lassoFreehand
+                            ? 'Draw freely on wall — lift finger to close'
+                            : 'Tap on wall (tap first point to close) · $_lassoPointCount pts')
                     : _activeTool == 'erase' ? 'Rub to remove areas' : 'Rub to add areas',
                 style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
                 textAlign: TextAlign.center))),
@@ -253,6 +266,34 @@ class _ARScreenState extends State<ARScreen> {
                     _miniToggle('Erase', _lassoMode == 'erase', () => setState(() => _lassoMode = 'erase')),
                     const SizedBox(width: 8),
                     _miniToggle('Paint', _lassoMode == 'paint', () => setState(() => _lassoMode = 'paint')),
+
+                    // EDIT 3: Tap/Pen toggle button
+                    const SizedBox(width: 12),
+                    GestureDetector(
+                      onTap: _toggleLassoFreehand,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: _lassoFreehand
+                              ? Colors.greenAccent.withOpacity(0.3)
+                              : Colors.white10,
+                          borderRadius: BorderRadius.circular(8),
+                          border: _lassoFreehand
+                              ? Border.all(color: Colors.greenAccent)
+                              : null),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(_lassoFreehand ? Icons.draw : Icons.touch_app,
+                              color: _lassoFreehand ? Colors.greenAccent : Colors.white54,
+                              size: 14),
+                          const SizedBox(width: 4),
+                          Text(_lassoFreehand ? 'Pen' : 'Tap',
+                              style: TextStyle(
+                                color: _lassoFreehand ? Colors.greenAccent : Colors.white54,
+                                fontSize: 11, fontWeight: FontWeight.w500)),
+                        ]),
+                      ),
+                    ),
+
                     const SizedBox(width: 12),
                     if (_lassoPointCount > 0)
                       GestureDetector(
