@@ -49,7 +49,9 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>OBOIA uses the camera and LiDAR to scan your room, identify walls and openings, and let you preview wallpapers in AR.</string>
+	<string>OBOIA needs camera access to scan your room and visualize wallpaper.</string>
+	<key>NSWorldSensingUsageDescription</key>
+	<string>OBOIA scans your room walls to show how wallpaper will look.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>OBOIA needs access to your photos so you can set a profile picture.</string>
 	<key>NSMicrophoneUsageDescription</key>
