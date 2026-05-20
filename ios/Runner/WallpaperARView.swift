@@ -1,22 +1,27 @@
-// WallpaperARView.swift — v10 — Plane-anchor architecture (IKEA Place / RoomPlan style)
+// WallpaperARView.swift — v11 (RoomPlan-based)
 //
-// What's different from previous versions:
-//   1. SCAN: LiDAR mesh wireframe (same as before, this works)
-//   2. STOP SCAN: collect ARPlaneAnchor verticals, build flat SCNPlanes per wall
-//   3. EDIT/PREVIEW: wallpaper renders on FLAT planes, brush/lasso edit 2D BITMAP MASK
-//   4. LiDAR mesh becomes invisible depth occluder (furniture hides wallpaper)
+// Architecture: Apple's RoomPlan framework detects walls as parametric rectangles
+// (clean corners, ruler-straight edges, ML-trained). We render wallpaper as flat
+// SCNPlanes from RoomPlan's CapturedRoom data. Brush and lasso edit a 2D bitmap
+// mask per wall — pixel-perfect edges by CGContext drawing.
 //
-// Critical guards (lessons from v7 failure):
-//   - Wallpaper planes ONLY exist after stopScan
-//   - Plane nodes are children of anchor node (no manual world positioning)
-//   - Minimum size filter: ignore tiny noise plane anchors
-//   - If no planes detected, fall back to old LiDAR-mesh-alpha path
+// Requires:
+//   - iOS 16.0 or later
+//   - LiDAR-equipped device
+//   - `import RoomPlan` (add RoomPlan.framework in Xcode → Target → Frameworks)
+//
+// Replace: ios/Runner/WallpaperARView.swift
+//
+// Dart-side API unchanged: setARMode, startScan, stopScan, enterCutMode/exitCutMode,
+// setBrushMode, setBrushSize, setWallpaperOpacity, lassoStart/End/AddPoint/Clear/Apply,
+// placeWallpaper, undoCut, clearAllCuts.
 
 import ARKit
 import AVFoundation
 import SceneKit
 import Flutter
 import UIKit
+import RoomPlan
 
 enum ARViewMode: String {
     case idle = "idle", scanning = "scanning", preview = "preview", legacy = "legacy"
@@ -32,30 +37,33 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private let textureCache = TextureCache.shared
 
     // ════════════════════════════════════════════════════════════
-    // STATE
+    // ROOMPLAN STATE
     // ════════════════════════════════════════════════════════════
 
-    // SCAN STATE: LiDAR mesh wireframe (visible during scanning only)
-    private var meshWireframeNodes: [UUID: SCNNode] = [:]
-    private var meshFrozen = false
+    private var roomCaptureSession: RoomCaptureSession?
+    private var latestCapturedRoom: CapturedRoom?
+    private var roomBuilder: RoomBuilder?
 
-    // OCCLUDER STATE: LiDAR mesh as invisible depth (visible during preview/edit)
-    private var occluderNodes: [UUID: SCNNode] = [:]
+    // ════════════════════════════════════════════════════════════
+    // WALL STATE — built after stopScan from CapturedRoom
+    // ════════════════════════════════════════════════════════════
 
-    // WALL STATE: flat planes that get wallpaper (built at stopScan)
     private struct Wall {
-        let anchorID: UUID
-        let node: SCNNode
+        let id: UUID                   // CapturedRoom.Surface.identifier
+        let node: SCNNode              // SCNPlane node positioned by transform
         let plane: SCNPlane
         var maskImage: UIImage         // alpha mask (white = visible wallpaper)
         var maskSize: CGSize           // pixels
         var wallSize: CGSize           // meters (width × height)
+        let transform: simd_float4x4   // world transform from CapturedRoom
     }
     private var walls: [UUID: Wall] = [:]
-    private let maskPxPerMeter: CGFloat = 256  // 4mm per pixel — plenty sharp
-    private let minWallArea: Float = 0.5       // m² — ignore tiny noise planes
+    private let maskPxPerMeter: CGFloat = 256
 
-    // BRUSH
+    // ════════════════════════════════════════════════════════════
+    // BRUSH / LASSO / WALLPAPER STATE
+    // ════════════════════════════════════════════════════════════
+
     private var brushMode: BrushMode = .erase
     private var brushRadiusMeters: Float = 0.08
     private var editModeActive = false
@@ -63,7 +71,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var brushStrokeStarted = false
     private var brushCursorNode: SCNNode?
 
-    // LASSO
     private var lassoModeActive = false
     private var lassoWorldPoints: [SIMD3<Float>] = []
     private var lassoDotNodes: [SCNNode] = []
@@ -71,11 +78,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var lassoClosed = false
     private var lastLassoBroadcast: TimeInterval = 0
 
-    // UNDO: snapshot is (anchorID, maskImage)
     private var undoStack: [(UUID, UIImage)] = []
     private let maxUndo = 30
 
-    // WALLPAPER
     private var wpAlbedo: UIImage?
     private var wpNormal: UIImage?
     private var wpRoughness: UIImage?
@@ -84,36 +89,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var wallpaperRollWidth: CGFloat = 0.53
     private var isWallpaperApplied = false
 
-    // Channel state
+    // Channel
     private var currentWallIndex: Int = 0
     private var panGesture: UIPanGestureRecognizer?
     private var eventSink: ((Any) -> Void)?
     private var pendingEvents: [[String: Any]] = []
 
-    // ════════════════════════════════════════════════════════════
-    // MATERIALS
-    // ════════════════════════════════════════════════════════════
-
-    private lazy var wireWall: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.65))
-    private lazy var wireCeil: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.25))
-    private lazy var wireFloor: SCNMaterial = makeWire(UIColor.white.withAlphaComponent(0.12))
-    private lazy var wireDoor: SCNMaterial = makeWire(UIColor(red:1,green:0.83,blue:0.41,alpha:0.5))
-
-    private func makeWire(_ color: UIColor) -> SCNMaterial {
-        let m = SCNMaterial(); m.fillMode = .lines
-        m.diffuse.contents = color; m.isDoubleSided = true; m.lightingModel = .constant; return m
-    }
-
-    private lazy var occluderMat: SCNMaterial = {
-        let m = SCNMaterial()
-        m.colorBufferWriteMask = []      // invisible
-        m.writesToDepthBuffer = true     // but writes depth
-        m.readsFromDepthBuffer = true
-        m.isDoubleSided = true
-        m.lightingModel = .constant
-        return m
-    }()
-
+    // Cursor texture
     private static let cursorRingImage: UIImage = {
         let size = CGSize(width: 256, height: 256)
         let r = UIGraphicsImageRenderer(size: size)
@@ -143,7 +125,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         super.init()
         eventChannel.setStreamHandler(self)
         sceneView.delegate = self
-        sceneView.session.delegate = self
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         pan.maximumNumberOfTouches = 1
@@ -156,14 +137,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     func view() -> UIView { sceneView }
 
     // ════════════════════════════════════════════════════════════
-    // ROUTER
+    // ROUTER (Dart-side API unchanged)
     // ════════════════════════════════════════════════════════════
 
     private func route(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any]
         switch call.method {
         case "initAR":       initAR(result: result)
-        case "disposeAR":    sceneView.session.pause(); result(nil)
+        case "disposeAR":    teardown(); result(nil)
         case "setARMode":
             if let m = call.arguments as? String { setARMode(m, result: result) }
             else { result(FlutterError(code: "BAD", message: "mode needed", details: nil)) }
@@ -217,7 +198,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // AR LIFECYCLE
+    // LIFECYCLE
     // ════════════════════════════════════════════════════════════
 
     private func initAR(result: @escaping FlutterResult) {
@@ -225,7 +206,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         if st == .notDetermined {
             AVCaptureDevice.requestAccess(for: .video) { [weak self] ok in
                 DispatchQueue.main.async {
-                    if ok { self?.runIdle(result: result) }
+                    if ok { self?.bootIdleSession(); result(nil) }
                     else { self?.emit("error", data: ["message": "Camera denied"])
                         result(FlutterError(code: "CAM", message: "denied", details: nil)) }
                 }
@@ -235,20 +216,20 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             emit("error", data: ["message": "Camera denied"])
             result(FlutterError(code: "CAM", message: "denied", details: nil)); return
         }
-        runIdle(result: result)
+        bootIdleSession()
+        result(nil)
     }
 
-    private func runIdle(result: @escaping FlutterResult) {
+    private func bootIdleSession() {
+        // Plain AR session until user taps Start Scan
         guard ARWorldTrackingConfiguration.isSupported else {
-            emit("error", data: ["message": "ARKit not supported"])
-            result(FlutterError(code: "NOAR", message: "no ARKit", details: nil)); return
+            emit("error", data: ["message": "ARKit not supported"]); return
         }
         let c = ARWorldTrackingConfiguration()
-        c.planeDetection = [.vertical]
+        c.planeDetection = []
         sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
         currentMode = .idle
-        emit("boot", data: ["status": "AR session running"])
-        result(nil)
+        emit("boot", data: ["status": "AR ready (v11 RoomPlan)"])
     }
 
     private func setARMode(_ mode: String, result: @escaping FlutterResult) {
@@ -257,81 +238,78 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         result(nil)
     }
 
+    private func teardown() {
+        roomCaptureSession?.stop(pauseARSession: true)
+        roomCaptureSession = nil
+        sceneView.session.pause()
+    }
+
     // ════════════════════════════════════════════════════════════
-    // SCAN — wireframe only, NO wallpaper planes yet
+    // SCAN — RoomCaptureSession with custom ARSCNView
     // ════════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan v10 <<<"])
-        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
-            emit("error", data: ["message": "LiDAR not supported"])
-            result(FlutterError(code: "NOLIDAR", message: "Need LiDAR", details: nil)); return
+        emit("boot", data: ["status": ">>> startScan v11 RoomPlan <<<"])
+
+        // RoomPlan availability check
+        guard RoomCaptureSession.isSupported else {
+            emit("error", data: ["message": "RoomPlan not supported (need LiDAR + iOS 16+)"])
+            result(FlutterError(code: "NOROOMPLAN", message: "Not supported", details: nil))
+            return
         }
 
-        // Clear ALL state
-        for (_, n) in meshWireframeNodes { n.removeFromParentNode() }
-        for (_, n) in occluderNodes { n.removeFromParentNode() }
+        // Clear ALL prior state
         for (_, w) in walls { w.node.removeFromParentNode() }
-        meshWireframeNodes.removeAll()
-        occluderNodes.removeAll()
         walls.removeAll()
         undoStack.removeAll()
+        latestCapturedRoom = nil
         isWallpaperApplied = false
-        meshFrozen = false
         editModeActive = false
-        endLassoMode()
         removeCursor()
+        endLassoMode()
         currentMode = .scanning
 
-        let c = ARWorldTrackingConfiguration()
-        c.planeDetection = [.vertical, .horizontal]
-        c.sceneReconstruction = .meshWithClassification
-        c.environmentTexturing = .automatic
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            c.frameSemantics.insert(.sceneDepth)
-        }
-        sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
+        // Build RoomCaptureSession bound to our ARSCNView's ARSession
+        let session = RoomCaptureSession()
+        session.delegate = self
+        roomCaptureSession = session
+        roomBuilder = RoomBuilder(options: [.beautifyObjects])
+
+        // CRITICAL: assign RoomPlan's ARSession to our ARSCNView so we still
+        // own the visualization while RoomPlan does wall detection
+        sceneView.session = session.arSession
+        sceneView.session.delegate = self
+
+        // Run scan
+        let config = RoomCaptureSession.Configuration()
+        session.run(configuration: config)
         emit("boot", data: ["status": "Scanning — move slowly across walls"])
         result(nil)
     }
 
     private func stopScan(result: @escaping FlutterResult) {
-        meshFrozen = true
-        currentMode = .preview
-
-        // Keep tracking, but no more plane updates after this point
-        let c = ARWorldTrackingConfiguration()
-        c.planeDetection = []
-        c.environmentTexturing = .automatic
-        sceneView.session.run(c, options: [])
-
-        // STAGE 1: Remove all wireframe nodes (LiDAR mesh becomes invisible occluder instead)
-        for (uuid, wireNode) in meshWireframeNodes {
-            wireNode.removeFromParentNode()
-            // Replace with invisible occluder geometry on the same parent (the ARMeshAnchor's node)
-            if let frame = sceneView.session.currentFrame,
-               let anchor = frame.anchors.first(where: { $0.identifier == uuid }) as? ARMeshAnchor,
-               let parentNode = sceneView.node(for: anchor),
-               let occGeo = buildOccluderGeometry(from: anchor) {
-                let occNode = SCNNode(geometry: occGeo)
-                occNode.renderingOrder = -100  // draw first so depth gates wallpaper
-                parentNode.addChildNode(occNode)
-                occluderNodes[uuid] = occNode
-            }
+        guard let session = roomCaptureSession else {
+            emit("error", data: ["message": "No scan in progress"])
+            result(nil); return
         }
-        meshWireframeNodes.removeAll()
+        // KEY: pauseARSession: false so AR tracking continues. Wallpaper stays anchored.
+        session.stop(pauseARSession: false)
+        currentMode = .preview
+        emit("boot", data: ["status": "Processing room..."])
+        // Walls get built in captureSession(_:didEndWith:error:) delegate below
+        result(nil)
+    }
 
-        // STAGE 2: Build flat wallpaper planes from detected vertical plane anchors
+    /// Process final CapturedRoom — build flat SCNPlanes for each wall
+    private func processFinalRoom(_ room: CapturedRoom) {
+        // Clear any walls left from a previous scan (shouldn't happen, but defensive)
+        for (_, w) in walls { w.node.removeFromParentNode() }
+        walls.removeAll()
+
         var wallsBuilt = 0
-        if let frame = sceneView.session.currentFrame {
-            for anchor in frame.anchors {
-                guard let pa = anchor as? ARPlaneAnchor,
-                      pa.alignment == .vertical else { continue }
-                let w = Float(pa.planeExtent.width)
-                let h = Float(pa.planeExtent.height)
-                let area = w * h
-                guard area >= minWallArea else { continue }  // skip noise
-                if buildWall(for: pa) { wallsBuilt += 1 }
+        for surface in room.walls {
+            if buildWall(from: surface, doors: room.doors, windows: room.windows, openings: room.openings) {
+                wallsBuilt += 1
             }
         }
 
@@ -342,10 +320,111 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             "wallsDetected": wallsBuilt
         ])
         emit("boot", data: ["status": "Done: \(wallsBuilt) walls, \(String(format: "%.1f", area)) m²"])
-        result(nil)
     }
 
-    /// Compute total opaque-mask area across all walls (m²)
+    /// Build a flat wallpaper plane from a CapturedRoom.Surface (wall).
+    /// Door/window/opening rectangles that lie on this wall get pre-cut from the mask.
+    private func buildWall(
+        from surface: CapturedRoom.Surface,
+        doors: [CapturedRoom.Surface],
+        windows: [CapturedRoom.Surface],
+        openings: [CapturedRoom.Surface]
+    ) -> Bool {
+        let wMeters = CGFloat(surface.dimensions.x)
+        let hMeters = CGFloat(surface.dimensions.y)
+        guard wMeters > 0.5 && hMeters > 0.5 else { return false }
+
+        // SCNPlane sized to wall
+        let plane = SCNPlane(width: wMeters, height: hMeters)
+        plane.cornerRadius = 0
+
+        // Build initial mask: opaque + cut holes for doors/windows/openings on this wall
+        let maskW = max(64, Int(wMeters * maskPxPerMeter))
+        let maskH = max(64, Int(hMeters * maskPxPerMeter))
+        let maskSize = CGSize(width: maskW, height: maskH)
+        let mask = buildInitialMask(
+            wallTransform: surface.transform,
+            wallSize: CGSize(width: wMeters, height: hMeters),
+            maskSize: maskSize,
+            doors: doors,
+            windows: windows,
+            openings: openings
+        )
+
+        // Material
+        let mat = buildWallMaterial(mask: mask, wallWidth: wMeters, wallHeight: hMeters)
+        plane.materials = [mat]
+
+        // Node positioned by surface.transform
+        let node = SCNNode(geometry: plane)
+        // CapturedRoom.Surface convention: transform.column[0]=right (X axis along width),
+        // column[1]=up (Y axis along height), column[2]=normal, column[3]=position.
+        // SCNPlane default orientation: width along X, height along Y, normal +Z.
+        // This matches the surface convention exactly → apply transform directly.
+        node.simdTransform = surface.transform
+
+        sceneView.scene.rootNode.addChildNode(node)
+
+        walls[surface.identifier] = Wall(
+            id: surface.identifier,
+            node: node,
+            plane: plane,
+            maskImage: mask,
+            maskSize: maskSize,
+            wallSize: CGSize(width: wMeters, height: hMeters),
+            transform: surface.transform
+        )
+        return true
+    }
+
+    /// Initial mask: white (opaque) everywhere, with door/window rectangles cut out.
+    private func buildInitialMask(
+        wallTransform: simd_float4x4,
+        wallSize: CGSize,
+        maskSize: CGSize,
+        doors: [CapturedRoom.Surface],
+        windows: [CapturedRoom.Surface],
+        openings: [CapturedRoom.Surface]
+    ) -> UIImage {
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1.0; fmt.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: maskSize, format: fmt)
+        let invWall = simd_inverse(wallTransform)
+
+        return renderer.image { ctx in
+            // Opaque background
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: maskSize))
+
+            // Cut holes for each door/window/opening that lies on this wall
+            let cutouts = doors + windows + openings
+            for cut in cutouts {
+                let cutCenter = SIMD3<Float>(cut.transform.columns.3.x,
+                                              cut.transform.columns.3.y,
+                                              cut.transform.columns.3.z)
+                // Transform cut center into wall's local space
+                let localH = invWall * SIMD4<Float>(cutCenter.x, cutCenter.y, cutCenter.z, 1.0)
+                let localCenter = SIMD3<Float>(localH.x, localH.y, localH.z)
+                // Skip cuts not roughly on this wall (more than 30cm off the plane)
+                if abs(localCenter.z) > 0.30 { continue }
+
+                let cutW = CGFloat(cut.dimensions.x)
+                let cutH = CGFloat(cut.dimensions.y)
+                // Convert to mask pixels (UV: local origin at center of wall)
+                let u = (CGFloat(localCenter.x) + wallSize.width / 2) / wallSize.width
+                let v = (CGFloat(localCenter.y) + wallSize.height / 2) / wallSize.height
+                let pxCenter = CGPoint(x: u * maskSize.width, y: (1 - v) * maskSize.height)
+                let pxW = cutW / wallSize.width * maskSize.width
+                let pxH = cutH / wallSize.height * maskSize.height
+                let rect = CGRect(x: pxCenter.x - pxW/2, y: pxCenter.y - pxH/2, width: pxW, height: pxH)
+
+                ctx.cgContext.setBlendMode(.destinationOut)
+                ctx.cgContext.setFillColor(UIColor.black.cgColor)
+                ctx.cgContext.fill(rect)
+            }
+        }
+    }
+
     private func totalArea() -> Float {
         var total: Float = 0
         for (_, w) in walls {
@@ -355,51 +434,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // WALL CREATION (only called from stopScan — never during scan)
-    // ════════════════════════════════════════════════════════════
-
-    private func buildWall(for anchor: ARPlaneAnchor) -> Bool {
-        guard let anchorNode = sceneView.node(for: anchor) else { return false }
-        let wMeters = CGFloat(anchor.planeExtent.width)
-        let hMeters = CGFloat(anchor.planeExtent.height)
-
-        // SCNPlane sized to wall
-        let plane = SCNPlane(width: wMeters, height: hMeters)
-        plane.cornerRadius = 0
-
-        // Initial mask: fully opaque (wallpaper covers entire wall)
-        let maskW = max(64, Int(wMeters * maskPxPerMeter))
-        let maskH = max(64, Int(hMeters * maskPxPerMeter))
-        let maskSize = CGSize(width: maskW, height: maskH)
-        let mask = makeOpaqueMask(size: maskSize)
-
-        // Wall material
-        let mat = buildWallMaterial(mask: mask, wallWidth: wMeters, wallHeight: hMeters)
-        plane.materials = [mat]
-
-        // Build node, attach to anchor node (so it follows the anchor's pose automatically)
-        let node = SCNNode(geometry: plane)
-        // Anchor pose is the plane's pose; anchor.center is the offset from anchor origin to plane center
-        node.simdPosition = anchor.center
-        // ARPlaneAnchor's local space: plane lies in XZ, normal is +Y.
-        // SCNPlane default lies in XY facing +Z.
-        // Rotate -90° around X so SCNPlane lies in XZ facing +Y → matches anchor.
-        node.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
-        anchorNode.addChildNode(node)
-
-        walls[anchor.identifier] = Wall(
-            anchorID: anchor.identifier,
-            node: node,
-            plane: plane,
-            maskImage: mask,
-            maskSize: maskSize,
-            wallSize: CGSize(width: wMeters, height: hMeters)
-        )
-        return true
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // MATERIAL BUILDER
+    // WALLPAPER MATERIAL
     // ════════════════════════════════════════════════════════════
 
     private func buildWallMaterial(mask: UIImage, wallWidth: CGFloat, wallHeight: CGFloat) -> SCNMaterial {
@@ -419,7 +454,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
             m.diffuse.contentsTransform = tileTransform
         } else {
-            // Edit-mode placeholder: yellow tint shows selection
             m.lightingModel = .constant
             m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
         }
@@ -436,13 +470,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             m.ambientOcclusion.contentsTransform = tileTransform
         }
 
-        // Mask = transparency channel. NOT tiled — stretches to wall extent.
+        // Mask = transparency channel (clamp, not tile)
         m.transparent.contents = mask
         m.transparent.wrapS = .clamp; m.transparent.wrapT = .clamp
 
-        // Global opacity
         m.transparency = isWallpaperApplied ? wallpaperOpacity : wallpaperOpacity * 0.7
-
         return m
     }
 
@@ -457,25 +489,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // MASK BITMAP HELPERS
+    // MASK BITMAP DRAWING
     // ════════════════════════════════════════════════════════════
 
-    private func makeOpaqueMask(size: CGSize) -> UIImage {
-        let r = UIGraphicsImageRenderer(size: size)
-        return r.image { ctx in
-            UIColor.white.setFill()
-            ctx.fill(CGRect(origin: .zero, size: size))
-        }
-    }
-
-    /// Paint a circle on a mask. erase=cut hole, paint=fill in
     private func paintCircle(on mask: UIImage, size: CGSize, center: CGPoint, radius: CGFloat, erase: Bool) -> UIImage {
-        let fmt = UIGraphicsImageRendererFormat()
-        fmt.scale = 1.0; fmt.opaque = false
+        let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1.0; fmt.opaque = false
         let r = UIGraphicsImageRenderer(size: size, format: fmt)
         return r.image { ctx in
             mask.draw(in: CGRect(origin: .zero, size: size))
-            let rect = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
+            let rect = CGRect(x: center.x - radius, y: center.y - radius, width: radius*2, height: radius*2)
             if erase {
                 ctx.cgContext.setBlendMode(.destinationOut)
                 ctx.cgContext.setFillColor(UIColor.black.cgColor)
@@ -488,10 +510,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
     }
 
-    /// Fill a polygon on a mask. erase=cut polygon out, paint=fill polygon in
     private func fillPolygon(on mask: UIImage, size: CGSize, polygon: [CGPoint], erase: Bool) -> UIImage {
-        let fmt = UIGraphicsImageRendererFormat()
-        fmt.scale = 1.0; fmt.opaque = false
+        let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1.0; fmt.opaque = false
         let r = UIGraphicsImageRenderer(size: size, format: fmt)
         return r.image { ctx in
             mask.draw(in: CGRect(origin: .zero, size: size))
@@ -521,7 +541,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         isWallpaperApplied = false
         createCursor()
         refreshAllWalls()
-        emit("boot", data: ["status": "Edit mode — brush or lasso"])
+        emit("boot", data: ["status": "Edit mode"])
     }
 
     private func exitEditMode() {
@@ -549,9 +569,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func resetMasks() {
-        for (id, var w) in walls {
-            w.maskImage = makeOpaqueMask(size: w.maskSize)
-            walls[id] = w
+        // Rebuild initial masks from CapturedRoom (re-cut doors/windows)
+        guard let room = latestCapturedRoom else { return }
+        for (id, w) in walls {
+            let fresh = buildInitialMask(
+                wallTransform: w.transform,
+                wallSize: w.wallSize,
+                maskSize: w.maskSize,
+                doors: room.doors, windows: room.windows, openings: room.openings)
+            var updated = w
+            updated.maskImage = fresh
+            walls[id] = updated
             refreshWall(id)
         }
         undoStack.removeAll()
@@ -560,7 +588,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // BRUSH CURSOR
+    // CURSOR
     // ════════════════════════════════════════════════════════════
 
     private func createCursor() {
@@ -598,12 +626,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // BRUSH HANDLING (uses SCNHitTest against wallpaper plane to get UV)
+    // BRUSH
     // ════════════════════════════════════════════════════════════
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
-        guard editModeActive else { return }
-        guard !lassoModeActive else { return }
+        guard editModeActive, !lassoModeActive else { return }
         let pt = gesture.location(in: sceneView)
 
         switch gesture.state {
@@ -612,7 +639,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             lastBrushPanLocation = pt
             applyBrushAt(pt)
         case .changed:
-            // Interpolate to avoid gaps for fast finger moves
             if let last = lastBrushPanLocation {
                 let dist = hypot(pt.x - last.x, pt.y - last.y)
                 if dist > 4 {
@@ -642,7 +668,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         ]
         let hits = sceneView.hitTest(screenPoint, options: opts)
         for hit in hits {
-            // Find the wall whose plane was hit
             var cur: SCNNode? = hit.node
             while let n = cur {
                 if let entry = walls.first(where: { $0.value.node === n }) {
@@ -656,7 +681,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func applyBrushHit(anchorID: UUID, hit: SCNHitTestResult) {
         guard var w = walls[anchorID] else { return }
-
         if !brushStrokeStarted {
             saveUndo(anchorID: anchorID, mask: w.maskImage)
             brushStrokeStarted = true
@@ -665,7 +689,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let uv = hit.textureCoordinates(withMappingChannel: 0)
         let maskW = w.maskSize.width
         let maskH = w.maskSize.height
-        // SCNPlane UV: (0,0) bottom-left. UIImage origin: top-left. Flip Y.
         let px = uv.x * maskW
         let py = (1 - uv.y) * maskH
 
@@ -673,8 +696,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let radiusPx = CGFloat(brushRadiusMeters) * pxPerMeterW
 
         let newMask = paintCircle(
-            on: w.maskImage,
-            size: w.maskSize,
+            on: w.maskImage, size: w.maskSize,
             center: CGPoint(x: px, y: py),
             radius: radiusPx,
             erase: (brushMode == .erase))
@@ -687,7 +709,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // LASSO (world-anchored 3D points, same UX as v9)
+    // LASSO
     // ════════════════════════════════════════════════════════════
 
     private func startLassoMode() {
@@ -716,20 +738,39 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private func addLassoPoint(_ screenPoint: CGPoint) {
         guard lassoModeActive, !lassoClosed else { return }
 
-        // Use ARKit raycast against detected planes (clean, since we have plane anchors)
+        // Strategy 1: SCNHitTest against wallpaper planes
         var world: SIMD3<Float>?
-        if let q = sceneView.raycastQuery(from: screenPoint, allowing: .existingPlaneGeometry, alignment: .vertical),
-           let r = sceneView.session.raycast(q).first {
-            world = SIMD3<Float>(r.worldTransform.columns.3.x, r.worldTransform.columns.3.y, r.worldTransform.columns.3.z)
-        } else if let q = sceneView.raycastQuery(from: screenPoint, allowing: .estimatedPlane, alignment: .vertical),
-                  let r = sceneView.session.raycast(q).first {
-            world = SIMD3<Float>(r.worldTransform.columns.3.x, r.worldTransform.columns.3.y, r.worldTransform.columns.3.z)
+        let opts: [SCNHitTestOption: Any] = [
+            .boundingBoxOnly: false,
+            .searchMode: SCNHitTestSearchMode.closest.rawValue,
+            .ignoreHiddenNodes: false
+        ]
+        let hits = sceneView.hitTest(screenPoint, options: opts)
+        for hit in hits {
+            var cur: SCNNode? = hit.node
+            while let n = cur {
+                if walls.values.contains(where: { $0.node === n }) {
+                    world = SIMD3<Float>(Float(hit.worldCoordinates.x),
+                                         Float(hit.worldCoordinates.y),
+                                         Float(hit.worldCoordinates.z))
+                    break
+                }
+                cur = n.parent
+            }
+            if world != nil { break }
+        }
+        // Strategy 2: ARKit vertical plane raycast (fallback)
+        if world == nil {
+            if let q = sceneView.raycastQuery(from: screenPoint, allowing: .estimatedPlane, alignment: .vertical),
+               let r = sceneView.session.raycast(q).first {
+                world = SIMD3<Float>(r.worldTransform.columns.3.x, r.worldTransform.columns.3.y, r.worldTransform.columns.3.z)
+            }
         }
         guard let pickedWorld = world else {
             emit("boot", data: ["status": "Tap on wall"]); return
         }
 
-        // Close-loop check (10cm tolerance in 3D)
+        // Close-loop check
         if lassoWorldPoints.count >= 3 {
             if simd_distance(lassoWorldPoints[0], pickedWorld) < 0.10 {
                 lassoClosed = true
@@ -781,11 +822,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let up = SIMD3<Float>(0, 1, 0)
         let nd = simd_normalize(dir)
         let d = simd_dot(up, nd)
-        if d > 0.9999 {
-            // aligned
-        } else if d < -0.9999 {
-            n.eulerAngles = SCNVector3(Float.pi, 0, 0)
-        } else {
+        if d > 0.9999 { /* aligned */ }
+        else if d < -0.9999 { n.eulerAngles = SCNVector3(Float.pi, 0, 0) }
+        else {
             let axis = simd_normalize(simd_cross(up, nd))
             n.simdRotation = SIMD4<Float>(axis.x, axis.y, axis.z, acos(d))
         }
@@ -807,44 +846,22 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         emit("lassoScreenPoints", data: ["points": pts])
     }
 
-    /// Apply lasso: project polygon onto each wall's plane, convert to mask UV, fill polygon
     private func applyLasso(mode: String) {
         guard lassoWorldPoints.count >= 3 else {
             emit("boot", data: ["status": "Need 3+ points"]); return
         }
-        guard let frame = sceneView.session.currentFrame else { return }
         let isErase = (mode == "erase")
 
         for (anchorID, w) in walls {
-            let wallTransform = w.node.simdWorldTransform
-            let planeNormal = SIMD3<Float>(wallTransform.columns.2.x, wallTransform.columns.2.y, wallTransform.columns.2.z)
-            let planeOrigin = SIMD3<Float>(wallTransform.columns.3.x, wallTransform.columns.3.y, wallTransform.columns.3.z)
-            let invWorld = simd_inverse(wallTransform)
-
+            let invWall = simd_inverse(w.transform)
+            // Project each lasso world point into this wall's local 2D, build a polygon in mask pixels
             var uvPoly: [CGPoint] = []
             for wp in lassoWorldPoints {
-                // Use the world point directly — it's already on a wall surface
-                // Transform to wall's local space
-                let localH = invWorld * SIMD4<Float>(wp.x, wp.y, wp.z, 1.0)
-                // Check the point is roughly on this wall's plane (within 10cm)
-                let toPoint = wp - planeOrigin
-                let dist = abs(simd_dot(toPoint, planeNormal))
-                guard dist < 0.15 else {
-                    // Point not on this wall — project it via screen ray onto this wall's plane
-                    let sp = sceneView.projectPoint(SCNVector3(wp.x, wp.y, wp.z))
-                    let screenPt = CGPoint(x: CGFloat(sp.x), y: CGFloat(sp.y))
-                    if let projected = projectScreenOntoPlane(
-                        screenPoint: screenPt, planeOrigin: planeOrigin,
-                        planeNormal: planeNormal, frame: frame) {
-                        let localH2 = invWorld * SIMD4<Float>(projected.x, projected.y, projected.z, 1.0)
-                        let u = (CGFloat(localH2.x) + w.wallSize.width/2) / w.wallSize.width
-                        let v = (CGFloat(localH2.y) + w.wallSize.height/2) / w.wallSize.height
-                        uvPoly.append(CGPoint(x: u * w.maskSize.width, y: (1 - v) * w.maskSize.height))
-                    }
-                    continue
-                }
-                let u = (CGFloat(localH.x) + w.wallSize.width/2) / w.wallSize.width
-                let v = (CGFloat(localH.y) + w.wallSize.height/2) / w.wallSize.height
+                let localH = invWall * SIMD4<Float>(wp.x, wp.y, wp.z, 1.0)
+                // If too far off the wall plane (>30cm), skip — point belongs to another wall
+                if abs(localH.z) > 0.30 { continue }
+                let u = (CGFloat(localH.x) + w.wallSize.width / 2) / w.wallSize.width
+                let v = (CGFloat(localH.y) + w.wallSize.height / 2) / w.wallSize.height
                 uvPoly.append(CGPoint(x: u * w.maskSize.width, y: (1 - v) * w.maskSize.height))
             }
             guard uvPoly.count >= 3 else { continue }
@@ -860,30 +877,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         clearLassoPoints()
         emit("selectionChanged", data: ["area": totalArea()])
         emit("boot", data: ["status": wasClosed ? "Lasso applied ✅" : "Lasso applied"])
-    }
-
-    private func projectScreenOntoPlane(
-        screenPoint: CGPoint, planeOrigin: SIMD3<Float>,
-        planeNormal: SIMD3<Float>, frame: ARFrame
-    ) -> SIMD3<Float>? {
-        let vs = sceneView.bounds.size
-        let camT = frame.camera.transform
-        let proj = frame.camera.projectionMatrix(for: .portrait, viewportSize: vs, zNear: 0.001, zFar: 1000)
-        let ndcX = Float((screenPoint.x / vs.width) * 2 - 1)
-        let ndcY = Float(-((screenPoint.y / vs.height) * 2 - 1))
-        let invProj = simd_inverse(proj)
-        let near4 = invProj * SIMD4<Float>(ndcX, ndcY, -1, 1)
-        let far4 = invProj * SIMD4<Float>(ndcX, ndcY, 1, 1)
-        let nearW4 = camT * (near4 / near4.w)
-        let farW4 = camT * (far4 / far4.w)
-        let nearW = SIMD3<Float>(nearW4.x, nearW4.y, nearW4.z)
-        let farW = SIMD3<Float>(farW4.x, farW4.y, farW4.z)
-        let rayDir = simd_normalize(farW - nearW)
-        let denom = simd_dot(planeNormal, rayDir)
-        guard abs(denom) > 1e-6 else { return nil }
-        let t = simd_dot(planeOrigin - nearW, planeNormal) / denom
-        guard t > 0 else { return nil }
-        return nearW + rayDir * t
     }
 
     // ════════════════════════════════════════════════════════════
@@ -931,108 +924,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // OCCLUDER GEOMETRY (LiDAR mesh → invisible depth surface)
-    // ════════════════════════════════════════════════════════════
-
-    private func buildOccluderGeometry(from anchor: ARMeshAnchor) -> SCNGeometry? {
-        let g = anchor.geometry
-        let vCount = g.vertices.count
-        let fCount = g.faces.count
-        guard vCount > 0, fCount > 0 else { return nil }
-
-        var verts = [SCNVector3](); verts.reserveCapacity(vCount)
-        let vS = g.vertices
-        for i in 0..<vCount {
-            let p = vS.buffer.contents().advanced(by: vS.offset + vS.stride * i)
-                .assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            verts.append(SCNVector3(p.x, p.y, p.z))
-        }
-
-        // Skip wall-classified faces (let plane anchors handle walls; mesh occludes other objects)
-        let fEl = g.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
-        let cOpt = g.classification
-        var idx: [UInt32] = []
-        for f in 0..<fCount {
-            var isWall = false
-            if let c = cOpt {
-                let cv = c.buffer.contents().advanced(by: c.offset + c.stride * f)
-                    .assumingMemoryBound(to: UInt8.self).pointee
-                isWall = (ARMeshClassification(rawValue: Int(cv)) == .wall)
-            }
-            if isWall { continue }
-            for j in 0..<ipf {
-                let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
-                if bpi == 4 { idx.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
-                else { idx.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
-            }
-        }
-        guard !idx.isEmpty else { return nil }
-
-        let vertSrc = SCNGeometrySource(vertices: verts)
-        let idxData = Data(bytes: idx, count: idx.count * 4)
-        let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
-            primitiveCount: idx.count / 3, bytesPerIndex: 4)
-        let geom = SCNGeometry(sources: [vertSrc], elements: [element])
-        geom.materials = [occluderMat]
-        return geom
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // SCAN GEOMETRY (mesh wireframe — only during .scanning)
-    // ════════════════════════════════════════════════════════════
-
-    private func buildScanWireframe(from anchor: ARMeshAnchor) -> SCNGeometry? {
-        let geo = anchor.geometry
-        guard geo.vertices.count > 0, geo.faces.count > 0 else { return nil }
-
-        var verts = [SCNVector3]()
-        let vS = geo.vertices
-        for i in 0..<vS.count {
-            let p = vS.buffer.contents().advanced(by: vS.offset + vS.stride * i)
-                .assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            verts.append(SCNVector3(p.x, p.y, p.z))
-        }
-
-        let cOpt = geo.classification
-        let fEl = geo.faces; let bpi = fEl.bytesPerIndex; let ipf = fEl.indexCountPerPrimitive
-
-        var wI: [UInt32] = [], cI: [UInt32] = [], fI: [UInt32] = [], dI: [UInt32] = []
-        for f in 0..<fEl.count {
-            var cls: ARMeshClassification = .none
-            if let c = cOpt {
-                let cv = c.buffer.contents().advanced(by: c.offset + c.stride * f)
-                    .assumingMemoryBound(to: UInt8.self).pointee
-                cls = ARMeshClassification(rawValue: Int(cv)) ?? .none
-            }
-            var tri: [UInt32] = []
-            for j in 0..<ipf {
-                let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
-                if bpi == 4 { tri.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
-                else { tri.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
-            }
-            switch cls {
-            case .wall: wI.append(contentsOf: tri)
-            case .ceiling: cI.append(contentsOf: tri)
-            case .floor: fI.append(contentsOf: tri)
-            case .door, .window: dI.append(contentsOf: tri)
-            default: break
-            }
-        }
-
-        let src = SCNGeometrySource(vertices: verts)
-        var els: [SCNGeometryElement] = [], mats: [SCNMaterial] = []
-        func addEl(_ i: [UInt32], _ m: SCNMaterial) {
-            guard !i.isEmpty else { return }
-            els.append(SCNGeometryElement(data: Data(bytes: i, count: i.count * 4),
-                primitiveType: .triangles, primitiveCount: i.count / 3, bytesPerIndex: 4))
-            mats.append(m)
-        }
-        addEl(wI, wireWall); addEl(cI, wireCeil); addEl(fI, wireFloor); addEl(dI, wireDoor)
-        guard !els.isEmpty else { return nil }
-        let g = SCNGeometry(sources: [src], elements: els); g.materials = mats; return g
-    }
-
-    // ════════════════════════════════════════════════════════════
     // EVENTS
     // ════════════════════════════════════════════════════════════
 
@@ -1055,53 +946,48 @@ extension WallpaperARView: FlutterStreamHandler {
     func onCancel(withArguments arguments: Any?) -> FlutterError? { eventSink = nil; return nil }
 }
 
-// MARK: - AR Delegates
+// MARK: - RoomCaptureSessionDelegate
 
-extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
+extension WallpaperARView: RoomCaptureSessionDelegate {
+    func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
+        // Live updates during scan — keep track of latest detected room
+        DispatchQueue.main.async { [weak self] in
+            self?.latestCapturedRoom = room
+            let walls = room.walls.count
+            self?.emit("boot", data: ["status": "Scanning: \(walls) walls"])
+        }
+    }
+
+    func captureSession(_ session: RoomCaptureSession, didEndWith data: CapturedRoomData, error: Error?) {
+        if let e = error {
+            emit("error", data: ["message": "Scan failed: \(e.localizedDescription)"])
+            return
+        }
+        // Process final room data with RoomBuilder for highest quality
+        Task { [weak self] in
+            guard let self = self, let builder = self.roomBuilder else { return }
+            do {
+                let finalRoom = try await builder.capturedRoom(from: data)
+                await MainActor.run { [weak self] in
+                    guard let self = self else { return }
+                    self.latestCapturedRoom = finalRoom
+                    self.processFinalRoom(finalRoom)
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.emit("error", data: ["message": "Build failed: \(error.localizedDescription)"])
+                }
+            }
+        }
+    }
+}
+
+// MARK: - ARSessionDelegate / ARSCNViewDelegate
+
+extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         if lassoModeActive && !lassoWorldPoints.isEmpty {
             broadcastLassoScreenPoints()
-        }
-    }
-
-    func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
-        // ONLY during scan: render LiDAR mesh wireframe
-        if let ma = anchor as? ARMeshAnchor, !meshFrozen, currentMode == .scanning {
-            guard let geo = buildScanWireframe(from: ma) else { return }
-            let n = SCNNode(geometry: geo)
-            node.addChildNode(n)
-            DispatchQueue.main.async { [weak self] in
-                self?.meshWireframeNodes[ma.identifier] = n
-                let c = self?.meshWireframeNodes.count ?? 0
-                if c % 3 == 0 { self?.emit("boot", data: ["status": "Scanning: \(c) mesh"]) }
-            }
-        }
-        // Plane anchors are tracked silently during scan; we don't render them yet
-    }
-
-    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
-        if let ma = anchor as? ARMeshAnchor, !meshFrozen, currentMode == .scanning {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, let n = self.meshWireframeNodes[ma.identifier],
-                      let g = self.buildScanWireframe(from: ma) else { return }
-                n.geometry = g
-            }
-        }
-    }
-
-    func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
-        if let ma = anchor as? ARMeshAnchor {
-            DispatchQueue.main.async { [weak self] in
-                self?.meshWireframeNodes[ma.identifier]?.removeFromParentNode()
-                self?.meshWireframeNodes.removeValue(forKey: ma.identifier)
-                self?.occluderNodes[ma.identifier]?.removeFromParentNode()
-                self?.occluderNodes.removeValue(forKey: ma.identifier)
-            }
-        } else if let pa = anchor as? ARPlaneAnchor {
-            DispatchQueue.main.async { [weak self] in
-                self?.walls[pa.identifier]?.node.removeFromParentNode()
-                self?.walls.removeValue(forKey: pa.identifier)
-            }
         }
     }
 }
