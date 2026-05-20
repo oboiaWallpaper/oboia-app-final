@@ -432,6 +432,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // BRUSH
+    // ════════════════════════════════════════════════════════════
+    // EDIT 2: smoothAllBoundaries() called on stroke end
+    // ════════════════════════════════════════════════════════════
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
         guard editModeActive else { return }
         guard !lassoModeActive else { return }
@@ -458,6 +461,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case .ended, .cancelled:
             lastBrushWorld = nil
             brushCursorNode?.isHidden = true
+            // ★ EDGE REFINEMENT: smooth boundary fuzz after brush stroke
+            smoothAllBoundaries()
             totalSelectedAreaSqm = computeArea()
             emit("selectionChanged", data: ["area": totalSelectedAreaSqm])
         default: break
@@ -503,6 +508,47 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             if changed { vertexAlpha[uuid] = alpha; rebuilt.insert(uuid) }
         }
         for uuid in rebuilt { rebuildMesh(for: uuid) }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // EDIT 3: smoothAllBoundaries helper
+    // ════════════════════════════════════════════════════════════
+    /// Apply boundary smoothing to all mesh anchors. Called after brush strokes
+    /// and lasso applies to clean up jagged edges.
+    private func smoothAllBoundaries() {
+        guard let frame = sceneView.session.currentFrame else { return }
+        for anchor in frame.anchors {
+            guard let ma = anchor as? ARMeshAnchor else { continue }
+            let uuid = ma.identifier
+            guard var alpha = vertexAlpha[uuid] else { continue }
+
+            // Build adjacency from this anchor's triangle indices
+            let geo = ma.geometry
+            let fEl = geo.faces
+            let bpi = fEl.bytesPerIndex
+            let ipf = fEl.indexCountPerPrimitive
+            var indices: [UInt32] = []
+            indices.reserveCapacity(fEl.count * ipf)
+            for f in 0..<fEl.count {
+                for j in 0..<ipf {
+                    let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
+                    if bpi == 4 {
+                        indices.append(p.assumingMemoryBound(to: UInt32.self).pointee)
+                    } else {
+                        indices.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee))
+                    }
+                }
+            }
+            let adjacency = EdgeRefiner.buildAdjacency(
+                vertexCount: alpha.count,
+                triangleIndices: indices
+            )
+            // Morphological clean removes spikes, smoothBoundary handles transitions
+            alpha = EdgeRefiner.morphologicalClean(alpha: alpha, adjacency: adjacency)
+            alpha = EdgeRefiner.smoothBoundary(alpha: alpha, adjacency: adjacency, iterations: 1)
+            vertexAlpha[uuid] = alpha
+            rebuildMesh(for: uuid)
+        }
     }
 
     // ════════════════════════════════════════════════════════════
@@ -714,6 +760,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         emit("lassoScreenPoints", data: ["points": screenPts])
     }
 
+    // ════════════════════════════════════════════════════════════
+    // EDIT 1: applyLasso with EdgeRefiner snap after pointInPolygon loop
+    // ════════════════════════════════════════════════════════════
     private func applyLasso(mode: String) {
         guard lassoWorldPoints.count >= 3 else {
             emit("boot", data: ["status": "Need 3+ points"]); return
@@ -744,7 +793,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                     }
                 }
             }
-            if changed { vertexAlpha[uuid] = alpha }
+            if changed {
+                // ★ EDGE REFINEMENT: snap edges to the 3D lasso lines for ruler-straight result
+                alpha = EdgeRefiner.snapToLassoLines(
+                    alpha: alpha,
+                    vertexPositions: positions,
+                    polygonWorldPoints: lassoWorldPoints,
+                    mode: mode,
+                    snapDistance: 0.06
+                )
+                vertexAlpha[uuid] = alpha
+            }
         }
 
         let wasClosedJustNow = lassoClosed
@@ -875,7 +934,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         } else {
             m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
             m.lightingModel = .constant
-            m.transparency = wallpaperOpacity * 0.6  // make selection visibility scale with slider
+            m.transparency = wallpaperOpacity * 0.6
         }
         return m
     }
