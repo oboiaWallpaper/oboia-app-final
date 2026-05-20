@@ -74,9 +74,9 @@ workflows:
             end
           end
           project.save
-          puts 'Set deployment target to iOS 17.0'
+          puts 'Set deployment target to iOS 16.0'
           RUBY
-          sed -i '' 's/platform :ios, .*/platform :ios, '\''17.0'\''/' ios/Podfile
+          sed -i '' 's/platform :ios, .*/platform :ios, '\''16.0'\''/' ios/Podfile
       - name: Clean EVERYTHING (force Swift recompile)
         script: |
           echo "=== Cleaning Flutter ==="
