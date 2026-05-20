@@ -571,6 +571,13 @@ class ARService {
     await _channel.invokeMethod<void>('lassoApply', {'mode': mode});
   }
 
+  /// Toggle freehand (pen) mode for lasso.
+  /// true = pen/freehand, false = tap mode (default)
+  Future<void> lassoSetFreehand(bool freehand) async {
+    dlog('AR-DART', 'lassoSetFreehand $freehand');
+    await _channel.invokeMethod<void>('lassoSetFreehand', freehand);
+  }
+
   /// Pause AR session (freezes camera view, used for lasso drawing)
   Future<void> pauseSession() async {
     dlog('AR-DART', 'pauseSession');
