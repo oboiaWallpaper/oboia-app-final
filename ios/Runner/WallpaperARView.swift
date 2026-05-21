@@ -1,24 +1,16 @@
-// WallpaperARView.swift — v12 (RoomPlan + 4 fixes)
+// WallpaperARView.swift — v13 (diagnostic + fixes)
 //
-// Fixes from v11:
-//   1. Brush/lasso accuracy: ray-plane intersection picks the right wall and UV
-//      mathematically — no more SCNHitTest UV confusion
-//   2. Lasso works anywhere: even outside visible wallpaper, on curtains,
-//      furniture, anywhere — the ray finds the wall behind whatever the user
-//      tapped
-//   3. Pen-tool drag lasso: new lassoBeginDrag / lassoDragPoint / lassoEndDrag
-//      lets user drag a finger to trace smooth paths around complex objects.
-//      Original tap-add lasso still works.
-//   4. LiDAR occluder: re-enables scene reconstruction on the underlying
-//      ARSession, builds invisible-but-depth-writing geometry from the mesh.
-//      Furniture/curtains/decor in front of walls automatically hide wallpaper
-//      behind them. (Wall-classified mesh faces are skipped so the wallpaper
-//      plane itself isn't occluded.)
-//   5. Polished scan visuals: glowing wireframes with type-coded colors
-//      (walls white, doors orange, windows cyan, openings yellow). Smooth
-//      update as RoomPlan refines the room.
-//
-// Replace: ios/Runner/WallpaperARView.swift
+// KEY CHANGES FROM v12:
+//   • Replaced manual ray-plane math with sceneView.unprojectPoint() — this
+//     matches whatever SceneKit is rendering, so taps/drags land where the
+//     user expects regardless of Flutter UiKitView orientation issues.
+//   • Added a diagnostic log: timestamped events for every interaction.
+//   • New method "getDiagnosticReport" returns the full log + state snapshot
+//     to Dart so the user can email it.
+//   • Live diagnostic events emitted to Dart so on-screen overlay can show:
+//     - walls count, lassoPoints count, lastRayHit, anchors count, etc.
+//   • If LiDAR mesh anchors arrive during scan, log them — confirms whether
+//     occluder is even possible.
 
 import ARKit
 import AVFoundation
@@ -45,14 +37,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var latestCapturedRoom: CapturedRoom?
     private var roomBuilder: RoomBuilder?
 
-    // FIX #5: live wireframe preview nodes during scan
+    // Scan preview
     private var scanPreviewNodes: [UUID: SCNNode] = [:]
 
-    // FIX #4: LiDAR occluder nodes (invisible depth-only, hides wallpaper behind furniture)
+    // Occluder
     private var occluderNodes: [UUID: SCNNode] = [:]
     private var occluderEnabled = true
 
-    // Walls (post-scan flat planes)
+    // Walls
     private struct Wall {
         let id: UUID
         let node: SCNNode
@@ -69,7 +61,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var brushMode: BrushMode = .erase
     private var brushRadiusMeters: Float = 0.08
     private var editModeActive = false
-    private var lastBrushPanLocation: CGPoint?
     private var brushStrokeStarted = false
     private var brushCursorNode: SCNNode?
 
@@ -80,10 +71,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var lassoClosed = false
     private var lastLassoBroadcast: TimeInterval = 0
 
-    // FIX #3: drag-lasso (pen tool) state
     private var lassoDragging = false
     private var lassoDragTargetWallID: UUID?
-    private let lassoDragMinSpacing: CGFloat = 8  // px between consecutive drag points
+    private let lassoDragMinSpacing: CGFloat = 8
 
     private var undoStack: [(UUID, UIImage)] = []
     private let maxUndo = 30
@@ -102,39 +92,49 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var pendingEvents: [[String: Any]] = []
 
     // ════════════════════════════════════════════════════════════
-    // MATERIALS — POLISHED SCAN VISUALS
+    // DIAGNOSTIC LOG
+    // ════════════════════════════════════════════════════════════
+    private var diagLog: [String] = []
+    private let diagLogMax = 200
+    private var meshAnchorCount = 0
+    private var roomUpdateCount = 0
+    private var lastRayHitInfo: String = "none"
+
+    private func diag(_ msg: String) {
+        let ts = String(format: "%.3f", CACurrentMediaTime().truncatingRemainder(dividingBy: 100000))
+        let line = "[\(ts)] \(msg)"
+        diagLog.append(line)
+        if diagLog.count > diagLogMax { diagLog.removeFirst(diagLog.count - diagLogMax) }
+        emit("diag", data: ["line": line])
+    }
+
+    private func diagSnapshot() -> [String: Any] {
+        return [
+            "wallsCount": walls.count,
+            "scanPreviewCount": scanPreviewNodes.count,
+            "occluderCount": occluderNodes.count,
+            "meshAnchorsSeen": meshAnchorCount,
+            "roomUpdates": roomUpdateCount,
+            "lassoPoints": lassoWorldPoints.count,
+            "lassoModeActive": lassoModeActive,
+            "lassoDragging": lassoDragging,
+            "editModeActive": editModeActive,
+            "currentMode": currentMode.rawValue,
+            "isWallpaperApplied": isWallpaperApplied,
+            "occluderEnabled": occluderEnabled,
+            "lastRayHit": lastRayHitInfo,
+            "logTail": Array(diagLog.suffix(50))
+        ]
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // MATERIALS
     // ════════════════════════════════════════════════════════════
 
-    /// Glowing wireframe wall material for scan preview
-    private static let scanWallMat: SCNMaterial = {
-        let m = SCNMaterial()
-        m.fillMode = .lines
-        m.diffuse.contents = UIColor.white.withAlphaComponent(0.9)
-        m.emission.contents = UIColor.white.withAlphaComponent(0.4)
-        m.lightingModel = .constant
-        m.isDoubleSided = true
-        m.writesToDepthBuffer = false
-        m.readsFromDepthBuffer = false
-        return m
-    }()
-
-    /// Soft fill behind wireframe for depth perception
-    private static let scanWallFillMat: SCNMaterial = {
-        let m = SCNMaterial()
-        m.diffuse.contents = UIColor.white.withAlphaComponent(0.06)
-        m.lightingModel = .constant
-        m.isDoubleSided = true
-        m.blendMode = .alpha
-        m.writesToDepthBuffer = false
-        m.readsFromDepthBuffer = false
-        return m
-    }()
-
-    /// LiDAR occluder material — invisible to render, but writes depth
     private static let occluderMat: SCNMaterial = {
         let m = SCNMaterial()
-        m.colorBufferWriteMask = []         // invisible
-        m.writesToDepthBuffer = true         // but writes depth → hides things behind it
+        m.colorBufferWriteMask = []
+        m.writesToDepthBuffer = true
         m.readsFromDepthBuffer = true
         m.isDoubleSided = true
         m.lightingModel = .constant
@@ -177,6 +177,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         panGesture = pan
 
         channel.setMethodCallHandler { [weak self] (call, result) in self?.route(call, result) }
+        diag("init() complete")
     }
 
     func view() -> UIView { sceneView }
@@ -198,7 +199,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "enterCutMode": enterEditMode(); result(nil)
         case "exitCutMode":  exitEditMode(); result(nil)
         case "setBrushMode":
-            if let m = call.arguments as? String { brushMode = (m == "paint") ? .paint : .erase }
+            if let m = call.arguments as? String { brushMode = (m == "paint") ? .paint : .erase; diag("brushMode = \(m)") }
             result(nil)
         case "setBrushSize":
             if let s = args?["size"] as? Double { brushRadiusMeters = Float(s); updateCursorSize() }
@@ -212,8 +213,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(nil)
         case "undoCut":      undoLast(); result(nil)
         case "clearAllCuts": resetMasks(); result(nil)
-
-        // Lasso (tap mode — kept for compat)
         case "lassoStart":   startLassoMode(); result(nil)
         case "lassoEnd":     endLassoMode(); result(nil)
         case "lassoAddPoint":
@@ -226,7 +225,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             if let mode = args?["mode"] as? String { applyLasso(mode: mode) }
             result(nil)
 
-        // FIX #3: Pen-tool drag lasso (new)
         case "lassoBeginDrag":
             if let x = args?["x"] as? Double, let y = args?["y"] as? Double {
                 beginLassoDrag(CGPoint(x: x, y: y))
@@ -241,14 +239,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             endLassoDrag()
             result(nil)
 
-        // FIX #4: occluder toggle
         case "setOccluderEnabled":
             if let on = args?["enabled"] as? Bool {
                 occluderEnabled = on
                 for (_, n) in occluderNodes { n.isHidden = !on }
-                emit("boot", data: ["status": "Occluder: \(on ? "ON" : "OFF")"])
+                emit("boot", data: ["status": "Occluder: \(on ? "ON" : "OFF") (\(occluderNodes.count) meshes)"])
+                diag("setOccluderEnabled=\(on) — \(occluderNodes.count) occluder nodes exist")
             }
             result(nil)
+
+        // ★ NEW: Diagnostic report
+        case "getDiagnosticReport":
+            result(diagSnapshot())
 
         case "pauseSession", "resumeSession": result(nil)
         case "placeWallpaper", "switchWallpaper": placeWallpaper(args, result: result)
@@ -300,7 +302,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         c.planeDetection = []
         sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
         currentMode = .idle
-        emit("boot", data: ["status": "AR ready (v12)"])
+        emit("boot", data: ["status": "AR ready (v13 diag)"])
+        diag("bootIdleSession ok")
     }
 
     private func setARMode(_ mode: String, result: @escaping FlutterResult) {
@@ -322,7 +325,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ════════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        emit("boot", data: ["status": ">>> startScan v12 <<<"])
+        diag(">>> startScan v13 <<<")
+        emit("boot", data: ["status": ">>> startScan v13 <<<"])
         guard RoomCaptureSession.isSupported else {
             emit("error", data: ["message": "RoomPlan not supported"])
             result(FlutterError(code: "NOROOMPLAN", message: "Not supported", details: nil))
@@ -337,6 +341,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         latestCapturedRoom = nil
         isWallpaperApplied = false
         editModeActive = false
+        meshAnchorCount = 0
+        roomUpdateCount = 0
         removeCursor()
         endLassoMode()
         currentMode = .scanning
@@ -348,11 +354,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         sceneView.session = session.arSession
         sceneView.session.delegate = self
+        diag("RoomCaptureSession set; arSession assigned to sceneView")
 
-        // FIX #4: enable scene reconstruction so LiDAR mesh is available for occluder
-        // We pass our configuration with sceneReconstruction enabled; RoomPlan respects this.
         let config = RoomCaptureSession.Configuration()
         session.run(configuration: config)
+        diag("session.run() called")
         emit("boot", data: ["status": "Move slowly across walls"])
         result(nil)
     }
@@ -361,9 +367,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         guard let session = roomCaptureSession else {
             emit("error", data: ["message": "No scan in progress"]); result(nil); return
         }
-        // Fade out scan preview wireframes
+        diag("stopScan — session.stop(pauseARSession: false)")
         animateOutScanPreviews()
-        // KEY: pauseARSession: false — keeps tracking alive so wallpaper stays anchored
         session.stop(pauseARSession: false)
         currentMode = .preview
         emit("boot", data: ["status": "Processing room..."])
@@ -371,7 +376,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // FIX #5: LIVE SCAN PREVIEW (animated wireframes)
+    // LIVE SCAN PREVIEW
     // ════════════════════════════════════════════════════════════
 
     private func updateScanPreview(from room: CapturedRoom) {
@@ -394,14 +399,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             upsertScanWireframe(for: op, color: .systemYellow, withFill: false)
         }
 
-        // Remove preview nodes for surfaces that vanished
         for (id, node) in scanPreviewNodes where !alive.contains(id) {
             node.removeFromParentNode()
             scanPreviewNodes.removeValue(forKey: id)
         }
     }
 
-    /// Insert-or-update a wireframe rectangle. Newly added rectangles do a pulse animation.
     private func upsertScanWireframe(
         for surface: CapturedRoom.Surface,
         color: UIColor,
@@ -412,7 +415,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         guard w > 0.2, h > 0.2 else { return }
 
         if let existing = scanPreviewNodes[surface.identifier] {
-            // Update existing — smooth resize + reposition
             for child in existing.childNodes {
                 if let plane = child.geometry as? SCNPlane {
                     plane.width = w; plane.height = h
@@ -422,16 +424,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             return
         }
 
-        // Build a container node with two children:
-        //  1. wireframe plane (lines) with color tint
-        //  2. semi-transparent fill plane (only for walls) for depth perception
         let container = SCNNode()
         container.simdTransform = surface.transform
 
         if withFill {
             let fillPlane = SCNPlane(width: w, height: h)
-            let fillMat = WallpaperARView.scanWallFillMat.copy() as! SCNMaterial
+            let fillMat = SCNMaterial()
             fillMat.diffuse.contents = color.withAlphaComponent(0.08)
+            fillMat.lightingModel = .constant
+            fillMat.isDoubleSided = true
+            fillMat.blendMode = .alpha
+            fillMat.writesToDepthBuffer = false
+            fillMat.readsFromDepthBuffer = false
             fillPlane.materials = [fillMat]
             let fillNode = SCNNode(geometry: fillPlane)
             fillNode.renderingOrder = 595
@@ -455,7 +459,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.scene.rootNode.addChildNode(container)
         scanPreviewNodes[surface.identifier] = container
 
-        // Pulse-in animation: scale up from 0 to 1, fade in opacity
         container.scale = SCNVector3(0.1, 0.1, 1.0)
         container.opacity = 0
         let scaleAction = SCNAction.scale(to: 1.0, duration: 0.35)
@@ -482,11 +485,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // FIX #4: LiDAR OCCLUDER (invisible depth)
+    // OCCLUDER
     // ════════════════════════════════════════════════════════════
 
-    /// Build an invisible occluder mesh from an ARMeshAnchor.
-    /// Wall-classified faces are SKIPPED so they don't occlude the wallpaper plane.
     private func buildOccluderGeometry(from anchor: ARMeshAnchor) -> SCNGeometry? {
         let geo = anchor.geometry
         let vCount = geo.vertices.count
@@ -514,7 +515,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                     .assumingMemoryBound(to: UInt8.self).pointee
                 isWall = (ARMeshClassification(rawValue: Int(cv)) == .wall)
             }
-            if isWall { continue }  // skip walls — let our SCNPlane wallpaper handle them
+            if isWall { continue }
             for j in 0..<ipf {
                 let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
                 if bpi == 4 { idx.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
@@ -542,6 +543,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ════════════════════════════════════════════════════════════
 
     private func processFinalRoom(_ room: CapturedRoom) {
+        diag("processFinalRoom: \(room.walls.count) walls, \(room.doors.count) doors, \(room.windows.count) windows, \(room.openings.count) openings")
+
         for (_, w) in walls { w.node.removeFromParentNode() }
         walls.removeAll()
 
@@ -553,6 +556,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
 
         let area = totalArea()
+        diag("Built \(built) walls (total area \(area) m²)")
         emit("scanComplete", data: [
             "totalWallArea": area,
             "meshSegments": built,
@@ -569,7 +573,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     ) -> Bool {
         let wMeters = CGFloat(surface.dimensions.x)
         let hMeters = CGFloat(surface.dimensions.y)
-        guard wMeters > 0.5 && hMeters > 0.5 else { return false }
+        guard wMeters > 0.5 && hMeters > 0.5 else {
+            diag("Skipped wall \(surface.identifier.uuidString.prefix(8)) too small: \(wMeters)x\(hMeters)")
+            return false
+        }
 
         let plane = SCNPlane(width: wMeters, height: hMeters)
         plane.cornerRadius = 0
@@ -599,6 +606,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             wallSize: CGSize(width: wMeters, height: hMeters),
             transform: surface.transform
         )
+        diag("Built wall id=\(surface.identifier.uuidString.prefix(8)) size=\(String(format: "%.2f", wMeters))x\(String(format: "%.2f", hMeters))")
         return true
     }
 
@@ -756,7 +764,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         isWallpaperApplied = false
         createCursor()
         refreshAllWalls()
-        emit("boot", data: ["status": "Edit mode"])
+        diag("enterEditMode (\(walls.count) walls)")
+        emit("boot", data: ["status": "Edit mode (\(walls.count) walls)"])
     }
 
     private func exitEditMode() {
@@ -840,35 +849,93 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // FIX #1 — BRUSH using ray-plane intersection
+    // ★ THE FIX: Use SceneKit's unprojectPoint for raycasts
+    //
+    // Instead of building a ray manually with frame.camera.projectionMatrix
+    // (which may use a different viewport than what SceneKit actually renders),
+    // we use sceneView.unprojectPoint() which is GUARANTEED to match the
+    // current SceneKit rendering. This fixes lasso/eraser misalignment.
+    // ════════════════════════════════════════════════════════════
+
+    /// Cast a ray from camera through screenPoint using SceneKit's own
+    /// unproject. Returns ray origin (near plane) and ray direction in world space.
+    private func makeRayFromScreen(_ screenPoint: CGPoint) -> (SIMD3<Float>, SIMD3<Float>)? {
+        // Sample SceneKit's view at near (z=0) and far (z=1) for the same screen point.
+        // unprojectPoint gives us world coordinates that match what SceneKit renders.
+        let nearV = sceneView.unprojectPoint(SCNVector3(Float(screenPoint.x), Float(screenPoint.y), 0))
+        let farV = sceneView.unprojectPoint(SCNVector3(Float(screenPoint.x), Float(screenPoint.y), 1))
+        let near = SIMD3<Float>(Float(nearV.x), Float(nearV.y), Float(nearV.z))
+        let far = SIMD3<Float>(Float(farV.x), Float(farV.y), Float(farV.z))
+        let dir = far - near
+        let dirLen = simd_length(dir)
+        guard dirLen > 1e-6 else { return nil }
+        return (near, dir / dirLen)
+    }
+
+    /// Find the nearest wall hit by a ray cast from this screen point.
+    private func nearestWallByRay(_ screenPoint: CGPoint) -> (UUID, SIMD3<Float>)? {
+        guard let (rayOrigin, rayDir) = makeRayFromScreen(screenPoint) else {
+            lastRayHitInfo = "ray creation failed"
+            return nil
+        }
+
+        var best: (id: UUID, hit: SIMD3<Float>, dist: Float)? = nil
+
+        for (id, w) in walls {
+            let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
+            let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
+            let denom = simd_dot(nrm, rayDir)
+            if abs(denom) < 1e-6 { continue }
+            let t = simd_dot(center - rayOrigin, nrm) / denom
+            if t <= 0 { continue }
+            let hit = rayOrigin + rayDir * t
+
+            let invWall = simd_inverse(w.transform)
+            let localH = invWall * SIMD4<Float>(hit.x, hit.y, hit.z, 1.0)
+            let margin: Float = 0.10
+            let halfW = Float(w.wallSize.width) / 2 + margin
+            let halfH = Float(w.wallSize.height) / 2 + margin
+            if abs(localH.x) > halfW || abs(localH.y) > halfH { continue }
+
+            if best == nil || t < best!.dist { best = (id, hit, t) }
+        }
+        guard let b = best else {
+            lastRayHitInfo = "no wall hit (walls=\(walls.count))"
+            return nil
+        }
+        lastRayHitInfo = "hit wall \(b.id.uuidString.prefix(8)) at t=\(String(format: "%.2f", b.dist))"
+        return (b.id, b.hit)
+    }
+
+    /// Ray-cast onto a SPECIFIC wall.
+    private func rayHitOnWall(_ screenPoint: CGPoint, wall w: Wall) -> SIMD3<Float>? {
+        guard let (rayOrigin, rayDir) = makeRayFromScreen(screenPoint) else { return nil }
+        let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
+        let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
+        let denom = simd_dot(nrm, rayDir)
+        if abs(denom) < 1e-6 { return nil }
+        let t = simd_dot(center - rayOrigin, nrm) / denom
+        if t <= 0 { return nil }
+        return rayOrigin + rayDir * t
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // BRUSH
     // ════════════════════════════════════════════════════════════
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
         guard editModeActive else { return }
-        // Lasso drag is driven by Dart through method channel; ignore pan when lasso active
         guard !lassoModeActive else { return }
         let pt = gesture.location(in: sceneView)
 
         switch gesture.state {
         case .began:
             brushStrokeStarted = false
-            lastBrushPanLocation = pt
+            diag("brush.began at (\(Int(pt.x)),\(Int(pt.y)))")
             applyBrushAt(pt)
         case .changed:
-            if let last = lastBrushPanLocation {
-                let dist = hypot(pt.x - last.x, pt.y - last.y)
-                if dist > 4 {
-                    let steps = max(1, Int(dist / 4))
-                    for i in 1...steps {
-                        let t = CGFloat(i) / CGFloat(steps)
-                        let p = CGPoint(x: last.x + (pt.x - last.x) * t, y: last.y + (pt.y - last.y) * t)
-                        applyBrushAt(p)
-                    }
-                }
-            }
-            lastBrushPanLocation = pt
+            applyBrushAt(pt)
         case .ended, .cancelled:
-            lastBrushPanLocation = nil
             brushCursorNode?.isHidden = true
             brushStrokeStarted = false
             emit("selectionChanged", data: ["area": totalArea()])
@@ -877,8 +944,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func applyBrushAt(_ screenPoint: CGPoint) {
-        guard let frame = sceneView.session.currentFrame else { return }
-        guard let (wallID, worldHit) = nearestWallByRay(screenPoint, frame: frame) else { return }
+        guard let (wallID, worldHit) = nearestWallByRay(screenPoint) else { return }
         guard var w = walls[wallID] else { return }
 
         if !brushStrokeStarted {
@@ -912,81 +978,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // Ray-plane intersection (the workhorse for all picking)
-    // ════════════════════════════════════════════════════════════
-
-    /// Find the nearest wall hit by the ray cast from this screen point.
-    /// Works ANYWHERE — even if user taps outside the wallpaper visible area,
-    /// or on a curtain/TV/etc in front of the wall.
-    private func nearestWallByRay(_ screenPoint: CGPoint, frame: ARFrame) -> (UUID, SIMD3<Float>)? {
-        let vs = sceneView.bounds.size
-        let camT = frame.camera.transform
-        let proj = frame.camera.projectionMatrix(for: .portrait, viewportSize: vs, zNear: 0.001, zFar: 1000)
-        let ndcX = Float((screenPoint.x / vs.width) * 2 - 1)
-        let ndcY = Float(-((screenPoint.y / vs.height) * 2 - 1))
-        let invProj = simd_inverse(proj)
-        let near4 = invProj * SIMD4<Float>(ndcX, ndcY, -1, 1)
-        let far4 = invProj * SIMD4<Float>(ndcX, ndcY, 1, 1)
-        let nearW4 = camT * (near4 / near4.w)
-        let farW4 = camT * (far4 / far4.w)
-        let rayOrigin = SIMD3<Float>(nearW4.x, nearW4.y, nearW4.z)
-        let rayDir = simd_normalize(SIMD3<Float>(farW4.x, farW4.y, farW4.z) - rayOrigin)
-
-        var best: (id: UUID, hit: SIMD3<Float>, dist: Float)? = nil
-
-        for (id, w) in walls {
-            let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
-            let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
-            let denom = simd_dot(nrm, rayDir)
-            if abs(denom) < 1e-6 { continue }
-            let t = simd_dot(center - rayOrigin, nrm) / denom
-            if t <= 0 { continue }
-            let hit = rayOrigin + rayDir * t
-
-            let invWall = simd_inverse(w.transform)
-            let localH = invWall * SIMD4<Float>(hit.x, hit.y, hit.z, 1.0)
-            let margin: Float = 0.10
-            let halfW = Float(w.wallSize.width) / 2 + margin
-            let halfH = Float(w.wallSize.height) / 2 + margin
-            if abs(localH.x) > halfW || abs(localH.y) > halfH { continue }
-
-            if best == nil || t < best!.dist { best = (id, hit, t) }
-        }
-        guard let b = best else { return nil }
-        return (b.id, b.hit)
-    }
-
-    /// Ray-cast onto a SPECIFIC wall (not nearest). Used during drag to lock to one wall.
-    private func rayHitOnWall(_ screenPoint: CGPoint, wall w: Wall, frame: ARFrame) -> SIMD3<Float>? {
-        let vs = sceneView.bounds.size
-        let camT = frame.camera.transform
-        let proj = frame.camera.projectionMatrix(for: .portrait, viewportSize: vs, zNear: 0.001, zFar: 1000)
-        let ndcX = Float((screenPoint.x / vs.width) * 2 - 1)
-        let ndcY = Float(-((screenPoint.y / vs.height) * 2 - 1))
-        let invProj = simd_inverse(proj)
-        let near4 = invProj * SIMD4<Float>(ndcX, ndcY, -1, 1)
-        let far4 = invProj * SIMD4<Float>(ndcX, ndcY, 1, 1)
-        let nearW4 = camT * (near4 / near4.w)
-        let farW4 = camT * (far4 / far4.w)
-        let rayOrigin = SIMD3<Float>(nearW4.x, nearW4.y, nearW4.z)
-        let rayDir = simd_normalize(SIMD3<Float>(farW4.x, farW4.y, farW4.z) - rayOrigin)
-
-        let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
-        let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
-        let denom = simd_dot(nrm, rayDir)
-        if abs(denom) < 1e-6 { return nil }
-        let t = simd_dot(center - rayOrigin, nrm) / denom
-        if t <= 0 { return nil }
-        return rayOrigin + rayDir * t
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // LASSO — TAP MODE + DRAG MODE
+    // LASSO
     // ════════════════════════════════════════════════════════════
 
     private func startLassoMode() {
         lassoModeActive = true; lassoClosed = false
         clearLassoPoints()
+        diag("startLassoMode")
         emit("boot", data: ["status": "Lasso — drag to draw a path"])
         emit("lassoState", data: ["active": true, "closed": false, "count": 0])
     }
@@ -1009,12 +1007,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         broadcastLassoScreenPoints()
     }
 
-    // ── Tap add (old) ──
     private func addLassoPoint(_ screenPoint: CGPoint) {
         guard lassoModeActive, !lassoClosed else { return }
-        guard let frame = sceneView.session.currentFrame,
-              let (_, world) = nearestWallByRay(screenPoint, frame: frame) else {
-            emit("boot", data: ["status": "Tap on wall"]); return
+        guard let (_, world) = nearestWallByRay(screenPoint) else {
+            diag("lasso tap MISS at (\(Int(screenPoint.x)),\(Int(screenPoint.y))) — walls=\(walls.count)")
+            emit("boot", data: ["status": "Tap on wall (no hit, walls=\(walls.count))"])
+            return
         }
         if lassoWorldPoints.count >= 3 {
             if simd_distance(lassoWorldPoints[0], world) < 0.10 {
@@ -1035,31 +1033,30 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         broadcastLassoScreenPoints()
     }
 
-    // ── Pen-tool drag (new) ──
-
     private func beginLassoDrag(_ screenPoint: CGPoint) {
-        guard lassoModeActive, !lassoClosed else { return }
-        guard let frame = sceneView.session.currentFrame else { return }
-        guard let (wallID, world) = nearestWallByRay(screenPoint, frame: frame) else {
-            emit("boot", data: ["status": "Start on wall"]); return
+        guard lassoModeActive else { diag("beginLassoDrag IGNORED: lasso not active"); return }
+        guard !lassoClosed else { diag("beginLassoDrag IGNORED: already closed"); return }
+        guard let (wallID, world) = nearestWallByRay(screenPoint) else {
+            diag("beginLassoDrag MISS at (\(Int(screenPoint.x)),\(Int(screenPoint.y))) walls=\(walls.count) hit=\(lastRayHitInfo)")
+            emit("boot", data: ["status": "Start on wall (no hit, walls=\(walls.count))"])
+            return
         }
         clearLassoPoints()
         lassoDragging = true
         lassoDragTargetWallID = wallID
         lassoWorldPoints.append(world)
         addLassoDot(at: world)
+        diag("beginLassoDrag OK on wall \(wallID.uuidString.prefix(8)) at (\(Int(screenPoint.x)),\(Int(screenPoint.y)))")
         emit("lassoState", data: ["active": true, "closed": false, "count": 1])
-        emit("boot", data: ["status": "Drawing..."])
+        emit("boot", data: ["status": "Drawing... (1 pt)"])
         broadcastLassoScreenPoints()
     }
 
     private func dragLassoTo(_ screenPoint: CGPoint) {
         guard lassoModeActive, lassoDragging, !lassoClosed else { return }
         guard let wallID = lassoDragTargetWallID, let w = walls[wallID] else { return }
-        guard let frame = sceneView.session.currentFrame else { return }
-        guard let world = rayHitOnWall(screenPoint, wall: w, frame: frame) else { return }
+        guard let world = rayHitOnWall(screenPoint, wall: w) else { return }
 
-        // Spacing filter
         if let last = lassoWorldPoints.last {
             let lastSp = sceneView.projectPoint(SCNVector3(last.x, last.y, last.z))
             let dx = CGFloat(lastSp.x) - screenPoint.x
@@ -1078,13 +1075,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         guard lassoModeActive, lassoDragging else { return }
         lassoDragging = false
 
+        diag("endLassoDrag — collected \(lassoWorldPoints.count) points")
         if lassoWorldPoints.count >= 3 {
             lassoClosed = true
             addLassoLine(from: lassoWorldPoints.last!, to: lassoWorldPoints[0], isClosing: true)
             emit("lassoState", data: ["active": true, "closed": true, "count": lassoWorldPoints.count])
             emit("boot", data: ["status": "Drawn (\(lassoWorldPoints.count) pts) — tap Apply"])
         } else {
-            emit("boot", data: ["status": "Need more points"])
+            emit("boot", data: ["status": "Need more points (got \(lassoWorldPoints.count))"])
             clearLassoPoints()
         }
         broadcastLassoScreenPoints()
@@ -1252,18 +1250,22 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.roomUpdateCount += 1
             self.latestCapturedRoom = room
-            self.updateScanPreview(from: room)  // ★ FIX #5
+            self.updateScanPreview(from: room)
             let walls = room.walls.count
+            self.diag("roomUpdate #\(self.roomUpdateCount): \(walls) walls, \(room.doors.count) doors, \(room.windows.count) wins")
             self.emit("boot", data: ["status": "Scanning: \(walls) walls"])
         }
     }
 
     func captureSession(_ session: RoomCaptureSession, didEndWith data: CapturedRoomData, error: Error?) {
         if let e = error {
+            diag("captureSession didEndWith error: \(e.localizedDescription)")
             emit("error", data: ["message": "Scan failed: \(e.localizedDescription)"])
             return
         }
+        diag("captureSession didEndWith success — running RoomBuilder")
         Task { [weak self] in
             guard let self = self, let builder = self.roomBuilder else { return }
             do {
@@ -1275,6 +1277,7 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
                 }
             } catch {
                 await MainActor.run { [weak self] in
+                    self?.diag("RoomBuilder failed: \(error.localizedDescription)")
                     self?.emit("error", data: ["message": "Build failed: \(error.localizedDescription)"])
                 }
             }
@@ -1291,16 +1294,18 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         }
     }
 
-    // ★ FIX #4: When ARKit adds a mesh anchor, attach invisible occluder geometry
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
-        guard let ma = anchor as? ARMeshAnchor else { return }
-        guard let geo = buildOccluderGeometry(from: ma) else { return }
-        let occ = SCNNode(geometry: geo)
-        occ.renderingOrder = -100  // draw first so depth is set before wallpaper
-        occ.isHidden = !occluderEnabled
-        node.addChildNode(occ)
-        DispatchQueue.main.async { [weak self] in
-            self?.occluderNodes[ma.identifier] = occ
+        if let ma = anchor as? ARMeshAnchor {
+            meshAnchorCount += 1
+            diag("ARMeshAnchor added (total \(meshAnchorCount))")
+            guard let geo = buildOccluderGeometry(from: ma) else { return }
+            let occ = SCNNode(geometry: geo)
+            occ.renderingOrder = -100
+            occ.isHidden = !occluderEnabled
+            node.addChildNode(occ)
+            DispatchQueue.main.async { [weak self] in
+                self?.occluderNodes[ma.identifier] = occ
+            }
         }
     }
 
