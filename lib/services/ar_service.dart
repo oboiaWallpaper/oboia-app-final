@@ -616,4 +616,16 @@ class ARService {
     dlog('AR-DART', 'setOccluderEnabled $enabled');
     await _channel.invokeMethod<void>('setOccluderEnabled', {'enabled': enabled});
   }
+
+  // ── ADDED: Diagnostics ─────────────────────────────────────────────────
+
+  /// Fetch the full diagnostic report from Swift as a string.
+  Future<String> getDiagnostics() async {
+    try {
+      final result = await _channel.invokeMethod<String>('getDiagnostics');
+      return result ?? '(empty report)';
+    } catch (e) {
+      return '(error fetching diagnostics: $e)';
+    }
+  }
 }
