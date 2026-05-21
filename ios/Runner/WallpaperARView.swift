@@ -213,8 +213,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(nil)
         case "undoCut":      undoLast(); result(nil)
         case "clearAllCuts": resetMasks(); result(nil)
-        case "lassoStart":   startLassoMode(); result(nil)
-        case "lassoEnd":     endLassoMode(); result(nil)
+        case "lassoStart":
+            startLassoMode()
+            panGesture?.isEnabled = false  // ★ BUG A FIX: disable Swift pan so Flutter drag works
+            diag("lasso START: panGesture disabled")
+            result(nil)
+        case "lassoEnd":
+            endLassoMode()
+            panGesture?.isEnabled = true   // re-enable brush pan
+            diag("lasso END: panGesture re-enabled")
+            result(nil)
         case "lassoAddPoint":
             if let x = args?["x"] as? Double, let y = args?["y"] as? Double {
                 addLassoPoint(CGPoint(x: x, y: y))
@@ -427,10 +435,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let container = SCNNode()
         container.simdTransform = surface.transform
 
+        // ★ BUG B FIX: bright semi-transparent fill so wall is OBVIOUSLY highlighted
         if withFill {
             let fillPlane = SCNPlane(width: w, height: h)
             let fillMat = SCNMaterial()
-            fillMat.diffuse.contents = color.withAlphaComponent(0.08)
+            fillMat.diffuse.contents = color.withAlphaComponent(0.18)  // was 0.08, doubled
+            fillMat.emission.contents = color.withAlphaComponent(0.20) // adds glow
             fillMat.lightingModel = .constant
             fillMat.isDoubleSided = true
             fillMat.blendMode = .alpha
@@ -442,11 +452,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             container.addChildNode(fillNode)
         }
 
+        // ★ BUG B FIX: bright glowing border (thick lines via repeated planes)
         let wirePlane = SCNPlane(width: w, height: h)
         let wireMat = SCNMaterial()
         wireMat.fillMode = .lines
-        wireMat.diffuse.contents = color.withAlphaComponent(0.95)
-        wireMat.emission.contents = color.withAlphaComponent(0.6)
+        wireMat.diffuse.contents = color  // full opacity, was 0.95
+        wireMat.emission.contents = color // full glow, was 0.6
         wireMat.lightingModel = .constant
         wireMat.isDoubleSided = true
         wireMat.writesToDepthBuffer = false
@@ -459,12 +470,21 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.scene.rootNode.addChildNode(container)
         scanPreviewNodes[surface.identifier] = container
 
+        // ★ BUG B FIX: dramatic entrance — scale from 0 + fade-in
         container.scale = SCNVector3(0.1, 0.1, 1.0)
         container.opacity = 0
-        let scaleAction = SCNAction.scale(to: 1.0, duration: 0.35)
+        let scaleAction = SCNAction.scale(to: 1.0, duration: 0.4)
         scaleAction.timingMode = .easeOut
-        let fadeAction = SCNAction.fadeIn(duration: 0.35)
-        container.runAction(SCNAction.group([scaleAction, fadeAction]))
+        let fadeAction = SCNAction.fadeIn(duration: 0.4)
+        let entrance = SCNAction.group([scaleAction, fadeAction])
+
+        // ★ BUG B FIX: continuous pulsing glow so user always sees it's there
+        let pulseUp = SCNAction.fadeOpacity(to: 1.0, duration: 0.8)
+        let pulseDown = SCNAction.fadeOpacity(to: 0.55, duration: 0.8)
+        let pulse = SCNAction.sequence([pulseUp, pulseDown])
+        let pulseForever = SCNAction.repeatForever(pulse)
+
+        container.runAction(SCNAction.sequence([entrance, pulseForever]))
     }
 
     private func animateOutScanPreviews() {
