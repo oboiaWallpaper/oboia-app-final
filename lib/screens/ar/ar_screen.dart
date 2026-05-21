@@ -1,6 +1,6 @@
-// lib/screens/ar/ar_screen.dart — v8
-// Lasso is now world-anchored: taps sent to Swift, Swift draws 3D dots/lines
-// Dart UI just shows status + buttons; no 2D polygon drawing
+// lib/screens/ar/ar_screen.dart — v12
+// Pen-tool drag lasso (pan gestures, not taps) + occluder toggle for "show
+// wallpaper behind objects" feature.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -28,19 +28,14 @@ class _ARScreenState extends State<ARScreen> {
   final List<String> _logLines = [];
   bool _isScanning = false, _scanDone = false, _wallpaperApplied = false;
   bool _editMode = false, _showLog = false;
+  bool _occluderEnabled = true;
   String _activeTool = 'erase';
   String _lassoMode = 'erase';
   double _brushSize = 0.08, _wallpaperOpacity = 0.96;
   double _totalWallArea = 0.0;
 
-  // EDIT 1: freehand pen toggle state
-  bool _lassoFreehand = false; // false = tap mode, true = pen/freehand mode
-
-  // Lasso state from Swift
   int _lassoPointCount = 0;
   bool _lassoClosed = false;
-  // Screen positions of lasso points pushed by Swift each frame
-  // Each entry: [x, y, visible_flag]
   List<List<double>> _lassoScreenPoints = [];
 
   @override
@@ -105,12 +100,10 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  // Calculations
   double get _rollArea => (widget.wallpaper?.rollWidth ?? 0.53) * (widget.wallpaper?.rollLength ?? 10.0);
   int get _rollsNeeded => _rollArea > 0 ? (_totalWallArea / _rollArea).ceil() : 0;
   double get _totalPrice => _rollsNeeded * widget.pricePerRoll;
 
-  // Actions
   Future<void> _startScan() async {
     setState(() { _isScanning = true; _scanDone = false; _wallpaperApplied = false;
       _editMode = false; _totalWallArea = 0; _lassoPointCount = 0; _lassoClosed = false; });
@@ -124,11 +117,9 @@ class _ARScreenState extends State<ARScreen> {
   }
 
   Future<void> _setTool(String tool) async {
-    // Leaving lasso → tell Swift
     if (_activeTool == 'lasso' && tool != 'lasso') {
       try { await _arService.lassoEnd(); } catch (_) {}
     }
-    // Entering lasso → tell Swift
     if (tool == 'lasso' && _activeTool != 'lasso') {
       try { await _arService.lassoStart(); } catch (_) {}
     }
@@ -146,6 +137,10 @@ class _ARScreenState extends State<ARScreen> {
     setState(() => _wallpaperOpacity = val);
     try { await _arService.setWallpaperOpacity(val); } catch (_) {}
   }
+  Future<void> _toggleOccluder(bool on) async {
+    setState(() => _occluderEnabled = on);
+    try { await _arService.setOccluderEnabled(on); } catch (_) {}
+  }
   Future<void> _undo() async { try { await _arService.undoCut(0); } catch (_) {} }
   Future<void> _reset() async { try { await _arService.clearAllCuts(0); } catch (_) {} }
 
@@ -157,25 +152,22 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.clearWall(0); setState(() => _wallpaperApplied = false); } catch (_) {}
   }
 
-  // Lasso tap handler — send screen position to Swift
-  Future<void> _handleLassoTap(Offset localPos) async {
-    try { await _arService.lassoAddPoint(localPos.dx, localPos.dy); } catch (e) { _log('Lasso tap: $e'); }
+  // ★ Pen-tool drag lasso handlers
+  Future<void> _lassoBegin(Offset p) async {
+    try { await _arService.lassoBeginDrag(p.dx, p.dy); } catch (e) { _log('Lasso begin: $e'); }
+  }
+  Future<void> _lassoDrag(Offset p) async {
+    try { await _arService.lassoDragPoint(p.dx, p.dy); } catch (_) {}
+  }
+  Future<void> _lassoEnd() async {
+    try { await _arService.lassoEndDrag(); } catch (_) {}
   }
 
   Future<void> _applyLasso() async {
     try { await _arService.lassoApply(_lassoMode); } catch (e) { _log('Lasso apply: $e'); }
   }
-
   Future<void> _clearLassoPoints() async {
     try { await _arService.lassoClear(); } catch (_) {}
-  }
-
-  // EDIT 2: freehand pen toggle helper
-  Future<void> _toggleLassoFreehand() async {
-    setState(() => _lassoFreehand = !_lassoFreehand);
-    try {
-      await ARService.instance.lassoSetFreehand(_lassoFreehand);
-    } catch (_) {}
   }
 
   @override
@@ -190,35 +182,35 @@ class _ARScreenState extends State<ARScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(children: [
-        // AR View
         Positioned.fill(child: UiKitView(viewType: 'com.oboia/ar_view',
             creationParams: const <String, dynamic>{}, creationParamsCodec: StandardMessageCodec())),
 
-        // Lasso overlay (just hint UI — the actual dots/lines are drawn by Swift in 3D)
+        // Lasso hint painter (yellow ring around first point)
         if (_editMode && _activeTool == 'lasso' && _lassoScreenPoints.isNotEmpty)
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // EDIT 4: Lasso tap detector — only active in tap mode (not freehand)
-        if (_editMode && _activeTool == 'lasso' && !_lassoClosed && !_lassoFreehand)
+        // ★ DRAG gesture detector (replaces old tap detector)
+        if (_editMode && _activeTool == 'lasso' && !_lassoClosed)
           Positioned.fill(child: GestureDetector(
             behavior: HitTestBehavior.translucent,
-            onTapDown: (d) => _handleLassoTap(d.localPosition),
+            onPanStart: (d) => _lassoBegin(d.localPosition),
+            onPanUpdate: (d) => _lassoDrag(d.localPosition),
+            onPanEnd: (d) => _lassoEnd(),
+            onPanCancel: () => _lassoEnd(),
             child: Container(color: Colors.transparent))),
 
-        // Back button
         Positioned(top: MediaQuery.of(context).padding.top + 8, left: 8,
           child: IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 24),
               style: IconButton.styleFrom(backgroundColor: Colors.black54),
               onPressed: () => Navigator.of(context).pop())),
 
-        // Scanning UI
         if (_isScanning) ...[
           Positioned(top: MediaQuery.of(context).padding.top + 8, left: 60, right: 60,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               decoration: BoxDecoration(color: Colors.white.withOpacity(0.92), borderRadius: BorderRadius.circular(12)),
-              child: const Text('Scan the walls you want\nto wallpaper',
-                style: TextStyle(color: Colors.black87, fontSize: 15, fontWeight: FontWeight.w600), textAlign: TextAlign.center))),
+              child: const Text('Move slowly around the room.\nWalls glow as they are detected.',
+                style: TextStyle(color: Colors.black87, fontSize: 14, fontWeight: FontWeight.w600), textAlign: TextAlign.center))),
           Positioned(bottom: 30, left: 40, right: 40,
             child: ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: goldColor, padding: const EdgeInsets.symmetric(vertical: 16),
@@ -227,25 +219,20 @@ class _ARScreenState extends State<ARScreen> {
               child: const Text('Done Scanning', style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // Edit Mode UI
         if (_scanDone && _editMode) ...[
-          // Top instruction bar
           Positioned(top: MediaQuery.of(context).padding.top + 8, left: 50, right: 50,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               decoration: BoxDecoration(color: Colors.black.withOpacity(0.75), borderRadius: BorderRadius.circular(10)),
               child: Text(
                 _activeTool == 'lasso'
                     ? (_lassoClosed
-                        ? 'Loop closed — tap Apply'
-                        : _lassoFreehand
-                            ? 'Draw freely on wall — lift finger to close'
-                            : 'Tap on wall (tap first point to close) · $_lassoPointCount pts')
+                        ? 'Drawn — tap Apply'
+                        : 'Drag finger to draw around area · $_lassoPointCount pts')
                     : _activeTool == 'erase' ? 'Rub to remove areas' : 'Rub to add areas',
                 style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
                 textAlign: TextAlign.center))),
 
-          // Toolbar
-          Positioned(bottom: (_activeTool == 'lasso' && _lassoPointCount >= 3) ? 170 : 140,
+          Positioned(bottom: (_activeTool == 'lasso' && _lassoPointCount >= 3) ? 200 : 170,
             left: 12, right: 12,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
               decoration: BoxDecoration(color: const Color(0xE6222222), borderRadius: BorderRadius.circular(16),
@@ -254,7 +241,7 @@ class _ARScreenState extends State<ARScreen> {
                 Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
                   _toolBtn(Icons.brush, 'Paint', _activeTool == 'paint', () => _setTool('paint')),
                   _toolBtn(Icons.auto_fix_high, 'Erase', _activeTool == 'erase', () => _setTool('erase')),
-                  _toolBtn(Icons.polyline, 'Lasso', _activeTool == 'lasso', () => _setTool('lasso')),
+                  _toolBtn(Icons.gesture, 'Lasso', _activeTool == 'lasso', () => _setTool('lasso')),
                   _toolBtn(Icons.undo, 'Undo', false, _undo),
                   _toolBtn(Icons.restart_alt, 'Reset', false, _reset),
                 ]),
@@ -266,34 +253,6 @@ class _ARScreenState extends State<ARScreen> {
                     _miniToggle('Erase', _lassoMode == 'erase', () => setState(() => _lassoMode = 'erase')),
                     const SizedBox(width: 8),
                     _miniToggle('Paint', _lassoMode == 'paint', () => setState(() => _lassoMode = 'paint')),
-
-                    // EDIT 3: Tap/Pen toggle button
-                    const SizedBox(width: 12),
-                    GestureDetector(
-                      onTap: _toggleLassoFreehand,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: _lassoFreehand
-                              ? Colors.greenAccent.withOpacity(0.3)
-                              : Colors.white10,
-                          borderRadius: BorderRadius.circular(8),
-                          border: _lassoFreehand
-                              ? Border.all(color: Colors.greenAccent)
-                              : null),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          Icon(_lassoFreehand ? Icons.draw : Icons.touch_app,
-                              color: _lassoFreehand ? Colors.greenAccent : Colors.white54,
-                              size: 14),
-                          const SizedBox(width: 4),
-                          Text(_lassoFreehand ? 'Pen' : 'Tap',
-                              style: TextStyle(
-                                color: _lassoFreehand ? Colors.greenAccent : Colors.white54,
-                                fontSize: 11, fontWeight: FontWeight.w500)),
-                        ]),
-                      ),
-                    ),
-
                     const SizedBox(width: 12),
                     if (_lassoPointCount > 0)
                       GestureDetector(
@@ -321,11 +280,20 @@ class _ARScreenState extends State<ARScreen> {
                   Text('${(_wallpaperOpacity * 100).toInt()}%', style: const TextStyle(color: Colors.white38, fontSize: 10)),
                 ]),
 
+                // ★ NEW: Occluder toggle — "Show wallpaper behind objects"
+                Row(children: [
+                  const Icon(Icons.view_in_ar, color: Colors.white38, size: 14),
+                  const SizedBox(width: 6),
+                  const Expanded(child: Text('Hide wallpaper behind objects',
+                      style: TextStyle(color: Colors.white60, fontSize: 11))),
+                  Switch(value: _occluderEnabled, onChanged: _toggleOccluder,
+                    activeColor: goldColor, activeTrackColor: goldColor.withOpacity(0.3)),
+                ]),
+
                 Text('Selected: ${_totalWallArea.toStringAsFixed(1)} m²',
                     style: const TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w600)),
               ]))),
 
-          // Apply Lasso button
           if (_activeTool == 'lasso' && _lassoPointCount >= 3)
             Positioned(bottom: 80, left: 40, right: 40,
               child: ElevatedButton.icon(
@@ -338,7 +306,6 @@ class _ARScreenState extends State<ARScreen> {
                 label: Text(_lassoClosed ? 'Apply Lasso (${_lassoMode})' : 'Apply ($_lassoPointCount pts)',
                     style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))),
 
-          // Apply Wallpaper button
           if (widget.wallpaper != null)
             Positioned(bottom: 20, left: 40, right: 40,
               child: ElevatedButton.icon(
@@ -350,7 +317,6 @@ class _ARScreenState extends State<ARScreen> {
                 label: const Text('Apply Wallpaper', style: TextStyle(fontSize: 15, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // Post-apply panel
         if (_scanDone && _wallpaperApplied && !_editMode) ...[
           if (widget.wallpaper != null)
             Positioned(top: MediaQuery.of(context).padding.top + 8, right: 12,
@@ -407,7 +373,6 @@ class _ARScreenState extends State<ARScreen> {
               ]))),
         ],
 
-        // Status pill (double-tap for log)
         if (!_isScanning)
           Positioned(top: MediaQuery.of(context).padding.top + 44, left: 50, right: 50,
             child: GestureDetector(onDoubleTap: () => setState(() => _showLog = !_showLog),
@@ -464,10 +429,8 @@ class _ARScreenState extends State<ARScreen> {
   ]);
 }
 
-/// Lightweight overlay painter — Swift draws the actual lasso in 3D,
-/// this just adds a yellow "close hint" ring around the first point when ready.
 class _LassoHintPainter extends CustomPainter {
-  final List<List<double>> screenPoints; // [x, y, visibleFlag] each
+  final List<List<double>> screenPoints;
   final bool closed;
   _LassoHintPainter(this.screenPoints, this.closed);
 
@@ -476,8 +439,7 @@ class _LassoHintPainter extends CustomPainter {
     if (screenPoints.isEmpty || closed) return;
     if (screenPoints.length < 3) return;
     final first = screenPoints[0];
-    if (first.length < 3 || first[2] < 0.5) return; // not visible
-    // Yellow hint ring around first point
+    if (first.length < 3 || first[2] < 0.5) return;
     final hint = Paint()
       ..color = Colors.yellow.withOpacity(0.6)
       ..strokeWidth = 2
