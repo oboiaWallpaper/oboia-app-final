@@ -1,10 +1,12 @@
-// lib/screens/ar/ar_screen.dart — v12
+// lib/screens/ar/ar_screen.dart — v13
 // Pen-tool drag lasso (pan gestures, not taps) + occluder toggle for "show
 // wallpaper behind objects" feature.
+// + Diagnostic email button (v13)
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
@@ -170,6 +172,22 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.lassoClear(); } catch (_) {}
   }
 
+  // ★ Diagnostic email sender
+  Future<void> _sendDiagnosticEmail() async {
+    setState(() => _statusText = 'Building diagnostic report...');
+    final report = await _arService.getDiagnostics();
+    final subject = Uri.encodeComponent('OBOIA Diagnostic — ${DateTime.now()}');
+    final body = Uri.encodeComponent(report);
+    final mailto = Uri.parse(
+      'mailto:ehtishampayoneer@gmail.com?subject=$subject&body=$body',
+    );
+    if (await canLaunchUrl(mailto)) {
+      await launchUrl(mailto);
+    } else {
+      setState(() => _statusText = 'Could not open Mail app');
+    }
+  }
+
   @override
   void dispose() {
     _eventSub?.cancel();
@@ -200,10 +218,28 @@ class _ARScreenState extends State<ARScreen> {
             onPanCancel: () => _lassoEnd(),
             child: Container(color: Colors.transparent))),
 
+        // Back button — top-left
         Positioned(top: MediaQuery.of(context).padding.top + 8, left: 8,
           child: IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 24),
               style: IconButton.styleFrom(backgroundColor: Colors.black54),
               onPressed: () => Navigator.of(context).pop())),
+
+        // ★ DIAGNOSTIC BUTTON — bottom-right, never conflicts
+        Positioned(
+          bottom: 100,
+          right: 12,
+          child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.purple.withOpacity(0.85),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            ),
+            onPressed: _sendDiagnosticEmail,
+            icon: const Icon(Icons.bug_report, color: Colors.white, size: 14),
+            label: const Text('Send Diagnostic',
+                style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600)),
+          ),
+        ),
 
         if (_isScanning) ...[
           Positioned(top: MediaQuery.of(context).padding.top + 8, left: 60, right: 60,
@@ -280,7 +316,7 @@ class _ARScreenState extends State<ARScreen> {
                   Text('${(_wallpaperOpacity * 100).toInt()}%', style: const TextStyle(color: Colors.white38, fontSize: 10)),
                 ]),
 
-                // ★ NEW: Occluder toggle — "Show wallpaper behind objects"
+                // ★ Occluder toggle — "Hide wallpaper behind objects"
                 Row(children: [
                   const Icon(Icons.view_in_ar, color: Colors.white38, size: 14),
                   const SizedBox(width: 6),
