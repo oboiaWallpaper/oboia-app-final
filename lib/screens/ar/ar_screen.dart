@@ -1,12 +1,14 @@
-// lib/screens/ar/ar_screen.dart — v13
-// Pen-tool drag lasso (pan gestures, not taps) + occluder toggle for "show
-// wallpaper behind objects" feature.
-// + Diagnostic email button (v13)
+// lib/screens/ar/ar_screen.dart — v14
+// COMPLETE REPLACEMENT — includes:
+//   - Diagnostic "Send Diagnostic" purple button (top-right, always visible in scan + edit modes)
+//   - Pen-tool drag lasso (onPanStart/Update/End)
+//   - Occluder toggle
+//   - All previous UI intact
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:url_launcher/url_launcher.dart';  // ★ for email composer
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
@@ -154,7 +156,7 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.clearWall(0); setState(() => _wallpaperApplied = false); } catch (_) {}
   }
 
-  // ★ Pen-tool drag lasso handlers
+  // Pen-tool drag lasso handlers
   Future<void> _lassoBegin(Offset p) async {
     try { await _arService.lassoBeginDrag(p.dx, p.dy); } catch (e) { _log('Lasso begin: $e'); }
   }
@@ -172,19 +174,21 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.lassoClear(); } catch (_) {}
   }
 
-  // ★ Diagnostic email sender
+  // ★ DIAGNOSTIC EMAIL HANDLER
   Future<void> _sendDiagnosticEmail() async {
     setState(() => _statusText = 'Building diagnostic report...');
     final report = await _arService.getDiagnostics();
     final subject = Uri.encodeComponent('OBOIA Diagnostic — ${DateTime.now()}');
     final body = Uri.encodeComponent(report);
-    final mailto = Uri.parse(
-      'mailto:ehtishampayoneer@gmail.com?subject=$subject&body=$body',
-    );
-    if (await canLaunchUrl(mailto)) {
-      await launchUrl(mailto);
-    } else {
-      setState(() => _statusText = 'Could not open Mail app');
+    final mailto = Uri.parse('mailto:ehtishampayoneer@gmail.com?subject=$subject&body=$body');
+    try {
+      if (await canLaunchUrl(mailto)) {
+        await launchUrl(mailto);
+      } else {
+        setState(() => _statusText = 'Could not open Mail app. Copy log from screen.');
+      }
+    } catch (e) {
+      setState(() => _statusText = 'Diag err: $e');
     }
   }
 
@@ -208,7 +212,7 @@ class _ARScreenState extends State<ARScreen> {
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // ★ DRAG gesture detector (replaces old tap detector)
+        // Lasso drag gesture detector
         if (_editMode && _activeTool == 'lasso' && !_lassoClosed)
           Positioned.fill(child: GestureDetector(
             behavior: HitTestBehavior.translucent,
@@ -218,31 +222,32 @@ class _ARScreenState extends State<ARScreen> {
             onPanCancel: () => _lassoEnd(),
             child: Container(color: Colors.transparent))),
 
-        // Back button — top-left
+        // Back button (top-left)
         Positioned(top: MediaQuery.of(context).padding.top + 8, left: 8,
           child: IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 24),
               style: IconButton.styleFrom(backgroundColor: Colors.black54),
               onPressed: () => Navigator.of(context).pop())),
 
-        // ★ DIAGNOSTIC BUTTON — bottom-right, never conflicts
+        // ★ DIAGNOSTIC BUTTON — top-right, ALWAYS visible
         Positioned(
-          bottom: 100,
+          top: MediaQuery.of(context).padding.top + 8,
           right: 12,
           child: ElevatedButton.icon(
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.purple.withOpacity(0.85),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              backgroundColor: Colors.purple.withOpacity(0.9),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+              minimumSize: const Size(0, 32),
             ),
             onPressed: _sendDiagnosticEmail,
             icon: const Icon(Icons.bug_report, color: Colors.white, size: 14),
-            label: const Text('Send Diagnostic',
-                style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600)),
+            label: const Text('Diag',
+                style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)),
           ),
         ),
 
         if (_isScanning) ...[
-          Positioned(top: MediaQuery.of(context).padding.top + 8, left: 60, right: 60,
+          Positioned(top: MediaQuery.of(context).padding.top + 50, left: 60, right: 100,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               decoration: BoxDecoration(color: Colors.white.withOpacity(0.92), borderRadius: BorderRadius.circular(12)),
               child: const Text('Move slowly around the room.\nWalls glow as they are detected.',
@@ -256,7 +261,7 @@ class _ARScreenState extends State<ARScreen> {
         ],
 
         if (_scanDone && _editMode) ...[
-          Positioned(top: MediaQuery.of(context).padding.top + 8, left: 50, right: 50,
+          Positioned(top: MediaQuery.of(context).padding.top + 50, left: 50, right: 90,
             child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               decoration: BoxDecoration(color: Colors.black.withOpacity(0.75), borderRadius: BorderRadius.circular(10)),
               child: Text(
@@ -316,7 +321,6 @@ class _ARScreenState extends State<ARScreen> {
                   Text('${(_wallpaperOpacity * 100).toInt()}%', style: const TextStyle(color: Colors.white38, fontSize: 10)),
                 ]),
 
-                // ★ Occluder toggle — "Hide wallpaper behind objects"
                 Row(children: [
                   const Icon(Icons.view_in_ar, color: Colors.white38, size: 14),
                   const SizedBox(width: 6),
@@ -355,7 +359,7 @@ class _ARScreenState extends State<ARScreen> {
 
         if (_scanDone && _wallpaperApplied && !_editMode) ...[
           if (widget.wallpaper != null)
-            Positioned(top: MediaQuery.of(context).padding.top + 8, right: 12,
+            Positioned(top: MediaQuery.of(context).padding.top + 50, right: 90,
               child: Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(10)),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
@@ -410,7 +414,7 @@ class _ARScreenState extends State<ARScreen> {
         ],
 
         if (!_isScanning)
-          Positioned(top: MediaQuery.of(context).padding.top + 44, left: 50, right: 50,
+          Positioned(top: MediaQuery.of(context).padding.top + 90, left: 50, right: 90,
             child: GestureDetector(onDoubleTap: () => setState(() => _showLog = !_showLog),
               child: Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
@@ -418,7 +422,7 @@ class _ARScreenState extends State<ARScreen> {
                     textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis)))),
 
         if (_showLog)
-          Positioned(top: MediaQuery.of(context).padding.top + 65, left: 8, right: 8,
+          Positioned(top: MediaQuery.of(context).padding.top + 115, left: 8, right: 8,
             child: IgnorePointer(child: Container(constraints: const BoxConstraints(maxHeight: 150),
                 padding: const EdgeInsets.all(6), color: Colors.black87,
                 child: SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
