@@ -42,6 +42,9 @@ dependencies:
   # Permissions (camera for AR)
   permission_handler: ^11.3.1
 
+  # Diagnostics
+  url_launcher: ^6.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
