@@ -589,4 +589,31 @@ class ARService {
     dlog('AR-DART', 'resumeSession');
     await _channel.invokeMethod<void>('resumeSession');
   }
+
+  // ── ADDED: Pen drag + LiDAR occluder methods ───────────────────────────
+
+  /// Begin a pen-tool drag stroke (touch down)
+  Future<void> lassoBeginDrag(double x, double y) async {
+    dlog('AR-DART', 'lassoBeginDrag x=$x y=$y');
+    await _channel.invokeMethod<void>('lassoBeginDrag', {'x': x, 'y': y});
+  }
+
+  /// Continue a pen-tool drag stroke (touch move)
+  Future<void> lassoDragPoint(double x, double y) async {
+    await _channel.invokeMethod<void>('lassoDragPoint', {'x': x, 'y': y});
+  }
+
+  /// End a pen-tool drag stroke (touch up) — auto-closes the polygon
+  Future<void> lassoEndDrag() async {
+    dlog('AR-DART', 'lassoEndDrag');
+    await _channel.invokeMethod<void>('lassoEndDrag');
+  }
+
+  /// Enable/disable the LiDAR occluder.
+  /// When ON: wallpaper is hidden behind furniture/curtains/objects in front of walls.
+  /// When OFF: wallpaper shows through everything (useful for previewing without obstruction).
+  Future<void> setOccluderEnabled(bool enabled) async {
+    dlog('AR-DART', 'setOccluderEnabled $enabled');
+    await _channel.invokeMethod<void>('setOccluderEnabled', {'enabled': enabled});
+  }
 }
