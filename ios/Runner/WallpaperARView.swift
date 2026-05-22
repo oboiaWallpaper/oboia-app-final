@@ -603,13 +603,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func animateOutScanPreviews() {
+        // ★ Immediate removal — no fade-out animation.
+        // The previous fade-out had a race condition where async actions left
+        // grid/corner nodes visible on top of the wallpaper. Instant removal
+        // is cleaner and matches the "wallpaper magically appears" intent.
         for (_, node) in scanPreviewNodes {
-            let fade = SCNAction.fadeOut(duration: 0.4)
-            let scale = SCNAction.scale(to: 1.05, duration: 0.4)
-            let group = SCNAction.group([fade, scale])
-            node.runAction(group) {
-                node.removeFromParentNode()
+            // Stop all running actions (pulse, corner pulses) and detach immediately.
+            node.removeAllActions()
+            for child in node.childNodes {
+                child.removeAllActions()
             }
+            node.removeFromParentNode()
         }
         scanPreviewNodes.removeAll()
     }
@@ -654,7 +658,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
             wallPlanes.append((nrm, center))
         }
-        let wallProximity: Float = 0.06  // 6cm — mesh within this of a wall is "the wall"
+        let wallProximity: Float = 0.08  // 8cm — wider, removes more wall-near fuzz
 
         let fEl = geo.faces
         let bpi = fEl.bytesPerIndex
