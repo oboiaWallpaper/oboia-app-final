@@ -212,14 +212,17 @@ class _ARScreenState extends State<ARScreen> {
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // Lasso drag gesture detector
+        // ★ Lasso drag — using Listener (low-level pointer events) instead of
+        // GestureDetector because GestureDetector fights with the native UiKitView
+        // on iOS, causing only the first touch to register. Listener bypasses the
+        // gesture arena entirely.
         if (_editMode && _activeTool == 'lasso' && !_lassoClosed)
-          Positioned.fill(child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onPanStart: (d) => _lassoBegin(d.localPosition),
-            onPanUpdate: (d) => _lassoDrag(d.localPosition),
-            onPanEnd: (d) => _lassoEnd(),
-            onPanCancel: () => _lassoEnd(),
+          Positioned.fill(child: Listener(
+            behavior: HitTestBehavior.opaque,
+            onPointerDown: (e) => _lassoBegin(e.localPosition),
+            onPointerMove: (e) => _lassoDrag(e.localPosition),
+            onPointerUp: (e) => _lassoEnd(),
+            onPointerCancel: (e) => _lassoEnd(),
             child: Container(color: Colors.transparent))),
 
         // Back button (top-left)
