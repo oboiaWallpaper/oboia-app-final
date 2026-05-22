@@ -432,6 +432,57 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
     }
 
+    /// Generate a procedural grid texture for scan visualization.
+    /// Returns a UIImage with a transparent background and bright grid lines.
+    private static func makeScanGridTexture(color: UIColor) -> UIImage {
+        let size = CGSize(width: 256, height: 256)
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1.0; fmt.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: size, format: fmt)
+        return renderer.image { ctx in
+            let cg = ctx.cgContext
+            // Faint background tint
+            cg.setFillColor(color.withAlphaComponent(0.08).cgColor)
+            cg.fill(CGRect(origin: .zero, size: size))
+            // Grid lines
+            cg.setStrokeColor(color.withAlphaComponent(0.7).cgColor)
+            cg.setLineWidth(1.5)
+            let step: CGFloat = 32  // grid cell size in pixels
+            var x: CGFloat = 0
+            while x <= size.width {
+                cg.move(to: CGPoint(x: x, y: 0))
+                cg.addLine(to: CGPoint(x: x, y: size.height))
+                x += step
+            }
+            var y: CGFloat = 0
+            while y <= size.height {
+                cg.move(to: CGPoint(x: 0, y: y))
+                cg.addLine(to: CGPoint(x: size.width, y: y))
+                y += step
+            }
+            cg.strokePath()
+            // Brighter inner grid (cross pattern)
+            cg.setStrokeColor(color.cgColor)
+            cg.setLineWidth(0.8)
+            x = step / 2
+            while x <= size.width {
+                cg.move(to: CGPoint(x: x, y: 0))
+                cg.addLine(to: CGPoint(x: x, y: size.height))
+                x += step
+            }
+            y = step / 2
+            while y <= size.height {
+                cg.move(to: CGPoint(x: 0, y: y))
+                cg.addLine(to: CGPoint(x: size.width, y: y))
+                y += step
+            }
+            cg.strokePath()
+        }
+    }
+
+    private static let scanGridTextureCyan: UIImage = makeScanGridTexture(color: UIColor.cyan)
+    private static let scanGridTextureWhite: UIImage = makeScanGridTexture(color: UIColor.white)
+
     private func upsertScanWireframe(
         for surface: CapturedRoom.Surface,
         color: UIColor,
@@ -442,9 +493,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         guard w > 0.2, h > 0.2 else { return }
 
         if let existing = scanPreviewNodes[surface.identifier] {
+            // Resize fill and border planes (corner markers stay at fixed size)
             for child in existing.childNodes {
                 if let plane = child.geometry as? SCNPlane {
-                    plane.width = w; plane.height = h
+                    // Skip corner markers (they are 10cm × 10cm), only resize big planes
+                    if plane.width > 0.5 || plane.height > 0.5 {
+                        plane.width = w; plane.height = h
+                    }
                 }
             }
             existing.simdTransform = surface.transform
@@ -454,12 +509,23 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let container = SCNNode()
         container.simdTransform = surface.transform
 
-        // ★ BUG B FIX: bright semi-transparent fill so wall is OBVIOUSLY highlighted
+        // ★ NEW: Use a procedural grid texture for the fill — gives a real "3D scan" feel
         if withFill {
             let fillPlane = SCNPlane(width: w, height: h)
             let fillMat = SCNMaterial()
-            fillMat.diffuse.contents = color.withAlphaComponent(0.18)  // was 0.08, doubled
-            fillMat.emission.contents = color.withAlphaComponent(0.20) // adds glow
+            // Tile the grid texture so cells are roughly 20cm × 20cm in the world.
+            let tilesX = max(1.0, w / 0.20)
+            let tilesY = max(1.0, h / 0.20)
+            fillMat.diffuse.contents = (color == .white)
+                ? WallpaperARView.scanGridTextureWhite
+                : WallpaperARView.scanGridTextureCyan
+            fillMat.diffuse.wrapS = .repeat; fillMat.diffuse.wrapT = .repeat
+            fillMat.diffuse.contentsTransform = SCNMatrix4MakeScale(Float(tilesX), Float(tilesY), 1)
+            fillMat.emission.contents = (color == .white)
+                ? WallpaperARView.scanGridTextureWhite
+                : WallpaperARView.scanGridTextureCyan
+            fillMat.emission.wrapS = .repeat; fillMat.emission.wrapT = .repeat
+            fillMat.emission.contentsTransform = SCNMatrix4MakeScale(Float(tilesX), Float(tilesY), 1)
             fillMat.lightingModel = .constant
             fillMat.isDoubleSided = true
             fillMat.blendMode = .alpha
@@ -471,12 +537,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             container.addChildNode(fillNode)
         }
 
-        // ★ BUG B FIX: bright glowing border (thick lines via repeated planes)
+        // Thin bright outline border
         let wirePlane = SCNPlane(width: w, height: h)
         let wireMat = SCNMaterial()
         wireMat.fillMode = .lines
-        wireMat.diffuse.contents = color  // full opacity, was 0.95
-        wireMat.emission.contents = color // full glow, was 0.6
+        wireMat.diffuse.contents = color
+        wireMat.emission.contents = color
         wireMat.lightingModel = .constant
         wireMat.isDoubleSided = true
         wireMat.writesToDepthBuffer = false
@@ -486,38 +552,40 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         wireNode.renderingOrder = 600
         container.addChildNode(wireNode)
 
+        // ★ NEW: 4 bright corner markers — gives that "AR CAD scanning" precision feel
+        if withFill {
+            let cornerSize: CGFloat = 0.10  // 10cm corner brackets
+            let positions: [(Float, Float)] = [
+                (-Float(w/2 - cornerSize/2),  Float(h/2 - cornerSize/2)),  // top-left
+                ( Float(w/2 - cornerSize/2),  Float(h/2 - cornerSize/2)),  // top-right
+                (-Float(w/2 - cornerSize/2), -Float(h/2 - cornerSize/2)),  // bottom-left
+                ( Float(w/2 - cornerSize/2), -Float(h/2 - cornerSize/2)),  // bottom-right
+            ]
+            for (cx, cy) in positions {
+                let dot = SCNPlane(width: cornerSize, height: cornerSize)
+                let dotMat = SCNMaterial()
+                dotMat.diffuse.contents = UIColor.cyan
+                dotMat.emission.contents = UIColor.cyan
+                dotMat.lightingModel = .constant
+                dotMat.isDoubleSided = true
+                dotMat.writesToDepthBuffer = false
+                dotMat.readsFromDepthBuffer = false
+                dot.materials = [dotMat]
+                let dotNode = SCNNode(geometry: dot)
+                dotNode.position = SCNVector3(cx, cy, 0.001)
+                dotNode.renderingOrder = 605
+                // Pulse the corner markers in sync — feels like beacons
+                let p1 = SCNAction.fadeOpacity(to: 0.4, duration: 0.7)
+                let p2 = SCNAction.fadeOpacity(to: 1.0, duration: 0.7)
+                dotNode.runAction(SCNAction.repeatForever(SCNAction.sequence([p1, p2])))
+                container.addChildNode(dotNode)
+            }
+        }
+
         sceneView.scene.rootNode.addChildNode(container)
         scanPreviewNodes[surface.identifier] = container
 
-        // ★ SCAN-LINE: a thin bright horizontal line that sweeps top-to-bottom
-        // continuously, giving the "active scanning" feel.
-        if withFill {
-            let lineHeight: CGFloat = 0.03  // 3cm thick line
-            let scanLinePlane = SCNPlane(width: w, height: lineHeight)
-            let scanMat = SCNMaterial()
-            scanMat.diffuse.contents = UIColor.cyan.withAlphaComponent(0.85)
-            scanMat.emission.contents = UIColor.cyan
-            scanMat.lightingModel = .constant
-            scanMat.isDoubleSided = true
-            scanMat.writesToDepthBuffer = false
-            scanMat.readsFromDepthBuffer = false
-            scanLinePlane.materials = [scanMat]
-            let scanLineNode = SCNNode(geometry: scanLinePlane)
-            scanLineNode.renderingOrder = 605
-            // Position relative to wall's local origin (the wall plane's center).
-            // SCNPlane is in XY of its parent's local space. Move along Y axis.
-            scanLineNode.position = SCNVector3(0, Float(h/2), 0.001)  // start at top
-            container.addChildNode(scanLineNode)
-            // Sweep from top (h/2) to bottom (-h/2) and back, forever.
-            let moveDown = SCNAction.move(by: SCNVector3(0, Float(-h), 0), duration: 1.6)
-            moveDown.timingMode = .easeInEaseOut
-            let moveUp = SCNAction.move(by: SCNVector3(0, Float(h), 0), duration: 1.6)
-            moveUp.timingMode = .easeInEaseOut
-            let sweep = SCNAction.sequence([moveDown, moveUp])
-            scanLineNode.runAction(SCNAction.repeatForever(sweep))
-        }
-
-        // ★ BUG B FIX: dramatic entrance — scale from 0 + fade-in
+        // Smooth entrance: scale-up + fade-in
         container.scale = SCNVector3(0.1, 0.1, 1.0)
         container.opacity = 0
         let scaleAction = SCNAction.scale(to: 1.0, duration: 0.4)
@@ -525,9 +593,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let fadeAction = SCNAction.fadeIn(duration: 0.4)
         let entrance = SCNAction.group([scaleAction, fadeAction])
 
-        // ★ BUG B FIX: continuous pulsing glow so user always sees it's there
-        let pulseUp = SCNAction.fadeOpacity(to: 1.0, duration: 0.8)
-        let pulseDown = SCNAction.fadeOpacity(to: 0.55, duration: 0.8)
+        // Subtle continuous pulse on the whole node
+        let pulseUp = SCNAction.fadeOpacity(to: 1.0, duration: 1.2)
+        let pulseDown = SCNAction.fadeOpacity(to: 0.75, duration: 1.2)
         let pulse = SCNAction.sequence([pulseUp, pulseDown])
         let pulseForever = SCNAction.repeatForever(pulse)
 
@@ -564,11 +632,29 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var verts = [SCNVector3]()
         verts.reserveCapacity(vCount)
         let vS = geo.vertices
+        // Also keep world-space positions for wall-plane proximity test.
+        var worldVerts = [SIMD3<Float>]()
+        worldVerts.reserveCapacity(vCount)
+        let anchorTransform = anchor.transform
         for i in 0..<vCount {
             let p = vS.buffer.contents().advanced(by: vS.offset + vS.stride * i)
                 .assumingMemoryBound(to: SIMD3<Float>.self).pointee
             verts.append(SCNVector3(p.x, p.y, p.z))
+            // Transform local mesh vertex to world space
+            let w4 = anchorTransform * SIMD4<Float>(p.x, p.y, p.z, 1.0)
+            worldVerts.append(SIMD3<Float>(w4.x, w4.y, w4.z))
         }
+
+        // Pre-extract wall planes (normal + center) for proximity test.
+        // We want to SKIP mesh triangles that lie on or very near a RoomPlan wall —
+        // those are the wall itself, and our flat wallpaper plane handles it cleanly.
+        var wallPlanes: [(SIMD3<Float>, SIMD3<Float>)] = []  // (normal, center)
+        for (_, w) in walls {
+            let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
+            let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
+            wallPlanes.append((nrm, center))
+        }
+        let wallProximity: Float = 0.06  // 6cm — mesh within this of a wall is "the wall"
 
         let fEl = geo.faces
         let bpi = fEl.bytesPerIndex
@@ -576,13 +662,51 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let cOpt = geo.classification
         var idx: [UInt32] = []
         for f in 0..<fCount {
-            var isWall = false
+            // ★ Skip walls / floor / ceiling — only OBJECTS in front of walls should occlude
+            var skip = false
             if let c = cOpt {
                 let cv = c.buffer.contents().advanced(by: c.offset + c.stride * f)
                     .assumingMemoryBound(to: UInt8.self).pointee
-                isWall = (ARMeshClassification(rawValue: Int(cv)) == .wall)
+                if let cls = ARMeshClassification(rawValue: Int(cv)) {
+                    switch cls {
+                    case .wall, .floor, .ceiling: skip = true
+                    default: skip = false  // table, seat, window, door, none → occlude these
+                    }
+                }
             }
-            if isWall { continue }
+            if skip { continue }
+
+            // ★ Additionally skip triangles too close to RoomPlan walls — these are
+            // mesh artifacts that would jaggedly occlude our clean wallpaper plane
+            var nearWall = false
+            if !wallPlanes.isEmpty && ipf == 3 {
+                // Read all 3 vertex indices for this triangle
+                var triVerts: [SIMD3<Float>] = []
+                triVerts.reserveCapacity(3)
+                for j in 0..<3 {
+                    let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
+                    let vIdx: UInt32
+                    if bpi == 4 { vIdx = p.assumingMemoryBound(to: UInt32.self).pointee }
+                    else { vIdx = UInt32(p.assumingMemoryBound(to: UInt16.self).pointee) }
+                    if Int(vIdx) < worldVerts.count {
+                        triVerts.append(worldVerts[Int(vIdx)])
+                    }
+                }
+                // If ALL 3 vertices are within wallProximity of any wall plane, skip
+                if triVerts.count == 3 {
+                    for (n, c) in wallPlanes {
+                        let d0 = abs(simd_dot(triVerts[0] - c, n))
+                        let d1 = abs(simd_dot(triVerts[1] - c, n))
+                        let d2 = abs(simd_dot(triVerts[2] - c, n))
+                        if d0 < wallProximity && d1 < wallProximity && d2 < wallProximity {
+                            nearWall = true
+                            break
+                        }
+                    }
+                }
+            }
+            if nearWall { continue }
+
             for j in 0..<ipf {
                 let p = fEl.buffer.contents().advanced(by: (f * ipf + j) * bpi)
                 if bpi == 4 { idx.append(p.assumingMemoryBound(to: UInt32.self).pointee) }
@@ -773,8 +897,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
             m.diffuse.contentsTransform = tileTransform
         } else {
+            // ★ Pre-wallpaper: semi-transparent yellow tint so user can see the
+            // actual room behind the painted selection area. Used during edit mode
+            // before "Apply Wallpaper" is tapped.
             m.lightingModel = .constant
-            m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 1.0)
+            m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 0.5)
         }
         if let n = wpNormal {
             m.normal.contents = n; m.normal.wrapS = .repeat; m.normal.wrapT = .repeat
@@ -1306,7 +1433,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             self.isWallpaperApplied = true
             self.editModeActive = false
             self.removeCursor(); self.endLassoMode()
+
+            // ★ MAGICAL APPEARANCE: fade walls from 0 → wallpaperOpacity smoothly
+            for (_, w) in self.walls {
+                w.node.opacity = 0
+            }
             self.refreshAllWalls()
+            for (_, w) in self.walls {
+                let fadeIn = SCNAction.fadeOpacity(to: 1.0, duration: 0.55)
+                fadeIn.timingMode = .easeInEaseOut
+                w.node.runAction(fadeIn)
+            }
+
             self.emit("wallpaperPlaced", data: ["wallIndex": wI, "success": true, "area": self.totalArea()])
             self.emit("boot", data: ["status": "Wallpaper applied ✅"])
             result(nil)
