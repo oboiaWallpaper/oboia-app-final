@@ -256,8 +256,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             result(nil)
 
-        // ★ NEW: Diagnostic report
-        case "getDiagnosticReport":
+        // ★ NEW: Diagnostic report (Dart calls this 'getDiagnostics')
+        case "getDiagnostics":
             result(diagSnapshot())
 
         case "pauseSession", "resumeSession": result(nil)
