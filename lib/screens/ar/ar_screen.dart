@@ -41,6 +41,7 @@ class _ARScreenState extends State<ARScreen> {
   int _lassoPointCount = 0;
   bool _lassoClosed = false;
   List<List<double>> _lassoScreenPoints = [];
+  Offset? _lassoTapDown;  // Track tap-down position to distinguish taps from drags
 
   @override
   void initState() { super.initState(); _initAR(); }
@@ -156,15 +157,10 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.clearWall(0); setState(() => _wallpaperApplied = false); } catch (_) {}
   }
 
-  // Pen-tool drag lasso handlers
-  Future<void> _lassoBegin(Offset p) async {
-    try { await _arService.lassoBeginDrag(p.dx, p.dy); } catch (e) { _log('Lasso begin: $e'); }
-  }
-  Future<void> _lassoDrag(Offset p) async {
-    try { await _arService.lassoDragPoint(p.dx, p.dy); } catch (_) {}
-  }
-  Future<void> _lassoEnd() async {
-    try { await _arService.lassoEndDrag(); } catch (_) {}
+  // Tap-mode lasso: each tap adds one point. Lines drawn between points.
+  // Close the loop by tapping near the first point.
+  Future<void> _lassoTap(Offset p) async {
+    try { await _arService.lassoAddPoint(p.dx, p.dy); } catch (e) { _log('Lasso tap: $e'); }
   }
 
   Future<void> _applyLasso() async {
@@ -212,17 +208,27 @@ class _ARScreenState extends State<ARScreen> {
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // ★ Lasso drag — using Listener (low-level pointer events) instead of
-        // GestureDetector because GestureDetector fights with the native UiKitView
-        // on iOS, causing only the first touch to register. Listener bypasses the
-        // gesture arena entirely.
+        // ★ Lasso TAP mode — each tap adds one point. Uses Listener for
+        // low-level pointer events that bypass the iOS gesture arena issue
+        // where UiKitView steals touches from GestureDetector.
+        // Logic: track pointer-down position, fire tap on pointer-up only if
+        // finger didn't move more than 10 pixels (i.e. it was a tap, not a drag).
         if (_editMode && _activeTool == 'lasso' && !_lassoClosed)
           Positioned.fill(child: Listener(
             behavior: HitTestBehavior.opaque,
-            onPointerDown: (e) => _lassoBegin(e.localPosition),
-            onPointerMove: (e) => _lassoDrag(e.localPosition),
-            onPointerUp: (e) => _lassoEnd(),
-            onPointerCancel: (e) => _lassoEnd(),
+            onPointerDown: (e) {
+              _lassoTapDown = e.localPosition;
+            },
+            onPointerUp: (e) {
+              final start = _lassoTapDown;
+              _lassoTapDown = null;
+              if (start == null) return;
+              final dx = e.localPosition.dx - start.dx;
+              final dy = e.localPosition.dy - start.dy;
+              if (dx * dx + dy * dy < 100) {  // within 10px = tap, not drag
+                _lassoTap(e.localPosition);
+              }
+            },
             child: Container(color: Colors.transparent))),
 
         // Back button (top-left)
