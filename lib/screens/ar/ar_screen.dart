@@ -38,6 +38,7 @@ class _ARScreenState extends State<ARScreen> {
   final List<String> _logLines = [];
   bool _isScanning = false, _scanDone = false, _wallpaperApplied = false;
   bool _showLog = false;
+  bool _editPanelOpen = false;  // ★ Edit panel visibility (replaces modal sheet)
   bool _occluderEnabled = true;
   String _activeTool = 'erase';
   String _lassoMode = 'erase';
@@ -153,21 +154,7 @@ class _ARScreenState extends State<ARScreen> {
     } catch (e) { _log('Auto-apply: $e'); }
   }
 
-  // ── Edit tool methods (used inside the bottom sheet) ──
-
-  Future<void> _setTool(String tool, StateSetter sheetSetState) async {
-    if (_activeTool == 'lasso' && tool != 'lasso') {
-      try { await _arService.lassoEnd(); } catch (_) {}
-    }
-    if (tool == 'lasso' && _activeTool != 'lasso') {
-      try { await _arService.lassoStart(); } catch (_) {}
-    }
-    sheetSetState(() {});
-    setState(() => _activeTool = tool);
-    if (tool == 'paint' || tool == 'erase') {
-      try { await _arService.setBrushMode(tool); } catch (_) {}
-    }
-  }
+  // ── Edit tool methods ──
 
   Future<void> _setBrushSize(double size) async {
     setState(() => _brushSize = size);
@@ -224,47 +211,38 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  /// Show the edit bottom sheet. Entering this sets the AR view into edit mode
-  /// (enterCutMode); exiting calls exitCutMode.
-  Future<void> _openEditSheet() async {
-    try { await _arService.enterCutMode(0); await _arService.setBrushMode(_activeTool == 'paint' ? 'paint' : 'erase'); } catch (_) {}
+  /// Open the inline edit panel.
+  /// We use a regular Positioned widget (not a modal sheet) so there is no
+  /// barrier dimming the screen and touches still reach the AR view above
+  /// the panel — needed for lasso tapping on walls.
+  Future<void> _openEditPanel() async {
+    if (_editPanelOpen) return;
+    try { await _arService.enterCutMode(0); } catch (_) {}
+    try { await _arService.setBrushMode(_activeTool == 'paint' ? 'paint' : 'erase'); } catch (_) {}
+    setState(() => _editPanelOpen = true);
+  }
 
-    await showModalBottomSheet<void>(
-      context: context,
-      isDismissible: false,
-      enableDrag: false,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (ctx) {
-        return StatefulBuilder(builder: (ctx, sheetSetState) {
-          return _EditSheet(
-            activeTool: _activeTool,
-            brushSize: _brushSize,
-            wallpaperOpacity: _wallpaperOpacity,
-            occluderEnabled: _occluderEnabled,
-            lassoMode: _lassoMode,
-            lassoPointCount: _lassoPointCount,
-            lassoClosed: _lassoClosed,
-            totalWallArea: _totalWallArea,
-            onTool: (t) async { await _setTool(t, sheetSetState); },
-            onBrushSize: _setBrushSize,
-            onOpacity: _setOpacity,
-            onOccluder: (v) async { await _toggleOccluder(v); sheetSetState(() {}); },
-            onLassoModeChanged: (m) => sheetSetState(() => _lassoMode = m),
-            onClearLasso: _clearLassoPoints,
-            onApplyLasso: _applyLasso,
-            onUndo: _undo,
-            onReset: _reset,
-            onDone: () { Navigator.of(ctx).pop(); },
-          );
-        });
-      },
-    );
-
-    // After sheet closes, exit edit mode
-    try { await _arService.exitCutMode(); } catch (_) {}
+  Future<void> _closeEditPanel() async {
+    if (!_editPanelOpen) return;
     if (_activeTool == 'lasso') {
       try { await _arService.lassoEnd(); } catch (_) {}
+    }
+    try { await _arService.exitCutMode(); } catch (_) {}
+    setState(() => _editPanelOpen = false);
+  }
+
+  /// Wrapper for the StatelessWidget _EditSheet callback that takes a
+  /// StateSetter — when calling from the inline panel we just use setState.
+  Future<void> _setToolInline(String tool) async {
+    if (_activeTool == 'lasso' && tool != 'lasso') {
+      try { await _arService.lassoEnd(); } catch (_) {}
+    }
+    if (tool == 'lasso' && _activeTool != 'lasso') {
+      try { await _arService.lassoStart(); } catch (_) {}
+    }
+    setState(() => _activeTool = tool);
+    if (tool == 'paint' || tool == 'erase') {
+      try { await _arService.setBrushMode(tool); } catch (_) {}
     }
   }
 
@@ -290,8 +268,8 @@ class _ARScreenState extends State<ARScreen> {
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // Lasso tap detector (only active when in lasso mode and lasso not closed)
-        if (_activeTool == 'lasso' && !_lassoClosed && _wallpaperApplied)
+        // Lasso tap detector (only active when in lasso mode and edit panel open)
+        if (_activeTool == 'lasso' && !_lassoClosed && _editPanelOpen)
           Positioned.fill(child: Listener(
             behavior: HitTestBehavior.opaque,
             onPointerDown: (e) { _lassoTapDown = e.localPosition; },
@@ -326,8 +304,9 @@ class _ARScreenState extends State<ARScreen> {
             icon: const Icon(Icons.bug_report, color: Colors.white, size: 14),
             label: const Text('Diag', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)))),
 
-        // Edit pencil (top-right, below Diag) — only after wallpaper applied
-        if (_wallpaperApplied)
+        // Edit pencil (top-right, below Diag) — only after wallpaper applied,
+        // and hidden when the edit panel is already open
+        if (_wallpaperApplied && !_editPanelOpen)
           Positioned(top: MediaQuery.of(context).padding.top + 50, right: 12,
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
@@ -335,7 +314,7 @@ class _ARScreenState extends State<ARScreen> {
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
                 minimumSize: const Size(0, 36)),
-              onPressed: _openEditSheet,
+              onPressed: _openEditPanel,
               icon: const Icon(Icons.edit, color: Colors.black, size: 16),
               label: const Text('Edit',
                   style: TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w700)))),
@@ -361,8 +340,8 @@ class _ARScreenState extends State<ARScreen> {
                   style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // Bottom stats bar (after wallpaper applied)
-        if (_wallpaperApplied)
+        // Bottom stats bar (after wallpaper applied AND no edit panel open)
+        if (_wallpaperApplied && !_editPanelOpen)
           Positioned(bottom: 0, left: 0, right: 0,
             child: Container(
               padding: EdgeInsets.fromLTRB(20, 14, 20, MediaQuery.of(context).padding.bottom + 14),
@@ -385,6 +364,31 @@ class _ARScreenState extends State<ARScreen> {
                     label: const Text('Rescan',
                         style: TextStyle(color: Colors.white38, fontSize: 12))),
               ]))),
+
+        // ★ INLINE EDIT PANEL — replaces the modal sheet so touches above it
+        //   still reach the AR view (needed for lasso tapping, brush drags).
+        if (_editPanelOpen)
+          Positioned(bottom: 0, left: 0, right: 0,
+            child: _EditSheet(
+              activeTool: _activeTool,
+              brushSize: _brushSize,
+              wallpaperOpacity: _wallpaperOpacity,
+              occluderEnabled: _occluderEnabled,
+              lassoMode: _lassoMode,
+              lassoPointCount: _lassoPointCount,
+              lassoClosed: _lassoClosed,
+              totalWallArea: _totalWallArea,
+              onTool: _setToolInline,
+              onBrushSize: _setBrushSize,
+              onOpacity: _setOpacity,
+              onOccluder: _toggleOccluder,
+              onLassoModeChanged: (m) => setState(() => _lassoMode = m),
+              onClearLasso: _clearLassoPoints,
+              onApplyLasso: _applyLasso,
+              onUndo: _undo,
+              onReset: _reset,
+              onDone: () { _closeEditPanel(); },
+            )),
 
         // Status pill (small text top-center, double-tap to show log)
         if (!_isScanning)
