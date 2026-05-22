@@ -489,6 +489,34 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.scene.rootNode.addChildNode(container)
         scanPreviewNodes[surface.identifier] = container
 
+        // ★ SCAN-LINE: a thin bright horizontal line that sweeps top-to-bottom
+        // continuously, giving the "active scanning" feel.
+        if withFill {
+            let lineHeight: CGFloat = 0.03  // 3cm thick line
+            let scanLinePlane = SCNPlane(width: w, height: lineHeight)
+            let scanMat = SCNMaterial()
+            scanMat.diffuse.contents = UIColor.cyan.withAlphaComponent(0.85)
+            scanMat.emission.contents = UIColor.cyan
+            scanMat.lightingModel = .constant
+            scanMat.isDoubleSided = true
+            scanMat.writesToDepthBuffer = false
+            scanMat.readsFromDepthBuffer = false
+            scanLinePlane.materials = [scanMat]
+            let scanLineNode = SCNNode(geometry: scanLinePlane)
+            scanLineNode.renderingOrder = 605
+            // Position relative to wall's local origin (the wall plane's center).
+            // SCNPlane is in XY of its parent's local space. Move along Y axis.
+            scanLineNode.position = SCNVector3(0, Float(h/2), 0.001)  // start at top
+            container.addChildNode(scanLineNode)
+            // Sweep from top (h/2) to bottom (-h/2) and back, forever.
+            let moveDown = SCNAction.move(by: SCNVector3(0, Float(-h), 0), duration: 1.6)
+            moveDown.timingMode = .easeInEaseOut
+            let moveUp = SCNAction.move(by: SCNVector3(0, Float(h), 0), duration: 1.6)
+            moveUp.timingMode = .easeInEaseOut
+            let sweep = SCNAction.sequence([moveDown, moveUp])
+            scanLineNode.runAction(SCNAction.repeatForever(sweep))
+        }
+
         // ★ BUG B FIX: dramatic entrance — scale from 0 + fade-in
         container.scale = SCNVector3(0.1, 0.1, 1.0)
         container.opacity = 0
@@ -596,12 +624,40 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         let area = totalArea()
         diag("Built \(built) walls (total area \(area) m²)")
+
+        // ★ FIX: Switch from RoomPlan's ARSession to a regular ARWorldTracking
+        // session WITH sceneReconstruction enabled. This produces ARMeshAnchor
+        // objects which our renderer(_:didAdd:) callback turns into invisible
+        // depth-only geometry — hiding wallpaper behind TVs/curtains/furniture.
+        startMeshTrackingForOccluder()
+
         emit("scanComplete", data: [
             "totalWallArea": area,
             "meshSegments": built,
             "wallsDetected": built
         ])
         emit("boot", data: ["status": "Done: \(built) walls, \(String(format: "%.1f", area)) m²"])
+    }
+
+    /// Start ARKit world tracking with LiDAR scene reconstruction enabled.
+    /// This MUST run AFTER RoomPlan finishes so we don't lose RoomPlan's wall
+    /// detection (RoomPlan's session does not produce mesh anchors itself).
+    private func startMeshTrackingForOccluder() {
+        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
+            diag("scene reconstruction not supported — no occluder available")
+            return
+        }
+        let cfg = ARWorldTrackingConfiguration()
+        cfg.sceneReconstruction = .meshWithClassification
+        cfg.planeDetection = []
+        cfg.environmentTexturing = .none
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            cfg.frameSemantics.insert(.sceneDepth)
+        }
+        // CRITICAL: do NOT reset tracking — that would lose our walls' world position.
+        // Just upgrade the configuration in place.
+        sceneView.session.run(cfg, options: [])
+        diag("startMeshTrackingForOccluder: ran ARWorldTrackingConfiguration with .meshWithClassification (no resetTracking)")
     }
 
     private func buildWall(
@@ -736,7 +792,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         m.transparent.contents = mask
         m.transparent.wrapS = .clamp; m.transparent.wrapT = .clamp
 
-        m.transparency = isWallpaperApplied ? wallpaperOpacity : wallpaperOpacity * 0.7
+        m.transparency = wallpaperOpacity
         return m
     }
 
