@@ -108,23 +108,42 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         emit("diag", data: ["line": line])
     }
 
-    private func diagSnapshot() -> [String: Any] {
-        return [
-            "wallsCount": walls.count,
-            "scanPreviewCount": scanPreviewNodes.count,
-            "occluderCount": occluderNodes.count,
-            "meshAnchorsSeen": meshAnchorCount,
-            "roomUpdates": roomUpdateCount,
-            "lassoPoints": lassoWorldPoints.count,
-            "lassoModeActive": lassoModeActive,
-            "lassoDragging": lassoDragging,
-            "editModeActive": editModeActive,
-            "currentMode": currentMode.rawValue,
-            "isWallpaperApplied": isWallpaperApplied,
-            "occluderEnabled": occluderEnabled,
-            "lastRayHit": lastRayHitInfo,
-            "logTail": Array(diagLog.suffix(50))
-        ]
+    private func diagSnapshot() -> String {
+        // Return formatted text (String) so Dart can cast it directly.
+        var lines: [String] = []
+        lines.append("=== OBOIA DIAGNOSTIC REPORT ===")
+        lines.append("timestamp: \(ISO8601DateFormatter().string(from: Date()))")
+        lines.append("")
+        lines.append("STATE")
+        lines.append("  wallsCount         = \(walls.count)")
+        lines.append("  scanPreviewCount   = \(scanPreviewNodes.count)")
+        lines.append("  occluderCount      = \(occluderNodes.count)")
+        lines.append("  meshAnchorsSeen    = \(meshAnchorCount)   <-- LiDAR mesh activity")
+        lines.append("  roomUpdates        = \(roomUpdateCount)   <-- RoomPlan didUpdate firings")
+        lines.append("  lassoPoints        = \(lassoWorldPoints.count)")
+        lines.append("  lassoModeActive    = \(lassoModeActive)")
+        lines.append("  lassoDragging      = \(lassoDragging)")
+        lines.append("  editModeActive     = \(editModeActive)")
+        lines.append("  currentMode        = \(currentMode.rawValue)")
+        lines.append("  isWallpaperApplied = \(isWallpaperApplied)")
+        lines.append("  occluderEnabled    = \(occluderEnabled)")
+        lines.append("  lastRayHit         = \(lastRayHitInfo)")
+        lines.append("")
+        lines.append("WALLS DETAIL")
+        if walls.isEmpty {
+            lines.append("  (no walls)")
+        } else {
+            for (i, (_, w)) in walls.enumerated() {
+                let pos = w.transform.columns.3
+                lines.append("  Wall #\(i): size=\(w.wallSize.width)x\(w.wallSize.height) center=(\(pos.x),\(pos.y),\(pos.z))")
+            }
+        }
+        lines.append("")
+        lines.append("LOG TAIL (last 100)")
+        for entry in diagLog.suffix(100) {
+            lines.append("  \(entry)")
+        }
+        return lines.joined(separator: "\n")
     }
 
     // ════════════════════════════════════════════════════════════
@@ -912,7 +931,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
             let invWall = simd_inverse(w.transform)
             let localH = invWall * SIMD4<Float>(hit.x, hit.y, hit.z, 1.0)
-            let margin: Float = 0.10
+            // ★ FIX: Generous margin so tapping on curtains, TVs, or anything in
+            // front of the wall still finds the wall behind. The ray-plane
+            // intersection naturally gives us the wall point even if the user
+            // tapped on something occluding it.
+            let margin: Float = 1.0  // 1 meter beyond the wall edge
             let halfW = Float(w.wallSize.width) / 2 + margin
             let halfH = Float(w.wallSize.height) / 2 + margin
             if abs(localH.x) > halfW || abs(localH.y) > halfH { continue }
