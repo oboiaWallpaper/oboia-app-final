@@ -1,19 +1,79 @@
-// lib/screens/walls_list_screen.dart
+// lib/screens/walls/walls_list_screen.dart
 //
-// The user's "home base" between AR sessions. Shows every wall they've
-// scanned + saved, with screenshot thumbnail, wallpaper name + shop, area,
-// rolls, price. Each row can be discarded. Floating "Add Wall" button
-// returns to AR for another scan. "Finish & Cart" goes to cart screen.
+// "My Walls" — the user's staging screen between AR scans and checkout.
+// Lists all walls saved during the current session with thumbnail, name,
+// shop, area, rolls, price. Each row can be discarded (swipe or × icon).
+//
+// Floating "Add Wall" → returns to shop list to pick another wallpaper.
+// "Finish & Cart" → converts each saved wall to a CartItem via your existing
+// CartProvider, clears the staging list, navigates to /cart.
 
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
-import '../models/saved_wall.dart';
-import '../providers/saved_walls_provider.dart';
-import '../theme/app_colors.dart';
+import '../../models/saved_wall.dart';
+import '../../models/cart_model.dart';
+import '../../providers/saved_walls_provider.dart';
+import '../../providers/cart_provider.dart';
+import '../../theme/app_colors.dart';
 
-class WallsListScreen extends StatelessWidget {
+class WallsListScreen extends StatefulWidget {
   const WallsListScreen({super.key});
+  @override
+  State<WallsListScreen> createState() => _WallsListScreenState();
+}
+
+class _WallsListScreenState extends State<WallsListScreen> {
+  bool _moving = false;
+
+  /// Convert SavedWall → CartItem and push into CartProvider. Then clear
+  /// the staging list and navigate to /cart. We approximate the wall as a
+  /// square (width = height = sqrt(area)) since RoomPlan returns multiple
+  /// wall planes per scan — a single width × height pair isn't meaningful
+  /// here, but the area is correct.
+  Future<void> _finishAndGoToCart() async {
+    final saved = context.read<SavedWallsProvider>();
+    final cart = context.read<CartProvider>();
+    if (saved.isEmpty) return;
+
+    setState(() => _moving = true);
+    try {
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      int i = 0;
+      for (final w in saved.walls) {
+        final dim = math.sqrt(w.areaSqm);
+        final cartItem = CartItem(
+          id: '$ts-$i-${w.id}',
+          wallpaperId: w.wallpaper.id,
+          wallpaperName: w.wallpaper.name,
+          wallpaperThumbnail: w.wallpaper.thumbnailUrl,
+          shopId: w.shop.id,
+          shopName: w.shop.name,
+          wallWidth: dim,
+          wallHeight: dim,
+          sqm: w.areaSqm,
+          rollsNeeded: w.rollsNeeded,
+          pricePerRoll: w.wallpaper.price,
+          totalPrice: w.totalPrice,
+          addedAt: DateTime.now(),
+        );
+        await cart.add(cartItem);
+        i++;
+      }
+      saved.clear();
+      if (!mounted) return;
+      context.go('/cart');
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not move walls to cart: $e'),
+          backgroundColor: Colors.red),
+      );
+    } finally {
+      if (mounted) setState(() => _moving = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -40,13 +100,13 @@ class WallsListScreen extends StatelessWidget {
                 _summaryStat('${provider.count}', 'Walls'),
                 _summaryStat('${provider.totalArea.toStringAsFixed(1)} m²', 'Area'),
                 _summaryStat('${provider.totalRolls}', 'Rolls'),
-                _summaryStat('${_formatPrice(provider.totalPrice)}', 'UZS'),
+                _summaryStat(_formatPrice(provider.totalPrice), 'UZS'),
               ]),
             ),
             // List
             Expanded(
               child: ListView.builder(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 100),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 140),
                 itemCount: provider.walls.length,
                 itemBuilder: (ctx, i) => _wallRow(context, provider.walls[i], provider),
               ),
@@ -61,10 +121,13 @@ class WallsListScreen extends StatelessWidget {
             child: FloatingActionButton.extended(
               heroTag: 'finish',
               backgroundColor: Colors.green,
-              icon: const Icon(Icons.shopping_cart_checkout, color: Colors.white),
+              icon: _moving
+                ? const SizedBox(width: 18, height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white))
+                : const Icon(Icons.shopping_cart_checkout, color: Colors.white),
               label: const Text('Finish & Cart',
                   style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              onPressed: () => context.push('/cart'),
+              onPressed: _moving ? null : _finishAndGoToCart,
             ),
           ),
           FloatingActionButton.extended(
@@ -73,7 +136,9 @@ class WallsListScreen extends StatelessWidget {
             icon: const Icon(Icons.add, color: Colors.black),
             label: const Text('Add Wall',
                 style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-            onPressed: () => context.push('/shop-picker'),
+            // Go back to the shops list so user can pick another wallpaper.
+            // Adjust the route below if your shops list lives elsewhere.
+            onPressed: () => context.go('/home'),
           ),
         ]);
       }),
@@ -103,7 +168,7 @@ class WallsListScreen extends StatelessWidget {
           icon: const Icon(Icons.store, color: Colors.black),
           label: const Text('Browse Shops',
             style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 15)),
-          onPressed: () => context.push('/shop-picker'),
+          onPressed: () => context.go('/home'),
         ),
       ]),
     );
@@ -114,6 +179,7 @@ class WallsListScreen extends StatelessWidget {
       key: ValueKey(wall.id),
       direction: DismissDirection.endToStart,
       background: Container(
+        margin: const EdgeInsets.only(bottom: 10),
         alignment: Alignment.centerRight,
         padding: const EdgeInsets.only(right: 24),
         decoration: BoxDecoration(
