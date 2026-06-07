@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/shop_model.dart';
 import '../../models/wallpaper_model.dart';
+import '../../providers/saved_walls_provider.dart';            // ★ NEW
 import '../../providers/shop_provider.dart';
 import '../../services/firestore_service.dart';
 import '../../theme/app_colors.dart';
@@ -167,11 +168,17 @@ class _ShopScreenState extends State<ShopScreen> {
     );
   }
 
-  // CHANGED: now passes wallpaper and shop as extra to the /ar route
+  // ★ CHANGED: after AR returns, if user saved a wall, push /walls
   void _openAR(Shop? shop, Wallpaper w) {
     if (shop == null) return;
     context.read<ShopProvider>().setContext(shop: shop, wallpaper: w);
-    context.push('/ar', extra: {'wallpaper': w, 'shop': shop});
+    context.push('/ar', extra: {'wallpaper': w, 'shop': shop}).then((_) {
+      if (!mounted) return;
+      final staging = context.read<SavedWallsProvider>();
+      if (staging.isNotEmpty) {
+        context.push('/walls');
+      }
+    });
   }
 
   Widget _banner(Shop? shop) {
