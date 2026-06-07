@@ -1,9 +1,17 @@
 // lib/providers/saved_walls_provider.dart
 //
-// Holds the in-memory list of walls the user has saved during the current
-// session. Walls are added after each AR scan-and-save cycle, can be
-// discarded individually from the walls list, and are cleared after a
-// successful cart submission.
+// Temporary in-memory staging list of walls the user has scanned + saved
+// during the current session. This is NOT the cart — it's a holding area
+// between AR scanning and your existing CartProvider/checkout flow.
+//
+// User flow:
+//   AR scan + apply wallpaper + edit → tap Save → SavedWall added here
+//   WallsListScreen displays them with thumbnails and lets user discard
+//   "Finish & Cart" iterates this list, adds each as a CartItem to CartProvider,
+//   then clears this provider and navigates to /cart.
+//
+// Cart aggregation (grouping by wallpaper, by shop, totals) is handled by
+// your existing CartProvider — don't duplicate it here.
 
 import 'package:flutter/foundation.dart';
 import '../models/saved_wall.dart';
@@ -16,13 +24,14 @@ class SavedWallsProvider extends ChangeNotifier {
   bool get isEmpty => _walls.isEmpty;
   bool get isNotEmpty => _walls.isNotEmpty;
 
-  /// Total area across all saved walls (m²)
+  /// Total area across all saved walls (m²) — used by the summary header
+  /// in WallsListScreen. Real cart math happens in CartProvider after handoff.
   double get totalArea => _walls.fold(0.0, (sum, w) => sum + w.areaSqm);
 
-  /// Total rolls across all saved walls
+  /// Total rolls (sum across walls)
   int get totalRolls => _walls.fold(0, (sum, w) => sum + w.rollsNeeded);
 
-  /// Total UZS price across all saved walls
+  /// Total UZS price (sum across walls)
   double get totalPrice => _walls.fold(0.0, (sum, w) => sum + w.totalPrice);
 
   void add(SavedWall wall) {
@@ -39,64 +48,4 @@ class SavedWallsProvider extends ChangeNotifier {
     _walls.clear();
     notifyListeners();
   }
-
-  /// Aggregate walls by wallpaper. Same wallpaper used on multiple walls
-  /// sums area and rolls into one line item. Returns list of CartLineItem.
-  List<CartLineItem> aggregateByWallpaper() {
-    final Map<String, CartLineItem> byWallpaper = {};
-    for (final w in _walls) {
-      final key = w.wallpaper.id;
-      if (byWallpaper.containsKey(key)) {
-        final existing = byWallpaper[key]!;
-        byWallpaper[key] = CartLineItem(
-          shop: existing.shop,
-          wallpaper: existing.wallpaper,
-          totalArea: existing.totalArea + w.areaSqm,
-          wallCount: existing.wallCount + 1,
-        );
-      } else {
-        byWallpaper[key] = CartLineItem(
-          shop: w.shop,
-          wallpaper: w.wallpaper,
-          totalArea: w.areaSqm,
-          wallCount: 1,
-        );
-      }
-    }
-    return byWallpaper.values.toList();
-  }
-
-  /// Group cart line items by shop. Returns map of shopId → list of items.
-  Map<String, List<CartLineItem>> aggregateByShop() {
-    final lines = aggregateByWallpaper();
-    final Map<String, List<CartLineItem>> byShop = {};
-    for (final line in lines) {
-      byShop.putIfAbsent(line.shop.id, () => []).add(line);
-    }
-    return byShop;
-  }
-}
-
-/// An aggregated line item in the cart — one wallpaper, total area across
-/// all walls using it, the resulting rolls/price for that aggregated area.
-class CartLineItem {
-  final dynamic shop;             // ShopModel (avoid circular import in this file)
-  final dynamic wallpaper;        // WallpaperModel
-  final double totalArea;
-  final int wallCount;
-
-  const CartLineItem({
-    required this.shop,
-    required this.wallpaper,
-    required this.totalArea,
-    required this.wallCount,
-  });
-
-  int get rollsNeeded {
-    final perRoll = wallpaper.rollWidth * wallpaper.rollLength;
-    if (perRoll <= 0) return 0;
-    return (totalArea / perRoll).ceil();
-  }
-
-  double get lineTotal => rollsNeeded * wallpaper.price;
 }
