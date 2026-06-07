@@ -14,18 +14,25 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';                        // ★ NEW
+import 'package:uuid/uuid.dart';                               // ★ NEW
 import 'package:url_launcher/url_launcher.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
+import '../../models/saved_wall.dart';                         // ★ NEW
+import '../../providers/saved_walls_provider.dart';            // ★ NEW
 
 const Color goldColor = Color(0xFFFFD369);
 
 class ARScreen extends StatefulWidget {
   final WallpaperModel? wallpaper;
+  final ShopModel? shop;                                       // ★ NEW
   final double pricePerRoll;
   ARScreen({super.key, WallpaperModel? initialWallpaper, ShopModel? initialShop, double? pricePerRoll})
-      : wallpaper = initialWallpaper, pricePerRoll = pricePerRoll ?? 0.0;
+      : wallpaper = initialWallpaper,
+        shop = initialShop,                                    // ★ NEW
+        pricePerRoll = pricePerRoll ?? 0.0;
   @override
   State<ARScreen> createState() => _ARScreenState();
 }
@@ -246,6 +253,30 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
+  // ★ NEW: Save wall to staging list and pop back
+  Future<void> _saveWall() async {
+    if (widget.wallpaper == null || widget.shop == null) {
+      _log('Cannot save: wallpaper or shop missing');
+      return;
+    }
+    setState(() => _statusText = 'Saving wall...');
+    final pngBytes = await _arService.captureScreenshot();
+    if (!mounted) return;
+
+    final saved = SavedWall(
+      id: const Uuid().v4(),
+      shop: widget.shop!,
+      wallpaper: widget.wallpaper!,
+      areaSqm: _totalWallArea,
+      screenshotPng: pngBytes,
+      savedAt: DateTime.now(),
+    );
+    context.read<SavedWallsProvider>().add(saved);
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    }
+  }
+
   @override
   void dispose() {
     _eventSub?.cancel();
@@ -358,11 +389,16 @@ class _ARScreenState extends State<ARScreen> {
                   _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
                 ]),
                 const SizedBox(height: 10),
-                TextButton.icon(
-                    onPressed: _rescan,
-                    icon: const Icon(Icons.replay, color: Colors.white38, size: 14),
-                    label: const Text('Rescan',
-                        style: TextStyle(color: Colors.white38, fontSize: 12))),
+                // ★ CHANGED: Replaced Rescan button with Save Wall button
+                ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+                    onPressed: _saveWall,
+                    icon: const Icon(Icons.check, color: Colors.white, size: 18),
+                    label: const Text('Save Wall',
+                        style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700))),
               ]))),
 
         // ★ INLINE EDIT PANEL — replaces the modal sheet so touches above it
