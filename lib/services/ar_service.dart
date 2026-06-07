@@ -14,7 +14,9 @@
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';                       // ★ NEW: for base64Decode
 import 'dart:io';
+import 'dart:typed_data';                    // ★ NEW: for Uint8List
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -626,6 +628,21 @@ class ARService {
       return result ?? '(empty report)';
     } catch (e) {
       return '(error fetching diagnostics: $e)';
+    }
+  }
+
+  // ── ADDED: Screenshot ──────────────────────────────────────────────────
+
+  /// Capture the current AR scene as a PNG. Returns base64-decoded bytes.
+  /// Used to thumbnail saved walls in the walls list.
+  Future<Uint8List?> captureScreenshot() async {
+    try {
+      final b64 = await _channel.invokeMethod<String>('captureScreenshot');
+      if (b64 == null || b64.isEmpty) return null;
+      return base64Decode(b64);
+    } catch (e) {
+      dlog('AR-DART', 'captureScreenshot failed: $e');
+      return null;
     }
   }
 }
