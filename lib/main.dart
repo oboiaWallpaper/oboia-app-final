@@ -9,6 +9,7 @@ import 'models/shop_model.dart';
 import 'models/wallpaper_model.dart';
 import 'providers/auth_provider.dart';
 import 'providers/cart_provider.dart';
+import 'providers/saved_walls_provider.dart';                  // ★ NEW
 import 'providers/shop_provider.dart';
 import 'screens/ar/ar_screen.dart';
 import 'screens/auth/login_screen.dart';
@@ -25,6 +26,7 @@ import 'screens/orders/orders_screen.dart';
 import 'screens/profile/profile_screen.dart';
 import 'screens/shop/shop_screen.dart';
 import 'screens/splash_screen.dart';
+import 'screens/walls/walls_list_screen.dart';                 // ★ NEW
 import 'services/debug_log_service.dart';
 import 'theme/app_theme.dart';
 
@@ -57,6 +59,7 @@ class OboiaApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AuthProvider()),
         ChangeNotifierProvider(create: (_) => CartProvider()),
         ChangeNotifierProvider(create: (_) => ShopProvider()),
+        ChangeNotifierProvider(create: (_) => SavedWallsProvider()),  // ★ NEW
       ],
       child: Consumer<AuthProvider>(
         builder: (context, auth, _) {
@@ -184,6 +187,10 @@ class OboiaApp extends StatelessWidget {
         GoRoute(
           path: '/craftsman/bonus',
           builder: (_, __) => const CraftsmanBonusScreen(),
+        ),
+        GoRoute(                                               // ★ NEW
+          path: '/walls',
+          builder: (_, __) => const WallsListScreen(),
         ),
       ],
     );
