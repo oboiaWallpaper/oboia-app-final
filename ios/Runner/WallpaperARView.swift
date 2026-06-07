@@ -279,6 +279,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "getDiagnostics":
             result(diagSnapshot())
 
+        // ★ NEW: Capture current AR scene as base64 PNG for wall thumbnail
+        case "captureScreenshot":
+            let snapshot: UIImage = sceneView.snapshot()
+            if let data = snapshot.pngData() {
+                let b64 = data.base64EncodedString()
+                diag("captureScreenshot ok (\(data.count) bytes)")
+                result(b64)
+            } else {
+                diag("captureScreenshot FAILED — pngData() returned nil")
+                result(FlutterError(code: "SNAPSHOT", message: "Could not capture", details: nil))
+            }
+
         case "pauseSession", "resumeSession": result(nil)
         case "placeWallpaper", "switchWallpaper": placeWallpaper(args, result: result)
         case "selectWall":
