@@ -22,6 +22,7 @@ import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
 import '../../models/saved_wall.dart';                         // ★ NEW
 import '../../providers/saved_walls_provider.dart';            // ★ NEW
+import '../../providers/pinned_shop_provider.dart';            // ★ NEW
 
 const Color goldColor = Color(0xFFFFD369);
 
@@ -272,8 +273,19 @@ class _ARScreenState extends State<ARScreen> {
       savedAt: DateTime.now(),
     );
     context.read<SavedWallsProvider>().add(saved);
+
+    // ★ CHANGED: After saving, navigate based on pinned shop state
+    if (!mounted) return;
+    final pinned = context.read<PinnedShopProvider>();
     if (Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
+    }
+    if (pinned.isPinned) {
+      // Pinned: go straight back into the pinned shop's wallpaper catalog
+      context.go('/shop/${pinned.shop!.id}');
+    } else {
+      // Marketplace: back to home for shop browsing
+      context.go('/home');
     }
   }
 
