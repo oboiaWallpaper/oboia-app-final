@@ -16,14 +16,23 @@ class FirestoreService {
 
   // ─── SHOPS ───────────────────────────────────────────────────────────────
 
-  /// Live list of all active shops (home screen).
+  /// Live list of active shops VISIBLE TO CUSTOMERS.
+  /// Filters by admin-set isActive AND subscription status client-side
+  /// (Firestore can't do time-based queries for expiry). Grace-period shops
+  /// stay visible so renewal doesn't drop orders mid-flow.
   Stream<List<Shop>> activeShopsStream() {
     return _db
         .collection(K.shops)
         .where('isActive', isEqualTo: true)
         .snapshots()
-        .map((s) => s.docs.map(Shop.fromDoc).toList()
-          ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase())));
+        .map((s) {
+          final all = s.docs.map(Shop.fromDoc).toList();
+          // Subscription gate: hide expired shops, keep grace-period visible.
+          final visible = all.where((shop) => shop.isVisibleToCustomers).toList();
+          visible.sort((a, b) => a.displayName().toLowerCase()
+              .compareTo(b.displayName().toLowerCase()));
+          return visible;
+        });
   }
 
   Stream<Shop?> shopStream(String shopId) {
@@ -32,6 +41,23 @@ class FirestoreService {
         .doc(shopId)
         .snapshots()
         .map((snap) => snap.exists ? Shop.fromDoc(snap) : null);
+  }
+
+  /// Look up a shop by its token (for pin-by-token flow).
+  /// Returns null if no shop matches, or if the matched shop is not visible
+  /// to customers (inactive or fully expired). Grace-period shops resolve OK.
+  Future<Shop?> shopByToken(String token) async {
+    final trimmed = token.trim().toUpperCase();
+    if (trimmed.isEmpty) return null;
+    final snap = await _db
+        .collection(K.shops)
+        .where('token', isEqualTo: trimmed)
+        .limit(1)
+        .get();
+    if (snap.docs.isEmpty) return null;
+    final shop = Shop.fromDoc(snap.docs.first);
+    if (!shop.isVisibleToCustomers) return null;
+    return shop;
   }
 
   // ─── WALLPAPERS ──────────────────────────────────────────────────────────
