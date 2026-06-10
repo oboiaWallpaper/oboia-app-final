@@ -9,7 +9,8 @@ import 'models/shop_model.dart';
 import 'models/wallpaper_model.dart';
 import 'providers/auth_provider.dart';
 import 'providers/cart_provider.dart';
-import 'providers/saved_walls_provider.dart';                  // ★ NEW
+import 'providers/pinned_shop_provider.dart';                  // ★ NEW
+import 'providers/saved_walls_provider.dart';
 import 'providers/shop_provider.dart';
 import 'screens/ar/ar_screen.dart';
 import 'screens/auth/login_screen.dart';
@@ -24,9 +25,10 @@ import 'screens/home/home_screen.dart';
 import 'screens/orders/order_detail_screen.dart';
 import 'screens/orders/orders_screen.dart';
 import 'screens/profile/profile_screen.dart';
+import 'screens/shop/pin_shop_screen.dart';                    // ★ NEW
 import 'screens/shop/shop_screen.dart';
 import 'screens/splash_screen.dart';
-import 'screens/walls/walls_list_screen.dart';                 // ★ NEW
+import 'screens/walls/walls_list_screen.dart';
 import 'services/debug_log_service.dart';
 import 'theme/app_theme.dart';
 
@@ -59,7 +61,8 @@ class OboiaApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AuthProvider()),
         ChangeNotifierProvider(create: (_) => CartProvider()),
         ChangeNotifierProvider(create: (_) => ShopProvider()),
-        ChangeNotifierProvider(create: (_) => SavedWallsProvider()),  // ★ NEW
+        ChangeNotifierProvider(create: (_) => SavedWallsProvider()),
+        ChangeNotifierProvider(create: (_) => PinnedShopProvider()..hydrate()),  // ★ NEW
       ],
       child: Consumer<AuthProvider>(
         builder: (context, auth, _) {
@@ -123,6 +126,10 @@ class OboiaApp extends StatelessWidget {
           path: '/home',
           builder: (_, __) => const HomeScreen(),
         ),
+        GoRoute(                                               // ★ NEW
+          path: '/pin-shop',
+          builder: (_, __) => const PinShopScreen(),
+        ),
         GoRoute(
           path: '/shop/:shopId',
           builder: (_, state) => ShopScreen(
@@ -131,9 +138,6 @@ class OboiaApp extends StatelessWidget {
         ),
         GoRoute(
           path: '/ar',
-          // CHANGED: Accept optional wallpaper + shop via GoRouter `extra`.
-          // Callers can do: context.go('/ar', extra: {'wallpaper': wp, 'shop': shop});
-          // If no extra is passed, ARScreen falls back to ShopProvider state.
           builder: (_, state) {
             final extra = state.extra;
             WallpaperModel? wp;
@@ -146,7 +150,6 @@ class OboiaApp extends StatelessWidget {
             } else if (extra is WallpaperModel) {
               wp = extra;
             }
-            // CHANGED: also pass pricePerRoll from the wallpaper to ARScreen
             return ARScreen(
               initialWallpaper: wp,
               initialShop: sh,
@@ -188,7 +191,7 @@ class OboiaApp extends StatelessWidget {
           path: '/craftsman/bonus',
           builder: (_, __) => const CraftsmanBonusScreen(),
         ),
-        GoRoute(                                               // ★ NEW
+        GoRoute(
           path: '/walls',
           builder: (_, __) => const WallsListScreen(),
         ),
