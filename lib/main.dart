@@ -9,7 +9,7 @@ import 'models/shop_model.dart';
 import 'models/wallpaper_model.dart';
 import 'providers/auth_provider.dart';
 import 'providers/cart_provider.dart';
-import 'providers/pinned_shop_provider.dart';                  // ★ NEW
+import 'providers/pinned_shop_provider.dart';
 import 'providers/saved_walls_provider.dart';
 import 'providers/shop_provider.dart';
 import 'screens/ar/ar_screen.dart';
@@ -25,10 +25,10 @@ import 'screens/home/home_screen.dart';
 import 'screens/orders/order_detail_screen.dart';
 import 'screens/orders/orders_screen.dart';
 import 'screens/profile/profile_screen.dart';
-import 'screens/shop/pin_shop_screen.dart';                    // ★ NEW
+import 'screens/shop/pin_shop_screen.dart';
 import 'screens/shop/shop_screen.dart';
 import 'screens/splash_screen.dart';
-import 'screens/walls/walls_list_screen.dart';
+import 'screens/walls_list_screen.dart';                       // ★ FIXED PATH
 import 'services/debug_log_service.dart';
 import 'theme/app_theme.dart';
 
@@ -62,7 +62,7 @@ class OboiaApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => CartProvider()),
         ChangeNotifierProvider(create: (_) => ShopProvider()),
         ChangeNotifierProvider(create: (_) => SavedWallsProvider()),
-        ChangeNotifierProvider(create: (_) => PinnedShopProvider()..hydrate()),  // ★ NEW
+        ChangeNotifierProvider(create: (_) => PinnedShopProvider()..hydrate()),
       ],
       child: Consumer<AuthProvider>(
         builder: (context, auth, _) {
@@ -126,7 +126,7 @@ class OboiaApp extends StatelessWidget {
           path: '/home',
           builder: (_, __) => const HomeScreen(),
         ),
-        GoRoute(                                               // ★ NEW
+        GoRoute(
           path: '/pin-shop',
           builder: (_, __) => const PinShopScreen(),
         ),
