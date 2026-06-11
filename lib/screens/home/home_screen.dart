@@ -1,268 +1,446 @@
-// lib/screens/pin_shop/pin_shop_screen.dart
+// lib/screens/home/home_screen.dart
 //
-// Token entry screen. Customer types the SHOP-XXXXX code they got from a
-// physical shop / QR code / business card. On success, app pins to that
-// shop and pops back to home. On failure, shows the error inline.
+// Hybrid mode home screen:
 //
-// QR scanning is deferred to a later round. Manual entry only for now.
+// - NOT pinned: marketplace view. List all active+subscribed shops (the
+//   subscription filter is already in FirestoreService.activeShopsStream).
+//   A small "Have a shop code?" pill at the top opens the pin screen.
+//
+// - PINNED:    the home screen immediately navigates the user into their
+//   pinned shop's catalog. A "Pinned to: ShopName [unpin]" banner stays
+//   visible at the top so the customer always knows their app is locked.
+//
+// The pin is set/cleared via PinnedShopProvider, which persists to disk.
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
-import '../../providers/pinned_shop_provider.dart';
-import '../../theme/app_colors.dart';
 
-class PinShopScreen extends StatefulWidget {
-  const PinShopScreen({super.key});
+import '../../models/shop_model.dart';
+import '../../providers/auth_provider.dart';
+import '../../providers/cart_provider.dart';
+import '../../providers/pinned_shop_provider.dart';
+import '../../services/firestore_service.dart';
+import '../../theme/app_colors.dart';
+import '../../utils/constants.dart';
+import '../../widgets/loading_skeleton.dart';
+import '../../widgets/shop_card.dart';
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
 
   @override
-  State<PinShopScreen> createState() => _PinShopScreenState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _PinShopScreenState extends State<PinShopScreen> {
-  final _controller = TextEditingController();
-  bool _submitting = false;
-  String? _errorText;
+class _HomeScreenState extends State<HomeScreen> {
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+  bool _redirectedToPinned = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Refresh pinned shop subscription state once after first frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      context.read<PinnedShopProvider>().refresh();
+    });
+  }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _submit() async {
-    final raw = _controller.text;
-    if (raw.trim().isEmpty) {
-      setState(() => _errorText = 'Enter a shop code to continue.');
-      return;
-    }
-    setState(() {
-      _submitting = true;
-      _errorText = null;
+  /// If pinned, auto-navigate into the pinned shop's catalog so the customer
+  /// lands inside their shop instead of seeing the marketplace browse.
+  void _maybeRedirectToPinned(BuildContext ctx, Shop? pinned) {
+    if (pinned == null || _redirectedToPinned) return;
+    _redirectedToPinned = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      // Use push so the home screen is still in the stack; back from shop
+      // returns here. The pin banner remains visible at the top of home.
+      ctx.push('/shop/${pinned.id}');
     });
-    final result = await context.read<PinnedShopProvider>().pinByToken(raw);
-    if (!mounted) return;
-    setState(() => _submitting = false);
-    if (result.success) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: Colors.green,
-          content: Text('Pinned to ${result.shop!.displayName()}'),
-          duration: const Duration(seconds: 2),
-        ),
-      );
-      if (context.canPop()) {
-        context.pop();
-      } else {
-        context.go('/home');
-      }
-    } else {
-      setState(() => _errorText = result.message);
-    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    final cart = context.watch<CartProvider>();
     final pinned = context.watch<PinnedShopProvider>();
+    final name = (auth.appUser?.name.split(' ').first ?? 'there');
+
+    // If we're freshly pinned, jump into the shop screen automatically.
+    _maybeRedirectToPinned(context, pinned.shop);
 
     return Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
-        backgroundColor: AppColors.background,
-        elevation: 0,
-        iconTheme: const IconThemeData(color: AppColors.textPrimary),
-        title: const Text(
-          'Shop code',
-          style: TextStyle(
-              color: AppColors.textPrimary, fontWeight: FontWeight.w700),
-        ),
-      ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(height: 12),
-              // Icon header
-              Container(
-                alignment: Alignment.center,
-                padding: const EdgeInsets.symmetric(vertical: 18),
-                child: Container(
-                  width: 72,
-                  height: 72,
-                  decoration: BoxDecoration(
-                    color: AppColors.gold.withOpacity(0.15),
-                    shape: BoxShape.circle,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Hello, $name',
+                          style: const TextStyle(
+                            color: AppColors.textSecondary,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        const Text(
+                          'Find your wallpaper',
+                          style: TextStyle(
+                            color: AppColors.textPrimary,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  child: const Icon(Icons.storefront,
-                      color: AppColors.gold, size: 36),
+                  _iconButton(
+                    Icons.shopping_bag_outlined,
+                    badge: cart.count,
+                    onTap: () => context.push('/cart'),
+                  ),
+                  const SizedBox(width: 8),
+                  _iconButton(
+                    Icons.person_outline_rounded,
+                    onTap: () => context.push('/profile'),
+                  ),
+                ],
+              ),
+            ),
+
+            // Pin banner
+            _PinBanner(
+              pinned: pinned.shop,
+              onEnterCode: () => context.push('/pin-shop'),
+              onOpenShop: (s) => context.push('/shop/${s.id}'),
+              onUnpin: () async {
+                await context.read<PinnedShopProvider>().unpin();
+                _redirectedToPinned = false; // allow re-redirect next time
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Unpinned. Showing all shops.'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                }
+              },
+            ),
+
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+              child: TextField(
+                controller: _searchCtrl,
+                style: const TextStyle(color: AppColors.textPrimary),
+                onChanged: (v) => setState(() => _query = v.toLowerCase()),
+                decoration: InputDecoration(
+                  hintText: 'Search shops',
+                  prefixIcon: const Icon(Icons.search,
+                      color: AppColors.textSecondary, size: 20),
+                  suffixIcon: _query.isNotEmpty
+                      ? IconButton(
+                          icon: const Icon(Icons.clear_rounded,
+                              color: AppColors.textSecondary, size: 18),
+                          onPressed: () {
+                            _searchCtrl.clear();
+                            setState(() => _query = '');
+                          },
+                        )
+                      : null,
                 ),
               ),
+            ),
+            Expanded(
+              child: StreamBuilder<List<Shop>>(
+                stream: FirestoreService.instance.activeShopsStream(),
+                builder: (context, snap) {
+                  if (snap.connectionState == ConnectionState.waiting) {
+                    return ListView.builder(
+                      itemCount: 5,
+                      itemBuilder: (_, __) => const ShopCardSkeleton(),
+                    );
+                  }
+                  if (snap.hasError) {
+                    return _error('Could not load shops.\n${snap.error}');
+                  }
+                  var shops = snap.data ?? const <Shop>[];
 
-              const SizedBox(height: 10),
-              const Text(
-                'Enter your shop code',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: AppColors.textPrimary,
-                  fontSize: 20,
+                  // When pinned, only that shop is shown in the list.
+                  if (pinned.isPinned) {
+                    shops = shops.where((s) => s.id == pinned.shop!.id).toList();
+                  }
+
+                  shops = shops
+                      .where((s) => _query.isEmpty ||
+                          s.displayName().toLowerCase().contains(_query) ||
+                          s.description.toLowerCase().contains(_query))
+                      .toList();
+                  if (shops.isEmpty) {
+                    return _empty(_query.isEmpty
+                        ? (pinned.isPinned
+                            ? 'Your pinned shop is no longer available.\n'
+                                'Tap "Unpin" above to browse all shops.'
+                            : 'No active shops yet.\nCheck back soon.')
+                        : 'No shops match "$_query".');
+                  }
+                  return RefreshIndicator(
+                    color: AppColors.gold,
+                    onRefresh: () async {
+                      await context.read<PinnedShopProvider>().refresh();
+                      await Future.delayed(const Duration(milliseconds: 400));
+                    },
+                    child: ListView.builder(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.only(bottom: 24),
+                      itemCount: shops.length,
+                      itemBuilder: (context, i) {
+                        final shop = shops[i];
+                        return _LiveWallpaperCountCard(
+                          shop: shop,
+                          onTap: () => context.push('/shop/${shop.id}'),
+                        );
+                      },
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _iconButton(IconData icon,
+      {required VoidCallback onTap, int badge = 0}) {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Material(
+          color: AppColors.card,
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: onTap,
+            child: Container(
+              width: 42,
+              height: 42,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                border: Border.all(color: AppColors.border),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: AppColors.textPrimary, size: 20),
+            ),
+          ),
+        ),
+        if (badge > 0)
+          Positioned(
+            right: -4,
+            top: -4,
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppColors.gold,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: AppColors.background, width: 2),
+              ),
+              child: Text(
+                '$badge',
+                style: const TextStyle(
+                  color: Colors.black,
+                  fontSize: 10,
                   fontWeight: FontWeight.w800,
                 ),
               ),
-              const SizedBox(height: 6),
-              const Text(
-                'If a wallpaper shop gave you a code, enter it here to '
-                'lock the app to that shop. Format: SHOP-XXXXX',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-              ),
-              const SizedBox(height: 28),
-
-              // Current pin status
-              if (pinned.isPinned)
-                Container(
-                  margin: const EdgeInsets.only(bottom: 18),
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: AppColors.gold.withOpacity(0.08),
-                    border: Border.all(color: AppColors.gold.withOpacity(0.3)),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.bookmark, color: AppColors.gold, size: 18),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Currently pinned',
-                              style: TextStyle(
-                                color: AppColors.textSecondary, fontSize: 11),
-                            ),
-                            Text(
-                              pinned.shop!.displayName(),
-                              style: const TextStyle(
-                                color: AppColors.textPrimary,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600),
-                            ),
-                          ],
-                        ),
-                      ),
-                      TextButton(
-                        onPressed: () async {
-                          await context.read<PinnedShopProvider>().unpin();
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('Unpinned')),
-                            );
-                          }
-                        },
-                        child: const Text('Unpin',
-                            style: TextStyle(color: AppColors.error)),
-                      ),
-                    ],
-                  ),
-                ),
-
-              // Input field
-              TextField(
-                controller: _controller,
-                textCapitalization: TextCapitalization.characters,
-                autocorrect: false,
-                enableSuggestions: false,
-                style: const TextStyle(
-                  color: AppColors.textPrimary,
-                  fontSize: 18,
-                  letterSpacing: 4,
-                  fontFamily: 'monospace',
-                  fontWeight: FontWeight.w600,
-                ),
-                textAlign: TextAlign.center,
-                inputFormatters: [
-                  LengthLimitingTextInputFormatter(10),
-                  FilteringTextInputFormatter.allow(RegExp(r'[A-Z0-9\-a-z]')),
-                  // Auto-uppercase the input visually
-                  TextInputFormatter.withFunction((oldVal, newVal) {
-                    return TextEditingValue(
-                      text: newVal.text.toUpperCase(),
-                      selection: newVal.selection,
-                    );
-                  }),
-                ],
-                decoration: InputDecoration(
-                  hintText: 'SHOP-XXXXX',
-                  hintStyle: const TextStyle(
-                    color: AppColors.textTertiary,
-                    letterSpacing: 4,
-                  ),
-                  errorText: _errorText,
-                  filled: true,
-                  fillColor: AppColors.card,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 18),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide: BorderSide(color: AppColors.border),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide: BorderSide(color: AppColors.border),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
-                    borderSide:
-                        const BorderSide(color: AppColors.gold, width: 1.5),
-                  ),
-                ),
-                onSubmitted: (_) => _submit(),
-              ),
-              const SizedBox(height: 16),
-
-              // Submit button
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.gold,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14)),
-                ),
-                onPressed: _submitting ? null : _submit,
-                child: _submitting
-                    ? const SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2.5, color: Colors.black))
-                    : const Text(
-                        'Pin to this shop',
-                        style: TextStyle(
-                            color: Colors.black,
-                            fontSize: 15,
-                            fontWeight: FontWeight.bold),
-                      ),
-              ),
-
-              const SizedBox(height: 24),
-
-              // Help text
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 8),
-                child: Text(
-                  'Don\'t have a code? You can skip this and browse all shops '
-                  'normally from the home screen.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: AppColors.textTertiary, fontSize: 12, height: 1.4),
-                ),
-              ),
-            ],
+            ),
           ),
+      ],
+    );
+  }
+
+  Widget _empty(String msg) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.storefront_outlined,
+                color: AppColors.textTertiary, size: 56),
+            const SizedBox(height: 16),
+            Text(
+              msg,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.textSecondary),
+            ),
+          ],
         ),
       ),
+    );
+  }
+
+  Widget _error(String msg) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, color: AppColors.error, size: 48),
+            const SizedBox(height: 12),
+            Text(
+              msg,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.textSecondary),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Banner at the top of home — shows current pin state.
+class _PinBanner extends StatelessWidget {
+  final Shop? pinned;
+  final VoidCallback onEnterCode;
+  final void Function(Shop) onOpenShop;
+  final VoidCallback onUnpin;
+
+  const _PinBanner({
+    required this.pinned,
+    required this.onEnterCode,
+    required this.onOpenShop,
+    required this.onUnpin,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (pinned == null) {
+      // Not pinned — show a small "Have a shop code?" pill
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
+        child: InkWell(
+          onTap: onEnterCode,
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: AppColors.card,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.qr_code_2,
+                    color: AppColors.textSecondary, size: 16),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Have a shop code? Pin your app to one shop.',
+                    style: TextStyle(
+                        color: AppColors.textSecondary, fontSize: 12),
+                  ),
+                ),
+                const Icon(Icons.chevron_right,
+                    color: AppColors.textSecondary, size: 16),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Pinned — show the shop name + unpin button
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: AppColors.gold.withOpacity(0.10),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColors.gold.withOpacity(0.35)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.bookmark, color: AppColors.gold, size: 16),
+            const SizedBox(width: 8),
+            Expanded(
+              child: GestureDetector(
+                onTap: () => onOpenShop(pinned!),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'Pinned to',
+                      style: TextStyle(
+                          color: AppColors.textTertiary, fontSize: 10),
+                    ),
+                    Text(
+                      pinned!.displayName(),
+                      style: const TextStyle(
+                          color: AppColors.textPrimary,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            TextButton(
+              onPressed: onUnpin,
+              style: TextButton.styleFrom(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+                  minimumSize: const Size(0, 28),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+              child: const Text('Unpin',
+                  style: TextStyle(color: AppColors.error, fontSize: 12)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Wraps ShopCard + real-time wallpaper count query per shop.
+class _LiveWallpaperCountCard extends StatelessWidget {
+  final Shop shop;
+  final VoidCallback onTap;
+
+  const _LiveWallpaperCountCard({required this.shop, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection(K.wallpapers)
+          .where('shopId', isEqualTo: shop.id)
+          .where('isApproved', isEqualTo: true)
+          .snapshots(),
+      builder: (context, snap) {
+        final count = snap.data?.docs.length ?? shop.wallpaperCount;
+        return ShopCard(shop: shop, wallpaperCount: count, onTap: onTap);
+      },
     );
   }
 }
