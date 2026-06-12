@@ -1,11 +1,12 @@
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/shop_model.dart';
 import '../../models/wallpaper_model.dart';
-import '../../providers/saved_walls_provider.dart';            // ★ NEW
+import '../../providers/saved_walls_provider.dart';
 import '../../providers/shop_provider.dart';
 import '../../services/firestore_service.dart';
 import '../../theme/app_colors.dart';
@@ -24,6 +25,43 @@ class _ShopScreenState extends State<ShopScreen> {
   String? _category;
   String _query = '';
   final _searchCtrl = TextEditingController();
+
+  // ★ NEW: category ID → display name map. The dashboard saves a wallpaper's
+  // category as the category DOCUMENT ID; without this lookup the chips show
+  // raw IDs like "MOWMZfCKDGrjal61dfsE".
+  Map<String, String> _categoryNames = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCategoryNames();
+  }
+
+  Future<void> _loadCategoryNames() async {
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('categories')
+          .where('shopId', isEqualTo: widget.shopId)
+          .get();
+      if (!mounted) return;
+      setState(() {
+        _categoryNames = {
+          for (final d in snap.docs)
+            d.id: (d.data()['nameEn'] ??
+                    d.data()['nameUz'] ??
+                    d.data()['name'] ??
+                    d.id)
+                .toString(),
+        };
+      });
+    } catch (_) {
+      // Lookup failure is non-fatal — chips fall back to raw values.
+    }
+  }
+
+  /// Display label for a category value (resolves ID → name, falls back to
+  /// the raw value for legacy wallpapers that stored a name directly).
+  String _categoryLabel(String raw) => _categoryNames[raw] ?? raw;
 
   @override
   void dispose() {
@@ -48,7 +86,9 @@ class _ShopScreenState extends State<ShopScreen> {
                 flexibleSpace: FlexibleSpaceBar(
                   background: _banner(shop),
                   title: Text(
-                    shop?.name ?? '',
+                    // ★ CHANGED: displayName resolves nameEn/nameUz from the
+                    // dashboard; plain .name is empty for dashboard-created shops
+                    shop?.displayName() ?? '',
                     style: const TextStyle(
                       color: AppColors.textPrimary,
                       fontWeight: FontWeight.w700,
@@ -109,7 +149,8 @@ class _ShopScreenState extends State<ShopScreen> {
                     for (final w in all)
                       if (w.category.isNotEmpty) w.category
                   }.toList()
-                    ..sort();
+                    ..sort((a, b) =>
+                        _categoryLabel(a).compareTo(_categoryLabel(b)));
 
                   final filtered = all.where((w) {
                     if (_category != null && w.category != _category) {
@@ -168,7 +209,7 @@ class _ShopScreenState extends State<ShopScreen> {
     );
   }
 
-  // ★ CHANGED: after AR returns, if user saved a wall, push /walls
+  // After AR returns, if user saved a wall, push /walls (My Walls list)
   void _openAR(Shop? shop, Wallpaper w) {
     if (shop == null) return;
     context.read<ShopProvider>().setContext(shop: shop, wallpaper: w);
@@ -222,7 +263,9 @@ class _ShopScreenState extends State<ShopScreen> {
           }
           final cat = categories[i - 1];
           final active = _category == cat;
-          return _chip(cat, active, () => setState(() => _category = cat));
+          // ★ CHANGED: show the human-readable name, filter by the raw value
+          return _chip(_categoryLabel(cat), active,
+              () => setState(() => _category = cat));
         },
       ),
     );
