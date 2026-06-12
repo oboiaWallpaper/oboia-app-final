@@ -1,4 +1,4 @@
-// lib/screens/ar/ar_screen.dart — v15 (clean UX flow)
+// lib/screens/ar/ar_screen.dart — v16 (multi-wall navigation fix)
 //
 // Flow:
 //   1. User taps "Start Scan" → grid scanning visual on detected walls
@@ -7,33 +7,35 @@
 //   4. Top-right pencil icon appears
 //   5. Tap pencil → bottom sheet with edit tools (lasso, erase, paint, opacity, occluder)
 //   6. Tap Done in sheet → returns to clean wallpaper view
+//   7. Tap Save Wall → wall saved → pops back to shop screen, which
+//      automatically opens the "My Walls" list (multi-wall home base).
 //
-// No more yellow placeholder layer. No more "Apply Wallpaper" button as a
-// separate step. Edit tools are hidden behind the pencil icon — clean by default.
+// v16 FIX: _saveWall previously called context.go('/home') / go('/shop/..')
+// which wiped the navigation stack and skipped the My Walls list entirely.
+// Now it simply pops; the shop screen's .then() handler pushes /walls.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flutter/services.dart';
-import 'package:provider/provider.dart';                        // ★ NEW
-import 'package:uuid/uuid.dart';                               // ★ NEW
+import 'package:provider/provider.dart';
+import 'package:uuid/uuid.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
-import '../../models/saved_wall.dart';                         // ★ NEW
-import '../../providers/saved_walls_provider.dart';            // ★ NEW
-import '../../providers/pinned_shop_provider.dart';            // ★ NEW
+import '../../models/saved_wall.dart';
+import '../../providers/saved_walls_provider.dart';
 
 const Color goldColor = Color(0xFFFFD369);
 
 class ARScreen extends StatefulWidget {
   final WallpaperModel? wallpaper;
-  final ShopModel? shop;                                       // ★ NEW
+  final ShopModel? shop;
   final double pricePerRoll;
   ARScreen({super.key, WallpaperModel? initialWallpaper, ShopModel? initialShop, double? pricePerRoll})
       : wallpaper = initialWallpaper,
-        shop = initialShop,                                    // ★ NEW
+        shop = initialShop,
         pricePerRoll = pricePerRoll ?? 0.0;
   @override
   State<ARScreen> createState() => _ARScreenState();
@@ -94,7 +96,7 @@ class _ARScreenState extends State<ARScreen> {
           _scanDone = true;
           if (area is num) _totalWallArea = area.toDouble();
         });
-        // ★ NEW: auto-apply wallpaper right after scan completes
+        // ★ auto-apply wallpaper right after scan completes
         _autoApplyWallpaper();
         break;
       case 'wallpaperPlaced':
@@ -255,7 +257,11 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  // ★ NEW: Save wall to staging list and pop back
+  // ★ v16 FIX: Save wall to staging list, then simply POP back to the shop
+  // screen. The shop screen's _openAR .then() handler detects that walls
+  // were saved and pushes the "/walls" (My Walls) list automatically.
+  // Previously this method called context.go('/home') which wiped the
+  // navigation stack and the user never saw the multi-wall list at all.
   Future<void> _saveWall() async {
     if (widget.wallpaper == null || widget.shop == null) {
       _log('Cannot save: wallpaper or shop missing');
@@ -275,18 +281,11 @@ class _ARScreenState extends State<ARScreen> {
     );
     context.read<SavedWallsProvider>().add(saved);
 
-    // ★ CHANGED: After saving, navigate based on pinned shop state
     if (!mounted) return;
-    final pinned = context.read<PinnedShopProvider>();
     if (Navigator.of(context).canPop()) {
-      Navigator.of(context).pop();
-    }
-    if (pinned.isPinned) {
-      // Pinned: go straight back into the pinned shop's wallpaper catalog
-      context.go('/shop/${pinned.shop!.id}');
+      Navigator.of(context).pop();          // → shop screen → auto-opens /walls
     } else {
-      // Marketplace: back to home for shop browsing
-      context.go('/home');
+      context.go('/walls');                 // direct fallback (deep-link case)
     }
   }
 
@@ -402,7 +401,6 @@ class _ARScreenState extends State<ARScreen> {
                   _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
                 ]),
                 const SizedBox(height: 10),
-                // ★ CHANGED: Replaced Rescan button with Save Wall button
                 ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.green,
