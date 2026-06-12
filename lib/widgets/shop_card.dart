@@ -55,7 +55,10 @@ class ShopCard extends StatelessWidget {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Text(
-                    shop.name,
+                    // ★ CHANGED: displayName() resolves nameEn/nameUz written
+                    // by the dashboard. Plain .name was empty for dashboard
+                    // shops, which made every card show "Unnamed shop".
+                    shop.displayName(),
                     style: const TextStyle(
                       color: AppColors.textPrimary,
                       fontSize: 17,
