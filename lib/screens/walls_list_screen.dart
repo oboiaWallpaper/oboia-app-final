@@ -1,4 +1,4 @@
-// lib/screens/walls/walls_list_screen.dart
+// lib/screens/walls_list_screen.dart
 //
 // "My Walls" — the user's staging screen between AR scans and checkout.
 // Lists all walls saved during the current session with thumbnail, name,
@@ -12,11 +12,11 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
-import '../../models/saved_wall.dart';
-import '../../models/cart_model.dart';
-import '../../providers/saved_walls_provider.dart';
-import '../../providers/cart_provider.dart';
-import '../../theme/app_colors.dart';
+import '../models/saved_wall.dart';
+import '../models/cart_model.dart';
+import '../providers/saved_walls_provider.dart';
+import '../providers/cart_provider.dart';
+import '../theme/app_colors.dart';
 
 class WallsListScreen extends StatefulWidget {
   const WallsListScreen({super.key});
@@ -49,7 +49,9 @@ class _WallsListScreenState extends State<WallsListScreen> {
           wallpaperName: w.wallpaper.name,
           wallpaperThumbnail: w.wallpaper.thumbnailUrl,
           shopId: w.shop.id,
-          shopName: w.shop.name,
+          // ★ CHANGED: displayName() resolves nameEn/nameUz written by the
+          // dashboard; plain .name is empty for dashboard-created shops.
+          shopName: w.shop.displayName(),
           wallWidth: dim,
           wallHeight: dim,
           sqm: w.areaSqm,
@@ -137,7 +139,7 @@ class _WallsListScreenState extends State<WallsListScreen> {
             label: const Text('Add Wall',
                 style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
             // Go back to the shops list so user can pick another wallpaper.
-            // Adjust the route below if your shops list lives elsewhere.
+            // If the app is pinned to one shop, home auto-redirects there.
             onPressed: () => context.go('/home'),
           ),
         ]);
@@ -229,7 +231,8 @@ class _WallsListScreenState extends State<WallsListScreen> {
               Row(children: [
                 const Icon(Icons.store, color: AppColors.textTertiary, size: 11),
                 const SizedBox(width: 3),
-                Expanded(child: Text(wall.shop.name,
+                // ★ CHANGED: displayName() instead of .name (Unnamed shop fix)
+                Expanded(child: Text(wall.shop.displayName(),
                   style: const TextStyle(color: AppColors.textSecondary, fontSize: 11),
                   maxLines: 1, overflow: TextOverflow.ellipsis)),
               ]),
