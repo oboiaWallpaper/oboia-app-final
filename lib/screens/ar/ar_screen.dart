@@ -1,20 +1,15 @@
-// lib/screens/ar/ar_screen.dart — v16 (multi-wall navigation fix)
+// lib/screens/ar/ar_screen.dart — v17 (in-AR marketplace browser)
 //
-// Flow:
-//   1. User taps "Start Scan" → grid scanning visual on detected walls
-//   2. User taps "Done Scanning"
-//   3. Wallpaper auto-applies with magical fade-in
-//   4. Top-right pencil icon appears
-//   5. Tap pencil → bottom sheet with edit tools (lasso, erase, paint, opacity, occluder)
-//   6. Tap Done in sheet → returns to clean wallpaper view
-//   7. Tap Save Wall → wall saved → pops back to shop screen, which
-//      automatically opens the "My Walls" list (multi-wall home base).
-//
-// v16 FIX: _saveWall previously called context.go('/home') / go('/shop/..')
-// which wiped the navigation stack and skipped the My Walls list entirely.
-// Now it simply pops; the shop screen's .then() handler pushes /walls.
+// New in v17: an expandable bottom marketplace bar. While viewing a wall the
+// user can swipe up a browser that drills Shops → Categories → Wallpapers
+// (each shown as image tiles). Tapping a wallpaper swaps it LIVE onto the
+// current wall (via ARService.switchWallpaper) and auto-minimizes the bar.
+// The currently-applied wallpaper/shop/price are now mutable state, so
+// Save Wall records whatever the user last selected — from any shop.
 
 import 'dart:async';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:flutter/services.dart';
@@ -22,6 +17,7 @@ import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../services/ar_service.dart';
+import '../../services/firestore_service.dart';
 import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
 import '../../models/saved_wall.dart';
@@ -45,11 +41,16 @@ class _ARScreenState extends State<ARScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
 
+  // ★ v17: the ACTIVE selection is now mutable (was widget.* constants).
+  WallpaperModel? _activeWallpaper;
+  ShopModel? _activeShop;
+  double _activePricePerRoll = 0;
+
   String _statusText = "Initializing...";
   final List<String> _logLines = [];
   bool _isScanning = false, _scanDone = false, _wallpaperApplied = false;
   bool _showLog = false;
-  bool _editPanelOpen = false;  // ★ Edit panel visibility (replaces modal sheet)
+  bool _editPanelOpen = false;
   bool _occluderEnabled = true;
   String _activeTool = 'erase';
   String _lassoMode = 'erase';
@@ -61,8 +62,18 @@ class _ARScreenState extends State<ARScreen> {
   List<List<double>> _lassoScreenPoints = [];
   Offset? _lassoTapDown;
 
+  // ★ v17: marketplace browser state
+  bool _browserOpen = false;
+  bool _swapping = false;
+
   @override
-  void initState() { super.initState(); _initAR(); }
+  void initState() {
+    super.initState();
+    _activeWallpaper = widget.wallpaper;
+    _activeShop = widget.shop;
+    _activePricePerRoll = widget.pricePerRoll;
+    _initAR();
+  }
 
   Future<void> _initAR() async {
     try {
@@ -96,7 +107,6 @@ class _ARScreenState extends State<ARScreen> {
           _scanDone = true;
           if (area is num) _totalWallArea = area.toDouble();
         });
-        // ★ auto-apply wallpaper right after scan completes
         _autoApplyWallpaper();
         break;
       case 'wallpaperPlaced':
@@ -131,9 +141,9 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  double get _rollArea => (widget.wallpaper?.rollWidth ?? 0.53) * (widget.wallpaper?.rollLength ?? 10.0);
+  double get _rollArea => (_activeWallpaper?.rollWidth ?? 0.53) * (_activeWallpaper?.rollLength ?? 10.0);
   int get _rollsNeeded => _rollArea > 0 ? (_totalWallArea / _rollArea).ceil() : 0;
-  double get _totalPrice => _rollsNeeded * widget.pricePerRoll;
+  double get _totalPrice => _rollsNeeded * _activePricePerRoll;
 
   Future<void> _startScan() async {
     setState(() {
@@ -150,22 +160,42 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.stopScan(); } catch (e) { _log('Stop: $e'); }
   }
 
-  /// Auto-apply wallpaper immediately after scan completes
   Future<void> _autoApplyWallpaper() async {
-    if (widget.wallpaper == null) {
+    if (_activeWallpaper == null) {
       _log('No wallpaper selected — skipping auto-apply');
       return;
     }
     try {
       await _arService.placeWallpaper(
-        wallpaper: widget.wallpaper!,
+        wallpaper: _activeWallpaper!,
         wallIndex: 0,
-        pricePerRoll: widget.pricePerRoll,
+        pricePerRoll: _activePricePerRoll,
       );
     } catch (e) { _log('Auto-apply: $e'); }
   }
 
-  // ── Edit tool methods ──
+  // ★ v17: Live-swap the wallpaper on the current wall from the browser.
+  Future<void> _selectWallpaperFromBrowser(WallpaperModel wp, ShopModel shop) async {
+    setState(() {
+      _swapping = true;
+      _activeWallpaper = wp;
+      _activeShop = shop;
+      _activePricePerRoll = wp.price;
+      _browserOpen = false;   // auto-minimize as requested
+    });
+    try {
+      await _arService.switchWallpaper(
+        wallpaper: wp,
+        wallIndex: 0,
+        pricePerRoll: wp.price,
+      );
+      setState(() => _wallpaperApplied = true);
+    } catch (e) {
+      _log('Swap: $e');
+    } finally {
+      if (mounted) setState(() => _swapping = false);
+    }
+  }
 
   Future<void> _setBrushSize(double size) async {
     setState(() => _brushSize = size);
@@ -197,14 +227,6 @@ class _ARScreenState extends State<ARScreen> {
     try { await _arService.lassoClear(); } catch (_) {}
   }
 
-  Future<void> _rescan() async {
-    setState(() {
-      _scanDone = false;
-      _wallpaperApplied = false;
-    });
-    await _startScan();
-  }
-
   Future<void> _sendDiagnosticEmail() async {
     setState(() => _statusText = 'Building diagnostic report...');
     final report = await _arService.getDiagnostics();
@@ -222,10 +244,6 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  /// Open the inline edit panel.
-  /// We use a regular Positioned widget (not a modal sheet) so there is no
-  /// barrier dimming the screen and touches still reach the AR view above
-  /// the panel — needed for lasso tapping on walls.
   Future<void> _openEditPanel() async {
     if (_editPanelOpen) return;
     try { await _arService.enterCutMode(0); } catch (_) {}
@@ -242,8 +260,6 @@ class _ARScreenState extends State<ARScreen> {
     setState(() => _editPanelOpen = false);
   }
 
-  /// Wrapper for the StatelessWidget _EditSheet callback that takes a
-  /// StateSetter — when calling from the inline panel we just use setState.
   Future<void> _setToolInline(String tool) async {
     if (_activeTool == 'lasso' && tool != 'lasso') {
       try { await _arService.lassoEnd(); } catch (_) {}
@@ -257,13 +273,9 @@ class _ARScreenState extends State<ARScreen> {
     }
   }
 
-  // ★ v16 FIX: Save wall to staging list, then simply POP back to the shop
-  // screen. The shop screen's _openAR .then() handler detects that walls
-  // were saved and pushes the "/walls" (My Walls) list automatically.
-  // Previously this method called context.go('/home') which wiped the
-  // navigation stack and the user never saw the multi-wall list at all.
+  // ★ v17: Save uses the ACTIVE wallpaper/shop (whatever was last selected).
   Future<void> _saveWall() async {
-    if (widget.wallpaper == null || widget.shop == null) {
+    if (_activeWallpaper == null || _activeShop == null) {
       _log('Cannot save: wallpaper or shop missing');
       return;
     }
@@ -273,8 +285,8 @@ class _ARScreenState extends State<ARScreen> {
 
     final saved = SavedWall(
       id: const Uuid().v4(),
-      shop: widget.shop!,
-      wallpaper: widget.wallpaper!,
+      shop: _activeShop!,
+      wallpaper: _activeWallpaper!,
       areaSqm: _totalWallArea,
       screenshotPng: pngBytes,
       savedAt: DateTime.now(),
@@ -283,9 +295,9 @@ class _ARScreenState extends State<ARScreen> {
 
     if (!mounted) return;
     if (Navigator.of(context).canPop()) {
-      Navigator.of(context).pop();          // → shop screen → auto-opens /walls
+      Navigator.of(context).pop();
     } else {
-      context.go('/walls');                 // direct fallback (deep-link case)
+      context.go('/walls');
     }
   }
 
@@ -306,12 +318,10 @@ class _ARScreenState extends State<ARScreen> {
             creationParams: const <String, dynamic>{},
             creationParamsCodec: StandardMessageCodec())),
 
-        // Lasso hint painter (yellow ring around first point)
         if (_activeTool == 'lasso' && _lassoScreenPoints.isNotEmpty)
           Positioned.fill(child: IgnorePointer(
             child: CustomPaint(painter: _LassoHintPainter(_lassoScreenPoints, _lassoClosed)))),
 
-        // Lasso tap detector (only active when in lasso mode and edit panel open)
         if (_activeTool == 'lasso' && !_lassoClosed && _editPanelOpen)
           Positioned.fill(child: Listener(
             behavior: HitTestBehavior.opaque,
@@ -322,20 +332,18 @@ class _ARScreenState extends State<ARScreen> {
               if (start == null) return;
               final dx = e.localPosition.dx - start.dx;
               final dy = e.localPosition.dy - start.dy;
-              if (dx * dx + dy * dy < 100) {  // within 10px = tap
+              if (dx * dx + dy * dy < 100) {
                 _lassoTap(e.localPosition);
               }
             },
             child: Container(color: Colors.transparent))),
 
-        // Back button (top-left)
         Positioned(top: MediaQuery.of(context).padding.top + 8, left: 8,
           child: IconButton(
               icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 22),
               style: IconButton.styleFrom(backgroundColor: Colors.black54),
               onPressed: () => Navigator.of(context).pop())),
 
-        // Diag button (top-right corner, always visible)
         Positioned(top: MediaQuery.of(context).padding.top + 8, right: 12,
           child: ElevatedButton.icon(
             style: ElevatedButton.styleFrom(
@@ -347,8 +355,6 @@ class _ARScreenState extends State<ARScreen> {
             icon: const Icon(Icons.bug_report, color: Colors.white, size: 14),
             label: const Text('Diag', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)))),
 
-        // Edit pencil (top-right, below Diag) — only after wallpaper applied,
-        // and hidden when the edit panel is already open
         if (_wallpaperApplied && !_editPanelOpen)
           Positioned(top: MediaQuery.of(context).padding.top + 50, right: 12,
             child: ElevatedButton.icon(
@@ -362,7 +368,6 @@ class _ARScreenState extends State<ARScreen> {
               label: const Text('Edit',
                   style: TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w700)))),
 
-        // Scanning UI
         if (_isScanning) ...[
           Positioned(top: MediaQuery.of(context).padding.top + 50, left: 60, right: 110,
             child: Container(
@@ -383,8 +388,8 @@ class _ARScreenState extends State<ARScreen> {
                   style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // Bottom stats bar (after wallpaper applied AND no edit panel open)
-        if (_wallpaperApplied && !_editPanelOpen)
+        // Bottom stats bar + Save + marketplace handle (after wallpaper applied)
+        if (_wallpaperApplied && !_editPanelOpen && !_browserOpen)
           Positioned(bottom: 0, left: 0, right: 0,
             child: Container(
               padding: EdgeInsets.fromLTRB(20, 14, 20, MediaQuery.of(context).padding.bottom + 14),
@@ -392,9 +397,36 @@ class _ARScreenState extends State<ARScreen> {
                   color: Color(0xE6111111),
                   borderRadius: BorderRadius.only(topLeft: Radius.circular(22), topRight: Radius.circular(22))),
               child: Column(mainAxisSize: MainAxisSize.min, children: [
-                Container(width: 36, height: 4,
-                    decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
-                const SizedBox(height: 12),
+                // ★ v17: "Browse wallpapers" handle — tap to expand the marketplace
+                GestureDetector(
+                  onTap: () => setState(() => _browserOpen = true),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      Container(width: 40, height: 4,
+                          decoration: BoxDecoration(color: Colors.white38, borderRadius: BorderRadius.circular(2))),
+                      const SizedBox(height: 8),
+                      Row(mainAxisAlignment: MainAxisAlignment.center, children: const [
+                        Icon(Icons.grid_view_rounded, color: goldColor, size: 16),
+                        SizedBox(width: 6),
+                        Text('Browse more wallpapers',
+                            style: TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w700)),
+                      ]),
+                    ]),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                // Active selection label
+                if (_activeWallpaper != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      '${_activeWallpaper!.name}'
+                      '${_activeShop != null ? '  ·  ${_activeShop!.displayName()}' : ''}',
+                      style: const TextStyle(color: Colors.white70, fontSize: 12),
+                      maxLines: 1, overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
                 Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
                   _stat('Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
                   _stat('Rolls', '$_rollsNeeded'),
@@ -412,8 +444,14 @@ class _ARScreenState extends State<ARScreen> {
                         style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700))),
               ]))),
 
-        // ★ INLINE EDIT PANEL — replaces the modal sheet so touches above it
-        //   still reach the AR view (needed for lasso tapping, brush drags).
+        // ★ v17: The marketplace browser (expanded)
+        if (_browserOpen && !_editPanelOpen)
+          Positioned(left: 0, right: 0, bottom: 0,
+            child: _MarketplaceBrowser(
+              onClose: () => setState(() => _browserOpen = false),
+              onPick: _selectWallpaperFromBrowser,
+            )),
+
         if (_editPanelOpen)
           Positioned(bottom: 0, left: 0, right: 0,
             child: _EditSheet(
@@ -437,7 +475,12 @@ class _ARScreenState extends State<ARScreen> {
               onDone: () { _closeEditPanel(); },
             )),
 
-        // Status pill (small text top-center, double-tap to show log)
+        if (_swapping)
+          const Positioned(top: 0, left: 0, right: 0, bottom: 0,
+            child: IgnorePointer(
+              child: Center(
+                child: CircularProgressIndicator(color: goldColor)))),
+
         if (!_isScanning)
           Positioned(top: MediaQuery.of(context).padding.top + 90, left: 70, right: 70,
             child: GestureDetector(onDoubleTap: () => setState(() => _showLog = !_showLog),
@@ -476,6 +519,237 @@ class _ARScreenState extends State<ARScreen> {
     const SizedBox(height: 2),
     Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
   ]);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MARKETPLACE BROWSER — Shops → Categories → Wallpapers (image tiles)
+// ─────────────────────────────────────────────────────────────────────
+
+class _MarketplaceBrowser extends StatefulWidget {
+  final VoidCallback onClose;
+  final Future<void> Function(WallpaperModel, ShopModel) onPick;
+  const _MarketplaceBrowser({required this.onClose, required this.onPick});
+
+  @override
+  State<_MarketplaceBrowser> createState() => _MarketplaceBrowserState();
+}
+
+class _MarketplaceBrowserState extends State<_MarketplaceBrowser> {
+  // Navigation level: 0 = shops, 1 = categories, 2 = wallpapers
+  int _level = 0;
+  ShopModel? _shop;
+  String? _categoryId;
+  String _categoryName = '';
+
+  List<Map<String, dynamic>> _categories = [];
+  bool _loadingCats = false;
+
+  Future<void> _openShop(ShopModel shop) async {
+    setState(() {
+      _shop = shop;
+      _level = 1;
+      _loadingCats = true;
+      _categories = [];
+    });
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('categories')
+          .where('shopId', isEqualTo: shop.id)
+          .get();
+      final cats = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+      cats.sort((a, b) => (a['nameEn'] ?? '').toString().compareTo((b['nameEn'] ?? '').toString()));
+      if (mounted) setState(() { _categories = cats; _loadingCats = false; });
+    } catch (_) {
+      if (mounted) setState(() => _loadingCats = false);
+    }
+  }
+
+  void _openCategory(String id, String name) {
+    setState(() { _categoryId = id; _categoryName = name; _level = 2; });
+  }
+
+  void _back() {
+    setState(() {
+      if (_level == 2) { _level = 1; _categoryId = null; }
+      else if (_level == 1) { _level = 0; _shop = null; }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.46,
+      decoration: const BoxDecoration(
+        color: Color(0xF2111111),
+        borderRadius: BorderRadius.only(topLeft: Radius.circular(22), topRight: Radius.circular(22)),
+      ),
+      child: Column(children: [
+        // Header: drag handle + breadcrumb + close
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(width: 40, height: 4,
+                decoration: BoxDecoration(color: Colors.white38, borderRadius: BorderRadius.circular(2))),
+            const SizedBox(height: 10),
+            Row(children: [
+              if (_level > 0)
+                GestureDetector(
+                  onTap: _back,
+                  child: const Padding(
+                    padding: EdgeInsets.only(right: 8),
+                    child: Icon(Icons.arrow_back, color: goldColor, size: 20),
+                  ),
+                ),
+              Expanded(
+                child: Text(
+                  _level == 0 ? 'Shops'
+                    : _level == 1 ? (_shop?.displayName() ?? 'Categories')
+                    : _categoryName,
+                  style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700),
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              GestureDetector(
+                onTap: widget.onClose,
+                child: const Icon(Icons.keyboard_arrow_down, color: Colors.white70, size: 26),
+              ),
+            ]),
+          ]),
+        ),
+        const Divider(color: Colors.white12, height: 1),
+        Expanded(child: _buildLevel()),
+      ]),
+    );
+  }
+
+  Widget _buildLevel() {
+    if (_level == 0) return _buildShops();
+    if (_level == 1) return _buildCategories();
+    return _buildWallpapers();
+  }
+
+  // Level 0 — all visible shops (logo + name)
+  Widget _buildShops() {
+    return StreamBuilder<List<ShopModel>>(
+      stream: FirestoreService.instance.activeShopsStream(),
+      builder: (context, snap) {
+        if (!snap.hasData) return const Center(child: CircularProgressIndicator(color: goldColor));
+        final shops = snap.data!;
+        if (shops.isEmpty) return _empty('No shops available');
+        return GridView.builder(
+          padding: const EdgeInsets.all(14),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 3, mainAxisSpacing: 12, crossAxisSpacing: 12, childAspectRatio: 0.82),
+          itemCount: shops.length,
+          itemBuilder: (_, i) {
+            final s = shops[i];
+            return _tile(
+              imageUrl: s.thumbnailUrl,
+              fallbackIcon: Icons.storefront,
+              label: s.displayName(),
+              onTap: () => _openShop(s),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // Level 1 — categories of the selected shop (category image + name)
+  Widget _buildCategories() {
+    if (_loadingCats) return const Center(child: CircularProgressIndicator(color: goldColor));
+    if (_categories.isEmpty) return _empty('No categories in this shop');
+    return GridView.builder(
+      padding: const EdgeInsets.all(14),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3, mainAxisSpacing: 12, crossAxisSpacing: 12, childAspectRatio: 0.82),
+      itemCount: _categories.length,
+      itemBuilder: (_, i) {
+        final c = _categories[i];
+        final name = (c['nameEn'] ?? c['nameUz'] ?? 'Category').toString();
+        return _tile(
+          imageUrl: (c['image'] ?? '').toString(),
+          fallbackIcon: Icons.category,
+          label: name,
+          onTap: () => _openCategory(c['id'].toString(), name),
+        );
+      },
+    );
+  }
+
+  // Level 2 — wallpapers in the selected shop+category (thumbnail + name)
+  Widget _buildWallpapers() {
+    return StreamBuilder<List<Wallpaper>>(
+      stream: FirestoreService.instance.wallpapersForShopStream(_shop!.id),
+      builder: (context, snap) {
+        if (!snap.hasData) return const Center(child: CircularProgressIndicator(color: goldColor));
+        final all = snap.data!;
+        final inCat = all.where((w) => w.category == _categoryId).toList();
+        if (inCat.isEmpty) return _empty('No wallpapers in this category');
+        return GridView.builder(
+          padding: const EdgeInsets.all(14),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 3, mainAxisSpacing: 12, crossAxisSpacing: 12, childAspectRatio: 0.78),
+          itemCount: inCat.length,
+          itemBuilder: (_, i) {
+            final w = inCat[i];
+            return _tile(
+              imageUrl: w.thumbnailUrl,
+              fallbackIcon: Icons.wallpaper,
+              label: w.name,
+              onTap: () => widget.onPick(w, _shop!),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _tile({
+    required String? imageUrl,
+    required IconData fallbackIcon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    final url = imageUrl ?? '';
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(14),
+            child: url.isNotEmpty
+                ? CachedNetworkImage(
+                    imageUrl: url,
+                    fit: BoxFit.cover,
+                    width: double.infinity,
+                    placeholder: (_, __) => Container(color: Colors.white10),
+                    errorWidget: (_, __, ___) => _iconBox(fallbackIcon),
+                  )
+                : _iconBox(fallbackIcon),
+          ),
+        ),
+        const SizedBox(height: 5),
+        Text(label,
+            style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600),
+            maxLines: 1, overflow: TextOverflow.ellipsis),
+      ]),
+    );
+  }
+
+  Widget _iconBox(IconData icon) => Container(
+        color: Colors.white10,
+        alignment: Alignment.center,
+        child: Icon(icon, color: Colors.white30, size: 30),
+      );
+
+  Widget _empty(String msg) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(30),
+          child: Text(msg, textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white54, fontSize: 13)),
+        ),
+      );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -534,7 +808,6 @@ class _EditSheet extends StatelessWidget {
             decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
         const SizedBox(height: 14),
 
-        // Tool row
         Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
           _toolBtn(Icons.brush, 'Paint', activeTool == 'paint', () => onTool('paint')),
           _toolBtn(Icons.auto_fix_high, 'Erase', activeTool == 'erase', () => onTool('erase')),
@@ -544,7 +817,6 @@ class _EditSheet extends StatelessWidget {
         ]),
         const SizedBox(height: 10),
 
-        // Lasso mode toggles
         if (activeTool == 'lasso')
           Row(mainAxisAlignment: MainAxisAlignment.center, children: [
             const Text('Lasso: ', style: TextStyle(color: Colors.white54, fontSize: 11)),
@@ -561,7 +833,6 @@ class _EditSheet extends StatelessWidget {
                   child: const Text('Clear', style: TextStyle(color: Colors.redAccent, fontSize: 10)))),
           ]),
 
-        // Brush slider (paint/erase only)
         if (activeTool != 'lasso') Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Row(children: [
@@ -574,7 +845,6 @@ class _EditSheet extends StatelessWidget {
           ]),
         ),
 
-        // Opacity slider
         Row(children: [
           const Text('Opacity', style: TextStyle(color: Colors.white60, fontSize: 11)),
           Expanded(child: Slider(
@@ -585,7 +855,6 @@ class _EditSheet extends StatelessWidget {
               style: const TextStyle(color: Colors.white60, fontSize: 11)),
         ]),
 
-        // Occluder toggle
         Row(children: [
           const Icon(Icons.view_in_ar, color: Colors.white38, size: 14),
           const SizedBox(width: 6),
@@ -597,7 +866,6 @@ class _EditSheet extends StatelessWidget {
 
         const SizedBox(height: 6),
 
-        // Apply Lasso button (only when lasso has 3+ points)
         if (activeTool == 'lasso' && lassoPointCount >= 3) Padding(
           padding: const EdgeInsets.only(bottom: 8),
           child: SizedBox(width: double.infinity,
@@ -612,7 +880,6 @@ class _EditSheet extends StatelessWidget {
                   style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13)))),
         ),
 
-        // Done button (closes sheet)
         SizedBox(width: double.infinity,
           child: ElevatedButton.icon(
             style: ElevatedButton.styleFrom(
@@ -653,7 +920,7 @@ class _EditSheet extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// LASSO HINT PAINTER (visible across both screens)
+// LASSO HINT PAINTER
 // ─────────────────────────────────────────────────────────────────────
 
 class _LassoHintPainter extends CustomPainter {
