@@ -1,16 +1,6 @@
 // lib/screens/home/home_screen.dart
 //
-// Hybrid mode home screen:
-//
-// - NOT pinned: marketplace view. List all active+subscribed shops (the
-//   subscription filter is already in FirestoreService.activeShopsStream).
-//   A small "Have a shop code?" pill at the top opens the pin screen.
-//
-// - PINNED:    the home screen immediately navigates the user into their
-//   pinned shop's catalog. A "Pinned to: ShopName [unpin]" banner stays
-//   visible at the top so the customer always knows their app is locked.
-//
-// The pin is set/cleared via PinnedShopProvider, which persists to disk.
+// Hybrid mode home screen with EN/UZ language support.
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
@@ -20,6 +10,7 @@ import 'package:provider/provider.dart';
 import '../../models/shop_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/cart_provider.dart';
+import '../../providers/locale_provider.dart';
 import '../../providers/pinned_shop_provider.dart';
 import '../../services/firestore_service.dart';
 import '../../theme/app_colors.dart';
@@ -39,10 +30,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String _query = '';
   bool _redirectedToPinned = false;
 
+  String _t(String key) => context.read<LocaleProvider>().t(key);
+
   @override
   void initState() {
     super.initState();
-    // Refresh pinned shop subscription state once after first frame.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       context.read<PinnedShopProvider>().refresh();
@@ -55,15 +47,11 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  /// If pinned, auto-navigate into the pinned shop's catalog so the customer
-  /// lands inside their shop instead of seeing the marketplace browse.
   void _maybeRedirectToPinned(BuildContext ctx, Shop? pinned) {
     if (pinned == null || _redirectedToPinned) return;
     _redirectedToPinned = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      // Use push so the home screen is still in the stack; back from shop
-      // returns here. The pin banner remains visible at the top of home.
       ctx.push('/shop/${pinned.id}');
     });
   }
@@ -73,9 +61,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final auth = context.watch<AuthProvider>();
     final cart = context.watch<CartProvider>();
     final pinned = context.watch<PinnedShopProvider>();
-    final name = (auth.appUser?.name.split(' ').first ?? 'there');
+    final locale = context.watch<LocaleProvider>();
+    final name = (auth.appUser?.name.split(' ').first ?? _t('home_there'));
 
-    // If we're freshly pinned, jump into the shop screen automatically.
     _maybeRedirectToPinned(context, pinned.shop);
 
     return Scaffold(
@@ -91,16 +79,16 @@ class _HomeScreenState extends State<HomeScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Hello, $name',
+                          '${_t('home_hello')}, $name',
                           style: const TextStyle(
                             color: AppColors.textSecondary,
                             fontSize: 13,
                           ),
                         ),
                         const SizedBox(height: 2),
-                        const Text(
-                          'Find your wallpaper',
-                          style: TextStyle(
+                        Text(
+                          _t('home_find_wallpaper'),
+                          style: const TextStyle(
                             color: AppColors.textPrimary,
                             fontSize: 24,
                             fontWeight: FontWeight.w800,
@@ -109,6 +97,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       ],
                     ),
                   ),
+                  // ★ Language toggle — tap to switch EN/UZ from the first screen.
+                  _langButton(locale),
+                  const SizedBox(width: 8),
                   _iconButton(
                     Icons.shopping_bag_outlined,
                     badge: cart.count,
@@ -123,19 +114,19 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
 
-            // Pin banner
             _PinBanner(
               pinned: pinned.shop,
+              t: _t,
               onEnterCode: () => context.push('/pin-shop'),
               onOpenShop: (s) => context.push('/shop/${s.id}'),
               onUnpin: () async {
                 await context.read<PinnedShopProvider>().unpin();
-                _redirectedToPinned = false; // allow re-redirect next time
+                _redirectedToPinned = false;
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Unpinned. Showing all shops.'),
-                      duration: Duration(seconds: 2),
+                    SnackBar(
+                      content: Text(_t('home_unpinned_msg')),
+                      duration: const Duration(seconds: 2),
                     ),
                   );
                 }
@@ -149,7 +140,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 style: const TextStyle(color: AppColors.textPrimary),
                 onChanged: (v) => setState(() => _query = v.toLowerCase()),
                 decoration: InputDecoration(
-                  hintText: 'Search shops',
+                  hintText: _t('home_search_shops'),
                   prefixIcon: const Icon(Icons.search,
                       color: AppColors.textSecondary, size: 20),
                   suffixIcon: _query.isNotEmpty
@@ -176,11 +167,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     );
                   }
                   if (snap.hasError) {
-                    return _error('Could not load shops.\n${snap.error}');
+                    return _error('${_t('home_load_error')}\n${snap.error}');
                   }
                   var shops = snap.data ?? const <Shop>[];
 
-                  // When pinned, only that shop is shown in the list.
                   if (pinned.isPinned) {
                     shops = shops.where((s) => s.id == pinned.shop!.id).toList();
                   }
@@ -193,10 +183,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   if (shops.isEmpty) {
                     return _empty(_query.isEmpty
                         ? (pinned.isPinned
-                            ? 'Your pinned shop is no longer available.\n'
-                                'Tap "Unpin" above to browse all shops.'
-                            : 'No active shops yet.\nCheck back soon.')
-                        : 'No shops match "$_query".');
+                            ? _t('home_pinned_unavailable')
+                            : _t('home_no_shops'))
+                        : '${_t('home_no_match')} "$_query".');
                   }
                   return RefreshIndicator(
                     color: AppColors.gold,
@@ -221,6 +210,43 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  // ★ Compact language toggle button showing the current language code.
+  Widget _langButton(LocaleProvider locale) {
+    return Material(
+      color: AppColors.card,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => locale.toggle(),
+        child: Container(
+          height: 42,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            border: Border.all(color: AppColors.border),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.language_rounded,
+                  color: AppColors.gold, size: 18),
+              const SizedBox(width: 4),
+              Text(
+                locale.lang.toUpperCase(),
+                style: const TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -317,15 +343,16 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-/// Banner at the top of home — shows current pin state.
 class _PinBanner extends StatelessWidget {
   final Shop? pinned;
+  final String Function(String) t;
   final VoidCallback onEnterCode;
   final void Function(Shop) onOpenShop;
   final VoidCallback onUnpin;
 
   const _PinBanner({
     required this.pinned,
+    required this.t,
     required this.onEnterCode,
     required this.onOpenShop,
     required this.onUnpin,
@@ -334,7 +361,6 @@ class _PinBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (pinned == null) {
-      // Not pinned — show a small "Have a shop code?" pill
       return Padding(
         padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
         child: InkWell(
@@ -352,10 +378,10 @@ class _PinBanner extends StatelessWidget {
                 const Icon(Icons.qr_code_2,
                     color: AppColors.textSecondary, size: 16),
                 const SizedBox(width: 8),
-                const Expanded(
+                Expanded(
                   child: Text(
-                    'Have a shop code? Pin your app to one shop.',
-                    style: TextStyle(
+                    t('home_have_code'),
+                    style: const TextStyle(
                         color: AppColors.textSecondary, fontSize: 12),
                   ),
                 ),
@@ -368,7 +394,6 @@ class _PinBanner extends StatelessWidget {
       );
     }
 
-    // Pinned — show the shop name + unpin button
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
       child: Container(
@@ -389,9 +414,9 @@ class _PinBanner extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Text(
-                      'Pinned to',
-                      style: TextStyle(
+                    Text(
+                      t('home_pinned_to'),
+                      style: const TextStyle(
                           color: AppColors.textTertiary, fontSize: 10),
                     ),
                     Text(
@@ -412,8 +437,8 @@ class _PinBanner extends StatelessWidget {
                       const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
                   minimumSize: const Size(0, 28),
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-              child: const Text('Unpin',
-                  style: TextStyle(color: AppColors.error, fontSize: 12)),
+              child: Text(t('home_unpin'),
+                  style: const TextStyle(color: AppColors.error, fontSize: 12)),
             ),
           ],
         ),
@@ -422,7 +447,6 @@ class _PinBanner extends StatelessWidget {
   }
 }
 
-/// Wraps ShopCard + real-time wallpaper count query per shop.
 class _LiveWallpaperCountCard extends StatelessWidget {
   final Shop shop;
   final VoidCallback onTap;
