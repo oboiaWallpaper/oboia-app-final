@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/cart_model.dart';
 import '../../providers/cart_provider.dart';
+import '../../providers/locale_provider.dart';
 import '../../theme/app_colors.dart';
 import '../../utils/formatters.dart';
 import '../../widgets/custom_button.dart';
@@ -15,21 +16,23 @@ class CartScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cart = context.watch<CartProvider>();
+    final locale = context.watch<LocaleProvider>();
+    String t(String k) => locale.t(k);
     final items = cart.items;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Your cart'),
+        title: Text(t('cart_title')),
         actions: [
           if (items.isNotEmpty)
             TextButton(
-              onPressed: () => _confirmClear(context),
-              child: const Text('Clear'),
+              onPressed: () => _confirmClear(context, t),
+              child: Text(t('cart_remove')),
             ),
         ],
       ),
       body: items.isEmpty
-          ? _empty(context)
+          ? _empty(context, t)
           : Column(
               children: [
                 Expanded(
@@ -39,18 +42,19 @@ class CartScreen extends StatelessWidget {
                     separatorBuilder: (_, __) => const SizedBox(height: 10),
                     itemBuilder: (context, i) => _CartRow(
                       item: items[i],
+                      t: t,
                       onRemove: () =>
                           context.read<CartProvider>().remove(items[i].id),
                     ),
                   ),
                 ),
-                _footer(context, cart),
+                _footer(context, cart, t),
               ],
             ),
     );
   }
 
-  Widget _empty(BuildContext context) {
+  Widget _empty(BuildContext context, String Function(String) t) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(40),
@@ -60,23 +64,23 @@ class CartScreen extends StatelessWidget {
             const Icon(Icons.shopping_bag_outlined,
                 color: AppColors.textTertiary, size: 64),
             const SizedBox(height: 16),
-            const Text(
-              'Your cart is empty',
-              style: TextStyle(
+            Text(
+              t('cart_empty'),
+              style: const TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 18,
                 fontWeight: FontWeight.w700,
               ),
             ),
             const SizedBox(height: 6),
-            const Text(
-              'Try wallpapers in AR and add them here.',
+            Text(
+              t('cart_empty_sub'),
               textAlign: TextAlign.center,
-              style: TextStyle(color: AppColors.textSecondary),
+              style: const TextStyle(color: AppColors.textSecondary),
             ),
             const SizedBox(height: 24),
             CustomButton(
-              label: 'Browse shops',
+              label: t('cart_browse'),
               variant: ButtonVariant.outline,
               expanded: false,
               onPressed: () => context.go('/home'),
@@ -87,7 +91,8 @@ class CartScreen extends StatelessWidget {
     );
   }
 
-  Widget _footer(BuildContext context, CartProvider cart) {
+  Widget _footer(BuildContext context, CartProvider cart,
+      String Function(String) t) {
     return Container(
       padding: EdgeInsets.fromLTRB(
           16, 12, 16, 12 + MediaQuery.of(context).padding.bottom),
@@ -100,9 +105,10 @@ class CartScreen extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                'Total',
-                style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              Text(
+                t('cart_total'),
+                style: const TextStyle(
+                    color: AppColors.textSecondary, fontSize: 13),
               ),
               Text(
                 Fmt.uzs(cart.grandTotal),
@@ -116,7 +122,7 @@ class CartScreen extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           CustomButton(
-            label: 'Place order',
+            label: t('cart_checkout'),
             icon: Icons.arrow_forward_rounded,
             onPressed: () => context.push('/order-confirm'),
           ),
@@ -125,22 +131,23 @@ class CartScreen extends StatelessWidget {
     );
   }
 
-  Future<void> _confirmClear(BuildContext context) async {
+  Future<void> _confirmClear(
+      BuildContext context, String Function(String) t) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: AppColors.card,
-        title: const Text('Clear cart?'),
-        content: const Text('This will remove all items from your cart.'),
+        title: Text(t('cart_remove')),
+        content: Text(t('cart_empty_sub')),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+            child: Text(t('common_cancel')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Clear',
-                style: TextStyle(color: AppColors.error)),
+            child: Text(t('cart_remove'),
+                style: const TextStyle(color: AppColors.error)),
           ),
         ],
       ),
@@ -154,8 +161,9 @@ class CartScreen extends StatelessWidget {
 class _CartRow extends StatelessWidget {
   final CartItem item;
   final VoidCallback onRemove;
+  final String Function(String) t;
 
-  const _CartRow({required this.item, required this.onRemove});
+  const _CartRow({required this.item, required this.onRemove, required this.t});
 
   @override
   Widget build(BuildContext context) {
@@ -218,7 +226,7 @@ class _CartRow extends StatelessWidget {
                   children: [
                     _chip('${Fmt.meters(item.wallWidth)} × ${Fmt.meters(item.wallHeight)}'),
                     _chip(Fmt.sqm(item.sqm)),
-                    _chip('${item.rollsNeeded} rolls'),
+                    _chip('${item.rollsNeeded} ${t('cart_rolls')}'),
                   ],
                 ),
                 const SizedBox(height: 6),
