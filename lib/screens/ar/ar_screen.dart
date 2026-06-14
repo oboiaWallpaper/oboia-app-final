@@ -355,19 +355,6 @@ class _ARScreenState extends State<ARScreen> {
             icon: const Icon(Icons.bug_report, color: Colors.white, size: 14),
             label: const Text('Diag', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)))),
 
-        if (_wallpaperApplied && !_editPanelOpen)
-          Positioned(top: MediaQuery.of(context).padding.top + 50, right: 12,
-            child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: goldColor,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-                minimumSize: const Size(0, 36)),
-              onPressed: _openEditPanel,
-              icon: const Icon(Icons.edit, color: Colors.black, size: 16),
-              label: const Text('Edit',
-                  style: TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w700)))),
-
         if (_isScanning) ...[
           Positioned(top: MediaQuery.of(context).padding.top + 50, left: 60, right: 110,
             child: Container(
@@ -388,68 +375,63 @@ class _ARScreenState extends State<ARScreen> {
                   style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
-        // Bottom stats bar + Save + marketplace handle (after wallpaper applied)
-        if (_wallpaperApplied && !_editPanelOpen && !_browserOpen)
+        // Bottom panel (after wallpaper applied). Two states share this space:
+        //  - default: stats + a 3-button row (Edit / Save / Browse)
+        //  - browse:  the same panel fills with the marketplace + a Back button
+        if (_wallpaperApplied && !_editPanelOpen)
           Positioned(bottom: 0, left: 0, right: 0,
             child: Container(
-              padding: EdgeInsets.fromLTRB(20, 14, 20, MediaQuery.of(context).padding.bottom + 14),
               decoration: const BoxDecoration(
-                  color: Color(0xE6111111),
+                  color: Color(0xF2111111),
                   borderRadius: BorderRadius.only(topLeft: Radius.circular(22), topRight: Radius.circular(22))),
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                // ★ v17: "Browse wallpapers" handle — tap to expand the marketplace
-                GestureDetector(
-                  onTap: () => setState(() => _browserOpen = true),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      Container(width: 40, height: 4,
-                          decoration: BoxDecoration(color: Colors.white38, borderRadius: BorderRadius.circular(2))),
-                      const SizedBox(height: 8),
-                      Row(mainAxisAlignment: MainAxisAlignment.center, children: const [
-                        Icon(Icons.grid_view_rounded, color: goldColor, size: 16),
-                        SizedBox(width: 6),
-                        Text('Browse more wallpapers',
-                            style: TextStyle(color: goldColor, fontSize: 13, fontWeight: FontWeight.w700)),
+              child: _browserOpen
+                  // ── BROWSE STATE: marketplace inside the bottom panel ──
+                  ? SizedBox(
+                      height: MediaQuery.of(context).size.height * 0.5,
+                      child: _MarketplaceBrowser(
+                        onClose: () => setState(() => _browserOpen = false),
+                        onPick: _selectWallpaperFromBrowser,
+                      ),
+                    )
+                  // ── DEFAULT STATE: stats + 3 buttons ──
+                  : Padding(
+                      padding: EdgeInsets.fromLTRB(16, 14, 16, MediaQuery.of(context).padding.bottom + 14),
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        if (_activeWallpaper != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              '${_activeWallpaper!.name}'
+                              '${_activeShop != null ? '  ·  ${_activeShop!.displayName()}' : ''}',
+                              style: const TextStyle(color: Colors.white70, fontSize: 12),
+                              maxLines: 1, overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                          _stat('Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
+                          _stat('Rolls', '$_rollsNeeded'),
+                          _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
+                        ]),
+                        const SizedBox(height: 14),
+                        // Three-button row: Edit (gold) · Save (green) · Browse (blue)
+                        Row(children: [
+                          Expanded(child: _barButton(
+                            label: 'Edit', icon: Icons.edit,
+                            bg: goldColor, fg: Colors.black,
+                            onTap: _openEditPanel)),
+                          const SizedBox(width: 10),
+                          Expanded(child: _barButton(
+                            label: 'Save', icon: Icons.check,
+                            bg: const Color(0xFF22C55E), fg: Colors.white,
+                            onTap: _saveWall)),
+                          const SizedBox(width: 10),
+                          Expanded(child: _barButton(
+                            label: 'Browse', icon: Icons.grid_view_rounded,
+                            bg: const Color(0xFF3B82F6), fg: Colors.white,
+                            onTap: () => setState(() => _browserOpen = true))),
+                        ]),
                       ]),
-                    ]),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                // Active selection label
-                if (_activeWallpaper != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Text(
-                      '${_activeWallpaper!.name}'
-                      '${_activeShop != null ? '  ·  ${_activeShop!.displayName()}' : ''}',
-                      style: const TextStyle(color: Colors.white70, fontSize: 12),
-                      maxLines: 1, overflow: TextOverflow.ellipsis,
                     ),
-                  ),
-                Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                  _stat('Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
-                  _stat('Rolls', '$_rollsNeeded'),
-                  _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
-                ]),
-                const SizedBox(height: 10),
-                ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green,
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
-                    onPressed: _saveWall,
-                    icon: const Icon(Icons.check, color: Colors.white, size: 18),
-                    label: const Text('Save Wall',
-                        style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700))),
-              ]))),
-
-        // ★ v17: The marketplace browser (expanded)
-        if (_browserOpen && !_editPanelOpen)
-          Positioned(left: 0, right: 0, bottom: 0,
-            child: _MarketplaceBrowser(
-              onClose: () => setState(() => _browserOpen = false),
-              onPick: _selectWallpaperFromBrowser,
             )),
 
         if (_editPanelOpen)
@@ -519,6 +501,29 @@ class _ARScreenState extends State<ARScreen> {
     const SizedBox(height: 2),
     Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
   ]);
+
+  Widget _barButton({
+    required String label,
+    required IconData icon,
+    required Color bg,
+    required Color fg,
+    required VoidCallback onTap,
+  }) {
+    return ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: bg,
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        elevation: 0,
+      ),
+      onPressed: onTap,
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, color: fg, size: 18),
+        const SizedBox(height: 3),
+        Text(label, style: TextStyle(color: fg, fontSize: 12, fontWeight: FontWeight.w700)),
+      ]),
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────
