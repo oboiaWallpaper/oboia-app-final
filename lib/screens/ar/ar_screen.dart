@@ -22,6 +22,7 @@ import '../../models/wallpaper_model.dart';
 import '../../models/shop_model.dart';
 import '../../models/saved_wall.dart';
 import '../../providers/saved_walls_provider.dart';
+import '../../providers/locale_provider.dart';
 
 const Color goldColor = Color(0xFFFFD369);
 
@@ -371,8 +372,8 @@ class _ARScreenState extends State<ARScreen> {
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
               onPressed: _stopScan,
-              child: const Text('Done Scanning',
-                  style: TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
+              child: Text(_t('ar_done_scanning'),
+                  style: const TextStyle(fontSize: 18, color: Colors.black, fontWeight: FontWeight.bold)))),
         ],
 
         // Bottom panel (after wallpaper applied). Two states share this space:
@@ -408,25 +409,25 @@ class _ARScreenState extends State<ARScreen> {
                             ),
                           ),
                         Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-                          _stat('Area', '${_totalWallArea.toStringAsFixed(1)} m²'),
-                          _stat('Rolls', '$_rollsNeeded'),
-                          _stat('Total', '${_totalPrice.toStringAsFixed(0)} UZS'),
+                          _stat(_t('ar_area'), '${_totalWallArea.toStringAsFixed(1)} m²'),
+                          _stat(_t('ar_rolls'), '$_rollsNeeded'),
+                          _stat(_t('ar_total'), '${_totalPrice.toStringAsFixed(0)} UZS'),
                         ]),
                         const SizedBox(height: 14),
                         // Three-button row: Edit (gold) · Save (green) · Browse (blue)
                         Row(children: [
                           Expanded(child: _barButton(
-                            label: 'Edit', icon: Icons.edit,
+                            label: _t('ar_edit'), icon: Icons.edit,
                             bg: goldColor, fg: Colors.black,
                             onTap: _openEditPanel)),
                           const SizedBox(width: 10),
                           Expanded(child: _barButton(
-                            label: 'Save', icon: Icons.check,
+                            label: _t('ar_save'), icon: Icons.check,
                             bg: const Color(0xFF22C55E), fg: Colors.white,
                             onTap: _saveWall)),
                           const SizedBox(width: 10),
                           Expanded(child: _barButton(
-                            label: 'Browse', icon: Icons.grid_view_rounded,
+                            label: _t('ar_browse'), icon: Icons.grid_view_rounded,
                             bg: const Color(0xFF3B82F6), fg: Colors.white,
                             onTap: () => setState(() => _browserOpen = true))),
                         ]),
@@ -490,11 +491,13 @@ class _ARScreenState extends State<ARScreen> {
               onPressed: _startScan,
               backgroundColor: goldColor,
               icon: const Icon(Icons.camera, color: Colors.black),
-              label: const Text('Start Scan',
-                  style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)))
+              label: Text(_t('ar_start_scan'),
+                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)))
           : null,
     );
   }
+
+  String _t(String key) => context.read<LocaleProvider>().t(key);
 
   Widget _stat(String label, String value) => Column(children: [
     Text(value, style: const TextStyle(color: goldColor, fontSize: 18, fontWeight: FontWeight.bold)),
@@ -607,8 +610,8 @@ class _MarketplaceBrowserState extends State<_MarketplaceBrowser> {
                 ),
               Expanded(
                 child: Text(
-                  _level == 0 ? 'Shops'
-                    : _level == 1 ? (_shop?.displayName() ?? 'Categories')
+                  _level == 0 ? context.read<LocaleProvider>().t('ar_shops')
+                    : _level == 1 ? (_shop?.displayName() ?? context.read<LocaleProvider>().t('shop_categories'))
                     : _categoryName,
                   style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700),
                   maxLines: 1, overflow: TextOverflow.ellipsis,
