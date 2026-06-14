@@ -9,6 +9,7 @@ import 'models/shop_model.dart';
 import 'models/wallpaper_model.dart';
 import 'providers/auth_provider.dart';
 import 'providers/cart_provider.dart';
+import 'providers/locale_provider.dart';                       // ★ NEW
 import 'providers/pinned_shop_provider.dart';
 import 'providers/saved_walls_provider.dart';
 import 'providers/shop_provider.dart';
@@ -28,15 +29,13 @@ import 'screens/profile/profile_screen.dart';
 import 'screens/shop/pin_shop_screen.dart';
 import 'screens/shop/shop_screen.dart';
 import 'screens/splash_screen.dart';
-import 'screens/walls_list_screen.dart';                       // ★ FIXED PATH
+import 'screens/walls_list_screen.dart';
 import 'services/debug_log_service.dart';
 import 'theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // CHANGED: Capture all debugPrint output so the in-app debug overlay
-  // can show it. Must run BEFORE anything that prints (Firebase init etc).
   DebugLogService.instance.attach();
 
   SystemChrome.setSystemUIOverlayStyle(
@@ -63,10 +62,11 @@ class OboiaApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => ShopProvider()),
         ChangeNotifierProvider(create: (_) => SavedWallsProvider()),
         ChangeNotifierProvider(create: (_) => PinnedShopProvider()..hydrate()),
+        // ★ NEW: language. hydrate() auto-detects phone locale + restores saved choice.
+        ChangeNotifierProvider(create: (_) => LocaleProvider()..hydrate()),
       ],
       child: Consumer<AuthProvider>(
         builder: (context, auth, _) {
-          // Keep cart bound to the current user
           context.read<CartProvider>().bindUser(
                 auth.firebaseUser?.uid,
               );
@@ -89,7 +89,6 @@ class OboiaApp extends StatelessWidget {
       redirect: (context, state) {
         final loc = state.matchedLocation;
 
-        // Splash handles its own timing
         if (loc == '/splash') return null;
         if (auth.loading) return null;
 
