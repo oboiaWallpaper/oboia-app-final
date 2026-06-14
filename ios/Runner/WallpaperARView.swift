@@ -58,7 +58,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private let maskPxPerMeter: CGFloat = 256
 
     // ★ v14: padding added around each detected wall so paint can extend outward.
-    private let wallPadMeters: CGFloat = 1.5
+    // v15: reduced 1.5→0.8 to limit overlap between adjacent walls' canvases
+    // (overlap caused shimmer/z-fighting and corner raycast misfires).
+    private let wallPadMeters: CGFloat = 0.8
+
+    // ★ v15: ignore RoomPlan wall fragments narrower than this. RoomPlan
+    // sometimes splits one physical wall into a normal piece + a tiny sliver
+    // (e.g. beside a door). The sliver, once padded, overlaps its neighbor and
+    // causes flicker + wrong-wall ray hits, so we drop it.
+    private let minWallWidthMeters: CGFloat = 1.0
 
     // Brush / Lasso / Wallpaper
     private var brushMode: BrushMode = .erase
@@ -342,7 +350,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         c.planeDetection = []
         sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
         currentMode = .idle
-        emit("boot", data: ["status": "AR ready (v14 expand)"])
+        emit("boot", data: ["status": "AR ready (v15 expand)"])
         diag("bootIdleSession ok")
     }
 
@@ -365,8 +373,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ════════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        diag(">>> startScan v14 <<<")
-        emit("boot", data: ["status": ">>> startScan v14 <<<"])
+        diag(">>> startScan v15 <<<")
+        emit("boot", data: ["status": ">>> startScan v15 <<<"])
         guard RoomCaptureSession.isSupported else {
             emit("error", data: ["message": "RoomPlan not supported"])
             result(FlutterError(code: "NOROOMPLAN", message: "Not supported", details: nil))
@@ -775,6 +783,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             diag("Skipped wall \(surface.identifier.uuidString.prefix(8)) too small: \(detW)x\(detH)")
             return false
         }
+        // ★ v15: drop narrow sliver fragments (usually a split of one real wall).
+        guard detW >= minWallWidthMeters else {
+            diag("Skipped sliver wall \(surface.identifier.uuidString.prefix(8)) width \(String(format: "%.2f", detW))m < \(minWallWidthMeters)m")
+            return false
+        }
 
         // ★ v14: oversized padded canvas so paint can extend outward.
         let padW = detW + wallPadMeters * 2
@@ -1169,8 +1182,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
             let invWall = simd_inverse(w.transform)
             let localH = invWall * SIMD4<Float>(hit.x, hit.y, hit.z, 1.0)
-            // Painting can land anywhere on the padded canvas; small extra margin.
-            let margin: Float = 0.5
+            // Painting can land on the padded canvas; small margin. v15: reduced
+            // 0.5→0.25 so taps near a corner resolve to the correct wall instead
+            // of catching a neighbor's padded edge (fixes wrong-line draws).
+            let margin: Float = 0.25
             let halfW = Float(w.wallSize.width) / 2 + margin
             let halfH = Float(w.wallSize.height) / 2 + margin
             if abs(localH.x) > halfW || abs(localH.y) > halfH { continue }
