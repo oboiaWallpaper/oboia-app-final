@@ -6,6 +6,7 @@ import '../../models/cart_model.dart';
 import '../../models/order_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/cart_provider.dart';
+import '../../providers/locale_provider.dart';
 import '../../services/firestore_service.dart';
 import '../../theme/app_colors.dart';
 import '../../utils/formatters.dart';
@@ -25,6 +26,8 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
   final _phone = TextEditingController();
   final _notes = TextEditingController();
   bool _placing = false;
+
+  String _t(String key) => context.read<LocaleProvider>().t(key);
 
   @override
   void dispose() {
@@ -70,7 +73,7 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not place order: $e')),
+        SnackBar(content: Text('${_t('order_placing')} $e')),
       );
     } finally {
       if (mounted) setState(() => _placing = false);
@@ -110,25 +113,20 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
                   color: AppColors.success, size: 32),
             ),
             const SizedBox(height: 14),
-            const Text(
-              'Order placed!',
-              style: TextStyle(
+            Text(
+              _t('order_success'),
+              textAlign: TextAlign.center,
+              style: const TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 18,
                 fontWeight: FontWeight.w700,
               ),
             ),
-            const SizedBox(height: 6),
-            const Text(
-              'The shop will contact you shortly to confirm.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-            ),
           ],
         ),
         actions: [
           CustomButton(
-            label: 'View my orders',
+            label: _t('orders_title'),
             onPressed: () {
               Navigator.of(context).pop();
               context.go('/orders');
@@ -142,16 +140,16 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
   @override
   Widget build(BuildContext context) {
     final cart = context.watch<CartProvider>();
+    context.watch<LocaleProvider>();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Confirm order')),
+      appBar: AppBar(title: Text(_t('order_confirm_title'))),
       body: SafeArea(
         child: Form(
           key: _form,
           child: ListView(
             padding: const EdgeInsets.all(20),
             children: [
-              // Summary
               Container(
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
@@ -162,9 +160,9 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Order summary',
-                      style: TextStyle(
+                    Text(
+                      _t('order_detail_items'),
+                      style: const TextStyle(
                         color: AppColors.textPrimary,
                         fontWeight: FontWeight.w700,
                       ),
@@ -176,7 +174,7 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
                             children: [
                               Expanded(
                                 child: Text(
-                                  '${it.wallpaperName} · ${it.rollsNeeded} rolls',
+                                  '${it.wallpaperName} · ${it.rollsNeeded} ${_t('cart_rolls')}',
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: const TextStyle(
@@ -200,9 +198,9 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text(
-                          'Total',
-                          style: TextStyle(
+                        Text(
+                          _t('cart_total'),
+                          style: const TextStyle(
                             color: AppColors.textPrimary,
                             fontWeight: FontWeight.w700,
                           ),
@@ -222,27 +220,27 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
               ),
               const SizedBox(height: 24),
               CustomTextField(
-                label: 'Delivery address',
+                label: _t('order_address'),
                 controller: _address,
                 prefixIcon: Icons.location_on_outlined,
                 maxLines: 2,
                 validator: (v) => (v == null || v.trim().length < 5)
-                    ? 'Please enter your address'
+                    ? _t('order_address')
                     : null,
               ),
               const SizedBox(height: 14),
               CustomTextField(
-                label: 'Phone number',
+                label: _t('order_phone'),
                 controller: _phone,
                 prefixIcon: Icons.phone_outlined,
                 keyboardType: TextInputType.phone,
                 validator: (v) => (v == null || v.trim().length < 7)
-                    ? 'Enter a valid phone'
+                    ? _t('order_phone_required')
                     : null,
               ),
               const SizedBox(height: 14),
               CustomTextField(
-                label: 'Notes for the shop (optional)',
+                label: _t('order_notes'),
                 controller: _notes,
                 prefixIcon: Icons.notes_rounded,
                 maxLines: 3,
@@ -250,7 +248,7 @@ class _OrderConfirmScreenState extends State<OrderConfirmScreen> {
               ),
               const SizedBox(height: 28),
               CustomButton(
-                label: 'Confirm order',
+                label: _t('order_place'),
                 icon: Icons.check_rounded,
                 loading: _placing,
                 onPressed: cart.items.isEmpty ? null : _placeOrder,
