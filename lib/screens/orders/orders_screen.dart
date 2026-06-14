@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/order_model.dart';
 import '../../providers/auth_provider.dart';
+import '../../providers/locale_provider.dart';
 import '../../services/firestore_service.dart';
 import '../../theme/app_colors.dart';
 import '../../utils/formatters.dart';
@@ -15,10 +16,13 @@ class OrdersScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final uid = context.watch<AuthProvider>().firebaseUser?.uid;
+    final locale = context.watch<LocaleProvider>();
+    String t(String k) => locale.t(k);
+
     return Scaffold(
-      appBar: AppBar(title: const Text('My orders')),
+      appBar: AppBar(title: Text(t('orders_title'))),
       body: uid == null
-          ? const Center(child: Text('Not signed in'))
+          ? Center(child: Text(t('orders_empty')))
           : StreamBuilder<List<AppOrder>>(
               stream:
                   FirestoreService.instance.ordersForCustomerStream(uid),
@@ -40,19 +44,20 @@ class OrdersScreen extends StatelessWidget {
                           const Icon(Icons.receipt_long_outlined,
                               color: AppColors.textTertiary, size: 56),
                           const SizedBox(height: 14),
-                          const Text(
-                            'No orders yet',
-                            style: TextStyle(
+                          Text(
+                            t('orders_empty'),
+                            style: const TextStyle(
                               color: AppColors.textPrimary,
                               fontSize: 18,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
                           const SizedBox(height: 6),
-                          const Text(
-                            'When you place an order, it will appear here.',
+                          Text(
+                            t('cart_empty_sub'),
                             textAlign: TextAlign.center,
-                            style: TextStyle(color: AppColors.textSecondary),
+                            style: const TextStyle(
+                                color: AppColors.textSecondary),
                           ),
                         ],
                       ),
@@ -78,7 +83,7 @@ class _OrderTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final firstItem = order.items.isEmpty ? null : order.items.first;
-    final extra = order.items.length > 1 ? ' +${order.items.length - 1} more' : '';
+    final extra = order.items.length > 1 ? ' +${order.items.length - 1}' : '';
 
     return InkWell(
       borderRadius: BorderRadius.circular(16),
@@ -122,7 +127,8 @@ class _OrderTile extends StatelessWidget {
                   : '${firstItem.wallpaperName}$extra',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              style: const TextStyle(
+                  color: AppColors.textSecondary, fontSize: 13),
             ),
             const SizedBox(height: 8),
             Row(
