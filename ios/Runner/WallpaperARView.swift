@@ -1,4 +1,14 @@
-// WallpaperARView.swift — v14 (paint expansion)
+// WallpaperARView.swift — v15 (preview-leak fix)
+//
+// CHANGES FROM v14:
+//   • FIXED: scan grid + door preview leaking into wallpaper mode and showing
+//     on top of the applied wallpaper (scanPreviewCount stuck at 2). A stray
+//     RoomPlan didUpdate fires AFTER stopScan and re-created the preview nodes.
+//     Now (A) didUpdate is ignored unless currentMode == .scanning, and
+//     (B) processFinalRoom clears any straggler preview nodes before building
+//     walls. This also removes the apparent "wallpaper moved" mismatch — that
+//     was the stale grid (live transform) sitting offset from the wallpaper
+//     (RoomBuilder's re-optimized final transform). Only the two guards changed.
 //
 // CHANGES FROM v13:
 //   • PAINT NOW EXTENDS the wallpaper onto wall area RoomPlan missed.
@@ -731,6 +741,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func processFinalRoom(_ room: CapturedRoom) {
         diag("processFinalRoom: \(room.walls.count) walls, \(room.doors.count) doors, \(room.windows.count) windows, \(room.openings.count) openings")
+        clearScanPreviewNodes()   // ★ v15: remove any leftover scan grid before placing walls
 
         for (_, w) in walls { w.node.removeFromParentNode() }
         walls.removeAll()
@@ -1564,6 +1575,7 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            guard self.currentMode == .scanning else { return }   // ★ v15: ignore stray didUpdate after stopScan
             self.roomUpdateCount += 1
             self.latestCapturedRoom = room
             self.updateScanPreview(from: room)
