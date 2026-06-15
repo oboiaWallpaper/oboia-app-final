@@ -1,14 +1,19 @@
-// WallpaperARView.swift — v13b (v13 base + preview-leak fix)
+// WallpaperARView.swift — v13c (v13 base + preview-leak fix + anchor stability)
 //
-// This is the KNOWN-GOOD v13 (wallpaper sits exactly on the scanned wall —
-// plane built at detected size, no padding). The ONLY additions over v13 are
-// two guards that stop the scan grid from lingering on top of the wallpaper:
-//   • didUpdate ignored unless currentMode == .scanning (a stray RoomPlan
-//     update fires AFTER stopScan and would otherwise re-create the grid).
-//   • processFinalRoom clears any straggler preview nodes before placing walls.
-// The v14/v15 paint-expansion padding is intentionally NOT included — that
-// padding (detected wall + 0.8m on every side, tiled across the padded plane)
-// is what made the wallpaper appear shifted off the scanned area.
+// This is the KNOWN-GOOD v13 geometry (wallpaper at detected size, no padding,
+// sits exactly on the scanned wall). Additions over v13:
+//   • Preview-leak fix: scan grid can no longer linger on top of the wallpaper
+//     (didUpdate ignored unless scanning; preview cleared in processFinalRoom).
+//   • Anchor stability: each wall is attached to an ARKit ARAnchor. When the
+//     occluder's mesh tracking makes ARKit relocalize the world, the wall is
+//     snapped to its corrected anchor transform (session didUpdate anchors) so
+//     the wallpaper stays glued to the real wall instead of sliding off /
+//     shaking. The node is still placed at the detected transform, so if no
+//     correction ever arrives the behaviour is identical to plain v13.
+//   • Occluder rebuilds throttled to ~0.4s per anchor to cut main-thread
+//     stutter when many mesh chunks update at once.
+// NOTE: the v14/v15 paint-expansion padding is intentionally NOT included —
+// that padding is what made the wallpaper appear shifted off the scanned area.
 //
 // KEY CHANGES FROM v12:
 //   • Replaced manual ray-plane math with sceneView.unprojectPoint() — this
@@ -62,8 +67,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var maskImage: UIImage
         var maskSize: CGSize
         var wallSize: CGSize
-        let transform: simd_float4x4
+        var transform: simd_float4x4   // ★ now mutable: updated when ARKit corrects the world
+        var anchorID: UUID?            // ★ ARAnchor that keeps this wall glued to the real wall
     }
+    // ★ Maps an ARAnchor.identifier -> wall surface UUID, so world corrections
+    // are applied to the matching wall (keeps wallpaper from drifting off-wall).
+    private var wallAnchorIDs: [UUID: UUID] = [:]
+    // ★ Throttle for occluder geometry rebuilds (avoid hammering main thread).
+    private var lastOccluderRebuild: [UUID: TimeInterval] = [:]
     private var walls: [UUID: Wall] = [:]
     private let maskPxPerMeter: CGFloat = 256
 
@@ -386,6 +397,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         walls.removeAll()
         clearScanPreviewNodes()
         clearOccluderNodes()
+        clearWallAnchors()
         undoStack.removeAll()
         latestCapturedRoom = nil
         isWallpaperApplied = false
@@ -759,9 +771,19 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // FINAL ROOM PROCESSING
     // ════════════════════════════════════════════════════════════
 
+    private func clearWallAnchors() {
+        for (anchorID, _) in wallAnchorIDs {
+            if let a = sceneView.session.currentFrame?.anchors.first(where: { $0.identifier == anchorID }) {
+                sceneView.session.remove(anchor: a)
+            }
+        }
+        wallAnchorIDs.removeAll()
+    }
+
     private func processFinalRoom(_ room: CapturedRoom) {
         diag("processFinalRoom: \(room.walls.count) walls, \(room.doors.count) doors, \(room.windows.count) windows, \(room.openings.count) openings")
         clearScanPreviewNodes()   // ★ remove any leftover scan grid before placing walls
+        clearWallAnchors()        // ★ drop any stale wall anchors before rebuilding
 
         for (_, w) in walls { w.node.removeFromParentNode() }
         walls.removeAll()
@@ -843,6 +865,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         node.simdTransform = surface.transform
         sceneView.scene.rootNode.addChildNode(node)
 
+        // ★ Anchor the wall to ARKit so it follows world corrections instead of
+        // sliding off the real wall during relocalization. The node is still
+        // placed at surface.transform above, so if no correction ever arrives
+        // the behaviour is identical to before (no regression).
+        let anchor = ARAnchor(name: "wall_\(surface.identifier.uuidString)", transform: surface.transform)
+        sceneView.session.add(anchor: anchor)
+        wallAnchorIDs[anchor.identifier] = surface.identifier
+
         walls[surface.identifier] = Wall(
             id: surface.identifier,
             node: node,
@@ -850,7 +880,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             maskImage: mask,
             maskSize: maskSize,
             wallSize: CGSize(width: wMeters, height: hMeters),
-            transform: surface.transform
+            transform: surface.transform,
+            anchorID: anchor.identifier
         )
         diag("Built wall id=\(surface.identifier.uuidString.prefix(8)) size=\(String(format: "%.2f", wMeters))x\(String(format: "%.2f", hMeters))")
         return true
@@ -1559,6 +1590,20 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         }
     }
 
+    // ★ When ARKit refines the world (e.g. during the occluder relocalization),
+    // it adjusts our wall anchors. Snap each wall node to its corrected anchor
+    // transform and keep the stored transform in sync so paint/raycast stay
+    // aligned. This is what stops the wallpaper from sliding off the wall.
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        for anchor in anchors {
+            guard let wallID = wallAnchorIDs[anchor.identifier],
+                  var w = walls[wallID] else { continue }
+            w.node.simdTransform = anchor.transform
+            w.transform = anchor.transform
+            walls[wallID] = w
+        }
+    }
+
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
         if let ma = anchor as? ARMeshAnchor {
             meshAnchorCount += 1
@@ -1576,6 +1621,10 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
         guard let ma = anchor as? ARMeshAnchor else { return }
+        // ★ Throttle: skip rebuilds that arrive faster than every 0.4s per anchor.
+        let now = CACurrentMediaTime()
+        if let last = lastOccluderRebuild[ma.identifier], now - last < 0.4 { return }
+        lastOccluderRebuild[ma.identifier] = now
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let occ = self.occluderNodes[ma.identifier],
                   let g = self.buildOccluderGeometry(from: ma) else { return }
@@ -1588,6 +1637,7 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.occluderNodes[ma.identifier]?.removeFromParentNode()
             self?.occluderNodes.removeValue(forKey: ma.identifier)
+            self?.lastOccluderRebuild.removeValue(forKey: ma.identifier)
         }
     }
 }
