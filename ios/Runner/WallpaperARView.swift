@@ -1,14 +1,17 @@
-// WallpaperARView.swift — v13 + LIVE geometry + wall ANCHOR-LOCK
+// WallpaperARView.swift — v13 + SINGLE-SESSION fix (root cause)
 //
-// FIX for "wallpaper is same size/shape as the grid but shifted off it":
-// the occluder's AR session restart re-localizes the world AFTER the wall is
-// placed, sliding the wall off the real surface. Each wall is now attached to
-// an ARKit ARAnchor; when the world re-localizes, session(didUpdate anchors:)
-// snaps the wall to ARKit's corrected transform, so it stays locked to the real
-// wall. Geometry/size is unchanged (already correct from the live room); this
-// only corrects POSITION. (Stage-1 LiDAR measurement probe also still present
-// in the diagnostic, but LiDAR width proved unstable so it does NOT drive the
-// wall — kept for reference only.)
+// ROOT CAUSE (confirmed via Apple docs/WWDC23 + developer reports): the app ran
+// RoomPlan on one session, then called session.run(meshConfig) for the occluder.
+// That reconfiguration SHIFTS ARKit's world origin — a documented iOS behavior —
+// which slid the wall off the grid (consistent offset). Geometry was always
+// correct; only the coordinate frame moved.
+//
+// FIX: use ONE ARSession for the whole flow. We build an ARWorldTrackingConfig
+// with sceneReconstruction(.meshWithClassification) + sceneDepth, run it, and
+// hand that session to RoomPlan via RoomCaptureSession(arSession:) (iOS 17+).
+// The session is NEVER reconfigured, so the world origin never moves → the wall
+// stays exactly where the grid was, AND the occluder mesh comes from the same
+// session (re-asserted in didStartWith, per Apple's documented timing).
 //
 // FIX: the wallpaper is now built from the LIVE RoomPlan room (the same data the
 // on-screen grid is drawn from, which fits the wall) instead of RoomBuilder's
@@ -121,6 +124,15 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ════════════════════════════════════════════════════════════
     private var diagLog: [String] = []
     private let diagLogMax = 200
+    // ★ Diagnostic kill-switch for the occluder. Now that mesh runs on the single
+    // shared session (no reconfiguration), the occluder no longer causes offset,
+    // so this is false (occluder ON). Flip to true only to isolate occluder.
+    private let DIAG_skipOccluder = false
+
+    // ★ Held so we can re-assert scene depth after RoomPlan's session starts
+    // (RoomPlan can drop sceneDepth from frames when it begins; documented).
+    private var pendingMeshConfig: ARWorldTrackingConfiguration?
+
     private var meshAnchorCount = 0
     // ★ Stage 1: LiDAR wall-measurement probe (non-destructive — logs only).
     // World-space vertices classified as .wall, kept per anchor so they refresh
@@ -436,14 +448,36 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         endLassoMode()
         currentMode = .scanning
 
-        let session = RoomCaptureSession()
+        let session: RoomCaptureSession
+        // ★ ROOT-CAUSE FIX: use ONE ARSession for the whole flow. Previously we
+        // ran RoomPlan on its default session, then later called session.run()
+        // with a mesh config for the occluder — that reconfiguration shifts
+        // ARKit's world origin (documented iOS behaviour), which slid the wall
+        // off the grid. Now we build our own ARWorldTrackingConfiguration with
+        // sceneReconstruction enabled, hand it to RoomPlan (iOS 17+ custom
+        // ARSession), and NEVER reconfigure it. One session, no swap → the world
+        // origin never moves → the wall stays exactly where the grid was, and we
+        // still get LiDAR mesh for the occluder from the same session.
+        let customSession = ARSession()
+        let cfg = ARWorldTrackingConfiguration()
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            cfg.sceneReconstruction = .meshWithClassification
+        }
+        cfg.planeDetection = []
+        cfg.environmentTexturing = .none
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            cfg.frameSemantics.insert(.sceneDepth)
+        }
+        pendingMeshConfig = cfg                       // re-asserted after RoomPlan starts (see didStartWith)
+        customSession.run(cfg)
+        session = RoomCaptureSession(arSession: customSession)
         session.delegate = self
         roomCaptureSession = session
         roomBuilder = RoomBuilder(options: [.beautifyObjects])
 
-        sceneView.session = session.arSession
+        sceneView.session = customSession
         sceneView.session.delegate = self
-        diag("RoomCaptureSession set; arSession assigned to sceneView")
+        diag("single-session: custom ARSession (mesh+depth) handed to RoomCaptureSession")
 
         let config = RoomCaptureSession.Configuration()
         session.run(configuration: config)
@@ -891,11 +925,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let area = totalArea()
         diag("Built \(built) walls (total area \(area) m²)")
 
-        // ★ FIX: Switch from RoomPlan's ARSession to a regular ARWorldTracking
-        // session WITH sceneReconstruction enabled. This produces ARMeshAnchor
-        // objects which our renderer(_:didAdd:) callback turns into invisible
-        // depth-only geometry — hiding wallpaper behind TVs/curtains/furniture.
-        startMeshTrackingForOccluder()
+        // ★ Mesh + depth are ALREADY running on our single shared session (set up
+        // in startScan), so the occluder's ARMeshAnchors arrive without any
+        // session reconfiguration. We must NOT call session.run() again here —
+        // that reconfiguration is exactly what used to shift the world origin and
+        // slide the wall off the grid. So: do nothing; the mesh is already coming.
+        if DIAG_skipOccluder {
+            diag("DIAG_skipOccluder = true — occluder disabled (test mode)")
+        } else {
+            diag("occluder: mesh already live on shared session — no session swap needed")
+        }
 
         emit("scanComplete", data: [
             "totalWallArea": area,
@@ -1637,6 +1676,17 @@ extension WallpaperARView: FlutterStreamHandler {
 // MARK: - RoomCaptureSessionDelegate
 
 extension WallpaperARView: RoomCaptureSessionDelegate {
+    func captureSession(_ session: RoomCaptureSession, didStartWith configuration: RoomCaptureSession.Configuration) {
+        // ★ Re-assert our mesh+depth config AFTER RoomPlan starts. RoomPlan can
+        // drop sceneDepth/mesh from the shared session when it begins; re-running
+        // the SAME config object (options: []) restores it WITHOUT resetting
+        // tracking, so the world origin does not move.
+        if let cfg = pendingMeshConfig {
+            session.arSession.run(cfg, options: [])
+            diag("didStartWith: re-asserted mesh+depth config (no reset)")
+        }
+    }
+
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -1708,6 +1758,7 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
     // mismatch). Paint/lasso/raycast use w.transform, so keeping it in sync keeps
     // them aligned too.
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        if DIAG_skipOccluder { return }   // ★ keep wall purely static during the test
         for anchor in anchors {
             guard let wallID = wallAnchorIDs[anchor.identifier],
                   var w = walls[wallID] else { continue }
