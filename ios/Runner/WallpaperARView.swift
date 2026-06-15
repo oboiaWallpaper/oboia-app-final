@@ -1,11 +1,14 @@
-// WallpaperARView.swift — v13 + LIVE-geometry wallpaper + Stage-1 LiDAR probe
+// WallpaperARView.swift — v13 + LIVE geometry + wall ANCHOR-LOCK
 //
-// STAGE 1 (non-destructive): measures the wall from the LiDAR mesh and logs it
-// in the diagnostic report under "LIDAR WALL FIT". Nothing visible changes yet —
-// the wallpaper still renders from the live RoomPlan room. The point is to scan
-// the SAME wall a few times and confirm the LiDAR measurement stays steady
-// (RoomPlan's won't) BEFORE we let LiDAR drive the wall. If the lidar number is
-// stable, Stage 2 swaps the wall source over and wires the tools to it.
+// FIX for "wallpaper is same size/shape as the grid but shifted off it":
+// the occluder's AR session restart re-localizes the world AFTER the wall is
+// placed, sliding the wall off the real surface. Each wall is now attached to
+// an ARKit ARAnchor; when the world re-localizes, session(didUpdate anchors:)
+// snaps the wall to ARKit's corrected transform, so it stays locked to the real
+// wall. Geometry/size is unchanged (already correct from the live room); this
+// only corrects POSITION. (Stage-1 LiDAR measurement probe also still present
+// in the diagnostic, but LiDAR width proved unstable so it does NOT drive the
+// wall — kept for reference only.)
 //
 // FIX: the wallpaper is now built from the LIVE RoomPlan room (the same data the
 // on-screen grid is drawn from, which fits the wall) instead of RoomBuilder's
@@ -71,8 +74,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var maskImage: UIImage
         var maskSize: CGSize
         var wallSize: CGSize
-        let transform: simd_float4x4
+        var transform: simd_float4x4   // ★ mutable: follows ARKit world re-localization
+        var anchorID: UUID?            // ★ ARAnchor that keeps the wall locked to the real surface
     }
+    // ARAnchor.identifier -> wall surface UUID
+    private var wallAnchorIDs: [UUID: UUID] = [:]
     private var walls: [UUID: Wall] = [:]
     private let maskPxPerMeter: CGFloat = 256
 
@@ -424,6 +430,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         editModeActive = false
         meshAnchorCount = 0
         wallMeshPointsByAnchor.removeAll()
+        wallAnchorIDs.removeAll()
         roomUpdateCount = 0
         removeCursor()
         endLassoMode()
@@ -866,6 +873,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         for (_, w) in walls { w.node.removeFromParentNode() }
         walls.removeAll()
+        // ★ drop stale wall anchors so they don't linger across rebuilds
+        if let frame = sceneView.session.currentFrame {
+            for a in frame.anchors where wallAnchorIDs[a.identifier] != nil {
+                sceneView.session.remove(anchor: a)
+            }
+        }
+        wallAnchorIDs.removeAll()
 
         var built = 0
         for surface in room.walls {
@@ -944,6 +958,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         node.simdTransform = surface.transform
         sceneView.scene.rootNode.addChildNode(node)
 
+        // ★ Anchor the wall to ARKit. When the occluder session re-localizes the
+        // world, ARKit adjusts this anchor and we move the wall to match (see
+        // session(_:didUpdate:)), so the wallpaper stays locked to the real wall
+        // instead of sliding off the grid. The node is still placed at
+        // surface.transform here, so if no correction arrives, behaviour is
+        // identical to before.
+        let anchor = ARAnchor(name: "wall_\(surface.identifier.uuidString)", transform: surface.transform)
+        sceneView.session.add(anchor: anchor)
+        wallAnchorIDs[anchor.identifier] = surface.identifier
+
         walls[surface.identifier] = Wall(
             id: surface.identifier,
             node: node,
@@ -951,7 +975,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             maskImage: mask,
             maskSize: maskSize,
             wallSize: CGSize(width: wMeters, height: hMeters),
-            transform: surface.transform
+            transform: surface.transform,
+            anchorID: anchor.identifier
         )
         diag("Built wall id=\(surface.identifier.uuidString.prefix(8)) size=\(String(format: "%.2f", wMeters))x\(String(format: "%.2f", hMeters))")
         return true
@@ -1674,6 +1699,21 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         lastCameraPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
         if lassoModeActive && !lassoWorldPoints.isEmpty {
             broadcastLassoScreenPoints()
+        }
+    }
+
+    // ★ When the occluder session re-localizes the world, ARKit updates our wall
+    // anchors. Snap the wall node + stored transform to the corrected position so
+    // the wallpaper stays glued to the real wall (fixes the "shifted off the grid"
+    // mismatch). Paint/lasso/raycast use w.transform, so keeping it in sync keeps
+    // them aligned too.
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        for anchor in anchors {
+            guard let wallID = wallAnchorIDs[anchor.identifier],
+                  var w = walls[wallID] else { continue }
+            w.node.simdTransform = anchor.transform
+            w.transform = anchor.transform
+            walls[wallID] = w
         }
     }
 
