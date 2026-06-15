@@ -1,4 +1,11 @@
-// WallpaperARView.swift — v13 (diagnostic + fixes)
+// WallpaperARView.swift — v13 (diagnostic + fixes) + LIVE-geometry wallpaper
+//
+// FIX: the wallpaper is now built from the LIVE RoomPlan room (the same data the
+// on-screen grid is drawn from, which fits the wall) instead of RoomBuilder's
+// reprocessed output. RoomBuilder was inflating the wall height (~2.9m) and
+// adding phantom sliver walls, which made the wallpaper overflow onto the
+// ceiling and adjacent surfaces. Only the room data source changed; all
+// placement, mask, paint, lasso, occluder, and pricing logic is untouched.
 //
 // KEY CHANGES FROM v12:
 //   • Replaced manual ray-plane math with sceneView.unprojectPoint() — this
@@ -35,6 +42,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // RoomPlan
     private var roomCaptureSession: RoomCaptureSession?
     private var latestCapturedRoom: CapturedRoom?
+    // ★ The last LIVE room from didUpdate — this is what the on-screen grid is
+    // drawn from. We build the wallpaper from THIS (the geometry that fits the
+    // wall) instead of RoomBuilder's reprocessed output (which inflates the wall
+    // and invents phantom slivers).
+    private var lastLiveRoom: CapturedRoom?
     private var roomBuilder: RoomBuilder?
 
     // Scan preview
@@ -378,6 +390,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         clearOccluderNodes()
         undoStack.removeAll()
         latestCapturedRoom = nil
+        lastLiveRoom = nil
         isWallpaperApplied = false
         editModeActive = false
         meshAnchorCount = 0
@@ -1505,6 +1518,7 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
             guard let self = self else { return }
             self.roomUpdateCount += 1
             self.latestCapturedRoom = room
+            self.lastLiveRoom = room   // ★ remember the live geometry the grid is drawn from
             self.updateScanPreview(from: room)
             let walls = room.walls.count
             self.diag("roomUpdate #\(self.roomUpdateCount): \(walls) walls, \(room.doors.count) doors, \(room.windows.count) wins")
@@ -1525,8 +1539,21 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
                 let finalRoom = try await builder.capturedRoom(from: data)
                 await MainActor.run { [weak self] in
                     guard let self = self else { return }
-                    self.latestCapturedRoom = finalRoom
-                    self.processFinalRoom(finalRoom)
+                    // ★ Prefer the LIVE room (what the grid showed and what fits
+                    // the wall). RoomBuilder's finalRoom inflates the wall height
+                    // and adds phantom slivers, which is what made the wallpaper
+                    // overflow onto the ceiling. Fall back to finalRoom only if
+                    // we somehow never captured a live room with walls.
+                    let roomToUse: CapturedRoom
+                    if let live = self.lastLiveRoom, !live.walls.isEmpty {
+                        roomToUse = live
+                        self.diag("Using LIVE room (\(live.walls.count) walls) — matches grid, not RoomBuilder")
+                    } else {
+                        roomToUse = finalRoom
+                        self.diag("No live room available — falling back to RoomBuilder (\(finalRoom.walls.count) walls)")
+                    }
+                    self.latestCapturedRoom = roomToUse
+                    self.processFinalRoom(roomToUse)
                 }
             } catch {
                 await MainActor.run { [weak self] in
