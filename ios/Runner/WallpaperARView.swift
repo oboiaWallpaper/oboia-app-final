@@ -13,6 +13,11 @@
 // stays exactly where the grid was, AND the occluder mesh comes from the same
 // session (re-asserted in didStartWith, per Apple's documented timing).
 //
+// MEASUREMENT (area-math only, does NOT touch geometry/placement/session):
+// charged area now subtracts detected door/window/opening area (you don't paper
+// those) and rounds UP to the next 0.1 m² so a seller is never short. The
+// position fix above is fully preserved.
+//
 // FIX: the wallpaper is now built from the LIVE RoomPlan room (the same data the
 // on-screen grid is drawn from, which fits the wall) instead of RoomBuilder's
 // reprocessed output. RoomBuilder was inflating the wall height (~2.9m) and
@@ -79,6 +84,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var wallSize: CGSize
         var transform: simd_float4x4   // ★ mutable: follows ARKit world re-localization
         var anchorID: UUID?            // ★ ARAnchor that keeps the wall locked to the real surface
+        var cutoutArea: Float = 0      // ★ door/window area on this wall (m²), subtracted from price
     }
     // ARAnchor.identifier -> wall surface UUID
     private var wallAnchorIDs: [UUID: UUID] = [:]
@@ -997,6 +1003,18 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         node.simdTransform = surface.transform
         sceneView.scene.rootNode.addChildNode(node)
 
+        // ★ Sum door/window/opening area that belongs to THIS wall (same matching
+        // rule as the mask cutouts), so the charged area excludes what you don't
+        // paper. Read-only on already-detected surfaces — does not affect geometry.
+        var cutoutArea: Float = 0
+        let invWall = simd_inverse(surface.transform)
+        for cut in (doors + windows + openings) {
+            let c = cut.transform.columns.3
+            let lh = invWall * SIMD4<Float>(c.x, c.y, c.z, 1.0)
+            if abs(lh.z) > 0.30 { continue }   // not on this wall plane
+            cutoutArea += cut.dimensions.x * cut.dimensions.y
+        }
+
         // ★ Anchor the wall to ARKit. When the occluder session re-localizes the
         // world, ARKit adjusts this anchor and we move the wall to match (see
         // session(_:didUpdate:)), so the wallpaper stays locked to the real wall
@@ -1015,9 +1033,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             maskSize: maskSize,
             wallSize: CGSize(width: wMeters, height: hMeters),
             transform: surface.transform,
-            anchorID: anchor.identifier
+            anchorID: anchor.identifier,
+            cutoutArea: cutoutArea
         )
-        diag("Built wall id=\(surface.identifier.uuidString.prefix(8)) size=\(String(format: "%.2f", wMeters))x\(String(format: "%.2f", hMeters))")
+        diag("Built wall id=\(surface.identifier.uuidString.prefix(8)) size=\(String(format: "%.2f", wMeters))x\(String(format: "%.2f", hMeters)) cutout=\(String(format: "%.2f", cutoutArea))m²")
         return true
     }
 
@@ -1064,8 +1083,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func totalArea() -> Float {
         var total: Float = 0
-        for (_, w) in walls { total += Float(w.wallSize.width * w.wallSize.height) }
-        return total
+        for (_, w) in walls {
+            let gross = Float(w.wallSize.width * w.wallSize.height)
+            // Subtract doors/windows (not papered); never let a wall go negative.
+            let net = max(0, gross - w.cutoutArea)
+            total += net
+        }
+        // ★ Marketplace-safe: round the charged area UP to the next 0.1 m² so a
+        // seller is never short on material. (Pure presentation of the measured
+        // value — does not change the wall or its geometry.)
+        return (total * 10).rounded(.up) / 10
     }
 
     // ════════════════════════════════════════════════════════════
