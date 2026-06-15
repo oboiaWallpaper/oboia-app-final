@@ -1,38 +1,28 @@
-// WallpaperARView.swift — v13d (v13 base + preview fix + clamped anchor stability)
+// WallpaperARView.swift — v13e (v13d + offset fix: strict anchor clamp + lock-on-reconfig)
 //
-// v13d adds a sanity clamp to the anchor sync: ARKit world corrections larger
-// than 15cm are treated as bad relocalizations and IGNORED (wall stays where it
-// was placed / where the grid was), which prevents the wallpaper being shoved
-// sideways off the wall. Every correction (applied or ignored) is logged with
-// its magnitude and direction, so the diagnostic report shows whether the world
-// is jumping. Worst case = same as before; it can only hold placement steadier.
+// v13e fixes the wallpaper-offset-after-scan bug seen in v13d.
 //
-// This is the KNOWN-GOOD v13 geometry (wallpaper at detected size, no padding,
-// sits exactly on the scanned wall). Additions over v13:
-//   • Preview-leak fix: scan grid can no longer linger on top of the wallpaper
-//     (didUpdate ignored unless scanning; preview cleared in processFinalRoom).
-//   • Anchor stability: each wall is attached to an ARKit ARAnchor. When the
-//     occluder's mesh tracking makes ARKit relocalize the world, the wall is
-//     snapped to its corrected anchor transform (session didUpdate anchors) so
-//     the wallpaper stays glued to the real wall instead of sliding off /
-//     shaking. The node is still placed at the detected transform, so if no
-//     correction ever arrives the behaviour is identical to plain v13.
-//   • Occluder rebuilds throttled to ~0.4s per anchor to cut main-thread
-//     stutter when many mesh chunks update at once.
-// NOTE: the v14/v15 paint-expansion padding is intentionally NOT included —
-// that padding is what made the wallpaper appear shifted off the scanned area.
+// ROOT CAUSE of v13d bug:
+//   When startMeshTrackingForOccluder() called sceneView.session.run(cfg, options: [])
+//   to switch from RoomCaptureSession's ARSession to a regular ARWorldTracking
+//   session (for LiDAR mesh / occluder), ARKit issued large anchor "corrections"
+//   on the wall anchors. The old 15cm clamp let those through, sliding the
+//   wallpaper off the real wall.
 //
-// KEY CHANGES FROM v12:
-//   • Replaced manual ray-plane math with sceneView.unprojectPoint() — this
-//     matches whatever SceneKit is rendering, so taps/drags land where the
-//     user expects regardless of Flutter UiKitView orientation issues.
-//   • Added a diagnostic log: timestamped events for every interaction.
-//   • New method "getDiagnosticReport" returns the full log + state snapshot
-//     to Dart so the user can email it.
-//   • Live diagnostic events emitted to Dart so on-screen overlay can show:
-//     - walls count, lassoPoints count, lastRayHit, anchors count, etc.
-//   • If LiDAR mesh anchors arrive during scan, log them — confirms whether
-//     occluder is even possible.
+// FIXES IN v13e:
+//   1. Anchor sync clamp tightened from 15cm → 2cm. Anything larger is rejected
+//      and the wall is force-snapped back to its placedTransform.
+//   2. The sync compares each correction against the CURRENT transform (not the
+//      original placed one), so small natural drift can still be tracked over
+//      time without accumulating into a big jump.
+//   3. Immediately after startMeshTrackingForOccluder() reconfigures the AR
+//      session, every wall is force-locked to its placedTransform. This blocks
+//      the one-time post-reconfig jump that was causing the visible offset.
+//   4. Both w.node.simdTransform AND w.transform are always updated together,
+//      keeping lasso/eraser raycasts perfectly aligned with the rendered wall.
+//
+// Everything else from v13d is preserved (preview-leak fix, occluder throttle,
+// scan grid look, lasso/brush behaviour, etc).
 
 import ARKit
 import AVFoundation
@@ -74,17 +64,19 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var maskImage: UIImage
         var maskSize: CGSize
         var wallSize: CGSize
-        var transform: simd_float4x4   // ★ now mutable: updated when ARKit corrects the world
-        var anchorID: UUID?            // ★ ARAnchor that keeps this wall glued to the real wall
-        let placedTransform: simd_float4x4  // ★ original placement, for sanity-clamping corrections
+        var transform: simd_float4x4   // ★ updated when ARKit corrects the world (only small corrections accepted)
+        var anchorID: UUID?            // ★ ARAnchor that tracks this wall
+        let placedTransform: simd_float4x4  // ★ original placement — wall is force-snapped here on big corrections
     }
-    // ★ Maps an ARAnchor.identifier -> wall surface UUID, so world corrections
-    // are applied to the matching wall (keeps wallpaper from drifting off-wall).
     private var wallAnchorIDs: [UUID: UUID] = [:]
-    // ★ Throttle for occluder geometry rebuilds (avoid hammering main thread).
     private var lastOccluderRebuild: [UUID: TimeInterval] = [:]
     private var walls: [UUID: Wall] = [:]
     private let maskPxPerMeter: CGFloat = 256
+
+    // ★ v13e: For a short window right after session reconfiguration, BLOCK
+    // all anchor corrections (even tiny ones). This kills the post-reconfig
+    // jump that ARKit issues when we switch to the mesh tracking config.
+    private var ignoreAnchorCorrectionsUntil: TimeInterval = 0
 
     // Brush / Lasso / Wallpaper
     private var brushMode: BrushMode = .erase
@@ -138,17 +130,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func diagSnapshot() -> String {
-        // Return formatted text (String) so Dart can cast it directly.
         var lines: [String] = []
-        lines.append("=== OBOIA DIAGNOSTIC REPORT ===")
+        lines.append("=== OBOIA DIAGNOSTIC REPORT (v13e) ===")
         lines.append("timestamp: \(ISO8601DateFormatter().string(from: Date()))")
         lines.append("")
         lines.append("STATE")
         lines.append("  wallsCount         = \(walls.count)")
         lines.append("  scanPreviewCount   = \(scanPreviewNodes.count)")
         lines.append("  occluderCount      = \(occluderNodes.count)")
-        lines.append("  meshAnchorsSeen    = \(meshAnchorCount)   <-- LiDAR mesh activity")
-        lines.append("  roomUpdates        = \(roomUpdateCount)   <-- RoomPlan didUpdate firings")
+        lines.append("  meshAnchorsSeen    = \(meshAnchorCount)")
+        lines.append("  roomUpdates        = \(roomUpdateCount)")
         lines.append("  lassoPoints        = \(lassoWorldPoints.count)")
         lines.append("  lassoModeActive    = \(lassoModeActive)")
         lines.append("  lassoDragging      = \(lassoDragging)")
@@ -164,7 +155,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         } else {
             for (i, (_, w)) in walls.enumerated() {
                 let pos = w.transform.columns.3
-                lines.append("  Wall #\(i): size=\(w.wallSize.width)x\(w.wallSize.height) center=(\(pos.x),\(pos.y),\(pos.z))")
+                let pPos = w.placedTransform.columns.3
+                let dx = pos.x - pPos.x, dy = pos.y - pPos.y, dz = pos.z - pPos.z
+                let drift = (dx*dx + dy*dy + dz*dz).squareRoot()
+                lines.append("  Wall #\(i): size=\(w.wallSize.width)x\(w.wallSize.height) center=(\(pos.x),\(pos.y),\(pos.z)) drift_from_placed=\(String(format: "%.4f", drift))m")
             }
         }
         lines.append("")
@@ -225,7 +219,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         panGesture = pan
 
         channel.setMethodCallHandler { [weak self] (call, result) in self?.route(call, result) }
-        diag("init() complete")
+        diag("init() complete (v13e)")
     }
 
     func view() -> UIView { sceneView }
@@ -263,12 +257,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case "clearAllCuts": resetMasks(); result(nil)
         case "lassoStart":
             startLassoMode()
-            panGesture?.isEnabled = false  // ★ BUG A FIX: disable Swift pan so Flutter drag works
+            panGesture?.isEnabled = false
             diag("lasso START: panGesture disabled")
             result(nil)
         case "lassoEnd":
             endLassoMode()
-            panGesture?.isEnabled = true   // re-enable brush pan
+            panGesture?.isEnabled = true
             diag("lasso END: panGesture re-enabled")
             result(nil)
         case "lassoAddPoint":
@@ -304,11 +298,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             }
             result(nil)
 
-        // ★ NEW: Diagnostic report (Dart calls this 'getDiagnostics')
         case "getDiagnostics":
             result(diagSnapshot())
 
-        // ★ NEW: Capture current AR scene as base64 PNG for wall thumbnail
         case "captureScreenshot":
             let snapshot: UIImage = sceneView.snapshot()
             if let data = snapshot.pngData() {
@@ -370,7 +362,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         c.planeDetection = []
         sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
         currentMode = .idle
-        emit("boot", data: ["status": "AR ready (v13 diag)"])
+        emit("boot", data: ["status": "AR ready (v13e)"])
         diag("bootIdleSession ok")
     }
 
@@ -393,8 +385,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ════════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        diag(">>> startScan v13 <<<")
-        emit("boot", data: ["status": ">>> startScan v13 <<<"])
+        diag(">>> startScan v13e <<<")
+        emit("boot", data: ["status": ">>> startScan v13e <<<"])
         guard RoomCaptureSession.isSupported else {
             emit("error", data: ["message": "RoomPlan not supported"])
             result(FlutterError(code: "NOROOMPLAN", message: "Not supported", details: nil))
@@ -474,8 +466,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
     }
 
-    /// Generate a procedural grid texture for scan visualization.
-    /// Returns a UIImage with a transparent background and bright grid lines.
     private static func makeScanGridTexture(color: UIColor) -> UIImage {
         let size = CGSize(width: 256, height: 256)
         let fmt = UIGraphicsImageRendererFormat()
@@ -483,13 +473,11 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let renderer = UIGraphicsImageRenderer(size: size, format: fmt)
         return renderer.image { ctx in
             let cg = ctx.cgContext
-            // Faint background tint
             cg.setFillColor(color.withAlphaComponent(0.08).cgColor)
             cg.fill(CGRect(origin: .zero, size: size))
-            // Grid lines
             cg.setStrokeColor(color.withAlphaComponent(0.7).cgColor)
             cg.setLineWidth(1.5)
-            let step: CGFloat = 32  // grid cell size in pixels
+            let step: CGFloat = 32
             var x: CGFloat = 0
             while x <= size.width {
                 cg.move(to: CGPoint(x: x, y: 0))
@@ -503,7 +491,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 y += step
             }
             cg.strokePath()
-            // Brighter inner grid (cross pattern)
             cg.setStrokeColor(color.cgColor)
             cg.setLineWidth(0.8)
             x = step / 2
@@ -535,10 +522,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         guard w > 0.2, h > 0.2 else { return }
 
         if let existing = scanPreviewNodes[surface.identifier] {
-            // Resize fill and border planes (corner markers stay at fixed size)
             for child in existing.childNodes {
                 if let plane = child.geometry as? SCNPlane {
-                    // Skip corner markers (they are 10cm × 10cm), only resize big planes
                     if plane.width > 0.5 || plane.height > 0.5 {
                         plane.width = w; plane.height = h
                     }
@@ -551,11 +536,9 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let container = SCNNode()
         container.simdTransform = surface.transform
 
-        // ★ NEW: Use a procedural grid texture for the fill — gives a real "3D scan" feel
         if withFill {
             let fillPlane = SCNPlane(width: w, height: h)
             let fillMat = SCNMaterial()
-            // Tile the grid texture so cells are roughly 20cm × 20cm in the world.
             let tilesX = max(1.0, w / 0.20)
             let tilesY = max(1.0, h / 0.20)
             fillMat.diffuse.contents = (color == .white)
@@ -579,7 +562,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             container.addChildNode(fillNode)
         }
 
-        // Thin bright outline border
         let wirePlane = SCNPlane(width: w, height: h)
         let wireMat = SCNMaterial()
         wireMat.fillMode = .lines
@@ -594,14 +576,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         wireNode.renderingOrder = 600
         container.addChildNode(wireNode)
 
-        // ★ NEW: 4 bright corner markers — gives that "AR CAD scanning" precision feel
         if withFill {
-            let cornerSize: CGFloat = 0.10  // 10cm corner brackets
+            let cornerSize: CGFloat = 0.10
             let positions: [(Float, Float)] = [
-                (-Float(w/2 - cornerSize/2),  Float(h/2 - cornerSize/2)),  // top-left
-                ( Float(w/2 - cornerSize/2),  Float(h/2 - cornerSize/2)),  // top-right
-                (-Float(w/2 - cornerSize/2), -Float(h/2 - cornerSize/2)),  // bottom-left
-                ( Float(w/2 - cornerSize/2), -Float(h/2 - cornerSize/2)),  // bottom-right
+                (-Float(w/2 - cornerSize/2),  Float(h/2 - cornerSize/2)),
+                ( Float(w/2 - cornerSize/2),  Float(h/2 - cornerSize/2)),
+                (-Float(w/2 - cornerSize/2), -Float(h/2 - cornerSize/2)),
+                ( Float(w/2 - cornerSize/2), -Float(h/2 - cornerSize/2)),
             ]
             for (cx, cy) in positions {
                 let dot = SCNPlane(width: cornerSize, height: cornerSize)
@@ -616,7 +597,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 let dotNode = SCNNode(geometry: dot)
                 dotNode.position = SCNVector3(cx, cy, 0.001)
                 dotNode.renderingOrder = 605
-                // Pulse the corner markers in sync — feels like beacons
                 let p1 = SCNAction.fadeOpacity(to: 0.4, duration: 0.7)
                 let p2 = SCNAction.fadeOpacity(to: 1.0, duration: 0.7)
                 dotNode.runAction(SCNAction.repeatForever(SCNAction.sequence([p1, p2])))
@@ -627,7 +607,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.scene.rootNode.addChildNode(container)
         scanPreviewNodes[surface.identifier] = container
 
-        // Smooth entrance: scale-up + fade-in
         container.scale = SCNVector3(0.1, 0.1, 1.0)
         container.opacity = 0
         let scaleAction = SCNAction.scale(to: 1.0, duration: 0.4)
@@ -635,7 +614,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let fadeAction = SCNAction.fadeIn(duration: 0.4)
         let entrance = SCNAction.group([scaleAction, fadeAction])
 
-        // Subtle continuous pulse on the whole node
         let pulseUp = SCNAction.fadeOpacity(to: 1.0, duration: 1.2)
         let pulseDown = SCNAction.fadeOpacity(to: 0.75, duration: 1.2)
         let pulse = SCNAction.sequence([pulseUp, pulseDown])
@@ -645,12 +623,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func animateOutScanPreviews() {
-        // ★ Immediate removal — no fade-out animation.
-        // The previous fade-out had a race condition where async actions left
-        // grid/corner nodes visible on top of the wallpaper. Instant removal
-        // is cleaner and matches the "wallpaper magically appears" intent.
         for (_, node) in scanPreviewNodes {
-            // Stop all running actions (pulse, corner pulses) and detach immediately.
             node.removeAllActions()
             for child in node.childNodes {
                 child.removeAllActions()
@@ -678,7 +651,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var verts = [SCNVector3]()
         verts.reserveCapacity(vCount)
         let vS = geo.vertices
-        // Also keep world-space positions for wall-plane proximity test.
         var worldVerts = [SIMD3<Float>]()
         worldVerts.reserveCapacity(vCount)
         let anchorTransform = anchor.transform
@@ -686,21 +658,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             let p = vS.buffer.contents().advanced(by: vS.offset + vS.stride * i)
                 .assumingMemoryBound(to: SIMD3<Float>.self).pointee
             verts.append(SCNVector3(p.x, p.y, p.z))
-            // Transform local mesh vertex to world space
             let w4 = anchorTransform * SIMD4<Float>(p.x, p.y, p.z, 1.0)
             worldVerts.append(SIMD3<Float>(w4.x, w4.y, w4.z))
         }
 
-        // Pre-extract wall planes (normal + center) for proximity test.
-        // We want to SKIP mesh triangles that lie on or very near a RoomPlan wall —
-        // those are the wall itself, and our flat wallpaper plane handles it cleanly.
-        var wallPlanes: [(SIMD3<Float>, SIMD3<Float>)] = []  // (normal, center)
+        var wallPlanes: [(SIMD3<Float>, SIMD3<Float>)] = []
         for (_, w) in walls {
             let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
             let center = SIMD3<Float>(w.transform.columns.3.x, w.transform.columns.3.y, w.transform.columns.3.z)
             wallPlanes.append((nrm, center))
         }
-        let wallProximity: Float = 0.08  // 8cm — wider, removes more wall-near fuzz
+        let wallProximity: Float = 0.08
 
         let fEl = geo.faces
         let bpi = fEl.bytesPerIndex
@@ -708,7 +676,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let cOpt = geo.classification
         var idx: [UInt32] = []
         for f in 0..<fCount {
-            // ★ Skip walls / floor / ceiling — only OBJECTS in front of walls should occlude
             var skip = false
             if let c = cOpt {
                 let cv = c.buffer.contents().advanced(by: c.offset + c.stride * f)
@@ -716,17 +683,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 if let cls = ARMeshClassification(rawValue: Int(cv)) {
                     switch cls {
                     case .wall, .floor, .ceiling: skip = true
-                    default: skip = false  // table, seat, window, door, none → occlude these
+                    default: skip = false
                     }
                 }
             }
             if skip { continue }
 
-            // ★ Additionally skip triangles too close to RoomPlan walls — these are
-            // mesh artifacts that would jaggedly occlude our clean wallpaper plane
             var nearWall = false
             if !wallPlanes.isEmpty && ipf == 3 {
-                // Read all 3 vertex indices for this triangle
                 var triVerts: [SIMD3<Float>] = []
                 triVerts.reserveCapacity(3)
                 for j in 0..<3 {
@@ -738,7 +702,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                         triVerts.append(worldVerts[Int(vIdx)])
                     }
                 }
-                // If ALL 3 vertices are within wallProximity of any wall plane, skip
                 if triVerts.count == 3 {
                     for (n, c) in wallPlanes {
                         let d0 = abs(simd_dot(triVerts[0] - c, n))
@@ -790,8 +753,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func processFinalRoom(_ room: CapturedRoom) {
         diag("processFinalRoom: \(room.walls.count) walls, \(room.doors.count) doors, \(room.windows.count) windows, \(room.openings.count) openings")
-        clearScanPreviewNodes()   // ★ remove any leftover scan grid before placing walls
-        clearWallAnchors()        // ★ drop any stale wall anchors before rebuilding
+        clearScanPreviewNodes()
+        clearWallAnchors()
 
         for (_, w) in walls { w.node.removeFromParentNode() }
         walls.removeAll()
@@ -806,10 +769,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let area = totalArea()
         diag("Built \(built) walls (total area \(area) m²)")
 
-        // ★ FIX: Switch from RoomPlan's ARSession to a regular ARWorldTracking
-        // session WITH sceneReconstruction enabled. This produces ARMeshAnchor
-        // objects which our renderer(_:didAdd:) callback turns into invisible
-        // depth-only geometry — hiding wallpaper behind TVs/curtains/furniture.
         startMeshTrackingForOccluder()
 
         emit("scanComplete", data: [
@@ -820,9 +779,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         emit("boot", data: ["status": "Done: \(built) walls, \(String(format: "%.1f", area)) m²"])
     }
 
-    /// Start ARKit world tracking with LiDAR scene reconstruction enabled.
-    /// This MUST run AFTER RoomPlan finishes so we don't lose RoomPlan's wall
-    /// detection (RoomPlan's session does not produce mesh anchors itself).
+    /// ★ v13e: Start LiDAR mesh tracking for occluder AND lock walls down so
+    /// the post-reconfig anchor corrections can't slide the wallpaper off-wall.
     private func startMeshTrackingForOccluder() {
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             diag("scene reconstruction not supported — no occluder available")
@@ -835,10 +793,25 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             cfg.frameSemantics.insert(.sceneDepth)
         }
-        // CRITICAL: do NOT reset tracking — that would lose our walls' world position.
-        // Just upgrade the configuration in place.
+
+        // ★ v13e CRITICAL FIX #1: BLOCK all anchor corrections for 2 seconds
+        // following the session reconfiguration. ARKit issues a burst of large
+        // "corrections" during this window because it's re-establishing the
+        // world. Those were sliding the wallpaper off the real wall.
+        ignoreAnchorCorrectionsUntil = CACurrentMediaTime() + 2.0
+        diag("anchor corrections BLOCKED until \(String(format: "%.3f", ignoreAnchorCorrectionsUntil.truncatingRemainder(dividingBy: 100000)))")
+
         sceneView.session.run(cfg, options: [])
-        diag("startMeshTrackingForOccluder: ran ARWorldTrackingConfiguration with .meshWithClassification (no resetTracking)")
+
+        // ★ v13e CRITICAL FIX #2: Immediately re-lock every wall to its
+        // placedTransform. Even if some early anchor update slips through,
+        // the wall will start from exactly where the grid was.
+        for (id, var w) in walls {
+            w.node.simdTransform = w.placedTransform
+            w.transform = w.placedTransform
+            walls[id] = w
+        }
+        diag("startMeshTrackingForOccluder: ran ARWorldTrackingConfiguration; locked \(walls.count) walls to placedTransform")
     }
 
     private func buildWall(
@@ -873,10 +846,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         node.simdTransform = surface.transform
         sceneView.scene.rootNode.addChildNode(node)
 
-        // ★ Anchor the wall to ARKit so it follows world corrections instead of
-        // sliding off the real wall during relocalization. The node is still
-        // placed at surface.transform above, so if no correction ever arrives
-        // the behaviour is identical to before (no regression).
         let anchor = ARAnchor(name: "wall_\(surface.identifier.uuidString)", transform: surface.transform)
         sceneView.session.add(anchor: anchor)
         wallAnchorIDs[anchor.identifier] = surface.identifier
@@ -964,9 +933,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             m.diffuse.wrapS = .repeat; m.diffuse.wrapT = .repeat
             m.diffuse.contentsTransform = tileTransform
         } else {
-            // ★ Pre-wallpaper: semi-transparent yellow tint so user can see the
-            // actual room behind the painted selection area. Used during edit mode
-            // before "Apply Wallpaper" is tapped.
             m.lightingModel = .constant
             m.diffuse.contents = UIColor(red: 1, green: 0.83, blue: 0.41, alpha: 0.5)
         }
@@ -1138,19 +1104,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     // ════════════════════════════════════════════════════════════
-    // ★ THE FIX: Use SceneKit's unprojectPoint for raycasts
-    //
-    // Instead of building a ray manually with frame.camera.projectionMatrix
-    // (which may use a different viewport than what SceneKit actually renders),
-    // we use sceneView.unprojectPoint() which is GUARANTEED to match the
-    // current SceneKit rendering. This fixes lasso/eraser misalignment.
+    // RAY CASTING (using SceneKit's unproject)
     // ════════════════════════════════════════════════════════════
 
-    /// Cast a ray from camera through screenPoint using SceneKit's own
-    /// unproject. Returns ray origin (near plane) and ray direction in world space.
     private func makeRayFromScreen(_ screenPoint: CGPoint) -> (SIMD3<Float>, SIMD3<Float>)? {
-        // Sample SceneKit's view at near (z=0) and far (z=1) for the same screen point.
-        // unprojectPoint gives us world coordinates that match what SceneKit renders.
         let nearV = sceneView.unprojectPoint(SCNVector3(Float(screenPoint.x), Float(screenPoint.y), 0))
         let farV = sceneView.unprojectPoint(SCNVector3(Float(screenPoint.x), Float(screenPoint.y), 1))
         let near = SIMD3<Float>(Float(nearV.x), Float(nearV.y), Float(nearV.z))
@@ -1161,7 +1118,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         return (near, dir / dirLen)
     }
 
-    /// Find the nearest wall hit by a ray cast from this screen point.
     private func nearestWallByRay(_ screenPoint: CGPoint) -> (UUID, SIMD3<Float>)? {
         guard let (rayOrigin, rayDir) = makeRayFromScreen(screenPoint) else {
             lastRayHitInfo = "ray creation failed"
@@ -1181,11 +1137,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
             let invWall = simd_inverse(w.transform)
             let localH = invWall * SIMD4<Float>(hit.x, hit.y, hit.z, 1.0)
-            // ★ FIX: Generous margin so tapping on curtains, TVs, or anything in
-            // front of the wall still finds the wall behind. The ray-plane
-            // intersection naturally gives us the wall point even if the user
-            // tapped on something occluding it.
-            let margin: Float = 1.0  // 1 meter beyond the wall edge
+            let margin: Float = 1.0
             let halfW = Float(w.wallSize.width) / 2 + margin
             let halfH = Float(w.wallSize.height) / 2 + margin
             if abs(localH.x) > halfW || abs(localH.y) > halfH { continue }
@@ -1200,7 +1152,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         return (b.id, b.hit)
     }
 
-    /// Ray-cast onto a SPECIFIC wall.
     private func rayHitOnWall(_ screenPoint: CGPoint, wall w: Wall) -> SIMD3<Float>? {
         guard let (rayOrigin, rayDir) = makeRayFromScreen(screenPoint) else { return nil }
         let nrm = SIMD3<Float>(w.transform.columns.2.x, w.transform.columns.2.y, w.transform.columns.2.z)
@@ -1501,7 +1452,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             self.editModeActive = false
             self.removeCursor(); self.endLassoMode()
 
-            // ★ MAGICAL APPEARANCE: fade walls from 0 → wallpaperOpacity smoothly
             for (_, w) in self.walls {
                 w.node.opacity = 0
             }
@@ -1554,7 +1504,7 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            guard self.currentMode == .scanning else { return }   // ★ ignore stray didUpdate after stopScan (prevents grid re-appearing over wallpaper)
+            guard self.currentMode == .scanning else { return }
             self.roomUpdateCount += 1
             self.latestCapturedRoom = room
             self.updateScanPreview(from: room)
@@ -1599,35 +1549,58 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         }
     }
 
-    // ★ When ARKit refines the world (e.g. during the occluder relocalization),
-    // it adjusts our wall anchors. Snap each wall node to its corrected anchor
-    // transform and keep the stored transform in sync so paint/raycast stay
-    // aligned. This is what stops the wallpaper from sliding off the wall.
+    // ★ v13e: STRICT anchor sync — small drift corrections only.
+    //
+    // KEY CHANGES vs v13d:
+    //  1. During the 2-second post-reconfig blackout, ALL corrections are
+    //     rejected and walls are pinned to placedTransform. This kills the
+    //     burst of bad corrections that shifted the wallpaper.
+    //  2. Clamp tightened from 15cm → 2cm. Beyond that = relocalization
+    //     glitch, wall snaps back to placedTransform.
+    //  3. Comparison is now against the CURRENT transform (not placedTransform)
+    //     so legitimate small drift can be tracked over time without one big
+    //     accumulated jump.
+    //  4. Both w.node.simdTransform AND w.transform are updated together,
+    //     keeping lasso/eraser raycasts perfectly aligned with the rendered wall.
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        let now = CACurrentMediaTime()
+        let blackoutActive = now < ignoreAnchorCorrectionsUntil
+
         for anchor in anchors {
             guard let wallID = wallAnchorIDs[anchor.identifier],
                   var w = walls[wallID] else { continue }
 
-            // Positional delta between ARKit's corrected transform and where we
-            // originally placed the wall (which matched the scan grid).
-            let oc = w.placedTransform.columns.3
-            let nc = anchor.transform.columns.3
-            let dx = nc.x - oc.x, dy = nc.y - oc.y, dz = nc.z - oc.z
-            let dist = (dx*dx + dy*dy + dz*dz).squareRoot()
-
-            // ★ Sanity clamp: a correction over 15cm is almost certainly a bad
-            // relocalization (it would shove the wallpaper off the wall). Ignore
-            // it and keep the wall where the grid was. Small drift is applied.
-            let clampMeters: Float = 0.15
-            if dist > clampMeters {
-                diag("anchor correction IGNORED (too large): d=\(String(format: "%.3f", dist))m dx=\(String(format: "%.3f", dx)) dy=\(String(format: "%.3f", dy)) dz=\(String(format: "%.3f", dz)) — keeping placed transform")
+            // ★ Blackout window: pin to placedTransform, ignore everything else.
+            if blackoutActive {
                 w.node.simdTransform = w.placedTransform
                 w.transform = w.placedTransform
                 walls[wallID] = w
                 continue
             }
 
-            diag("anchor correction applied: d=\(String(format: "%.3f", dist))m dx=\(String(format: "%.3f", dx)) dy=\(String(format: "%.3f", dy)) dz=\(String(format: "%.3f", dz))")
+            // Compare correction against CURRENT transform (incremental drift)
+            let oc = w.transform.columns.3
+            let nc = anchor.transform.columns.3
+            let dx = nc.x - oc.x, dy = nc.y - oc.y, dz = nc.z - oc.z
+            let dist = (dx*dx + dy*dy + dz*dz).squareRoot()
+
+            // ★ STRICT: only accept corrections under 2cm. Anything bigger is
+            // an ARKit relocalization glitch that would visibly shift the
+            // wallpaper off the wall.
+            let clampMeters: Float = 0.02
+            if dist > clampMeters {
+                diag("anchor correction REJECTED: d=\(String(format: "%.4f", dist))m dx=\(String(format: "%.4f", dx)) dy=\(String(format: "%.4f", dy)) dz=\(String(format: "%.4f", dz)) — snapping to placedTransform")
+                // Force back to original placement so we don't drift over time
+                w.node.simdTransform = w.placedTransform
+                w.transform = w.placedTransform
+                walls[wallID] = w
+                continue
+            }
+
+            // ★ Accept small drift correction. CRITICAL: update both
+            // node.simdTransform AND w.transform together so lasso/eraser
+            // raycasts remain pixel-accurate.
+            diag("anchor correction applied: d=\(String(format: "%.4f", dist))m")
             w.node.simdTransform = anchor.transform
             w.transform = anchor.transform
             walls[wallID] = w
@@ -1651,7 +1624,6 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
         guard let ma = anchor as? ARMeshAnchor else { return }
-        // ★ Throttle: skip rebuilds that arrive faster than every 0.4s per anchor.
         let now = CACurrentMediaTime()
         if let last = lastOccluderRebuild[ma.identifier], now - last < 0.4 { return }
         lastOccluderRebuild[ma.identifier] = now
