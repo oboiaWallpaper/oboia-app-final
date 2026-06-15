@@ -1,4 +1,11 @@
-// WallpaperARView.swift — v13 (diagnostic + fixes) + LIVE-geometry wallpaper
+// WallpaperARView.swift — v13 + LIVE-geometry wallpaper + Stage-1 LiDAR probe
+//
+// STAGE 1 (non-destructive): measures the wall from the LiDAR mesh and logs it
+// in the diagnostic report under "LIDAR WALL FIT". Nothing visible changes yet —
+// the wallpaper still renders from the live RoomPlan room. The point is to scan
+// the SAME wall a few times and confirm the LiDAR measurement stays steady
+// (RoomPlan's won't) BEFORE we let LiDAR drive the wall. If the lidar number is
+// stable, Stage 2 swaps the wall source over and wires the tools to it.
 //
 // FIX: the wallpaper is now built from the LIVE RoomPlan room (the same data the
 // on-screen grid is drawn from, which fits the wall) instead of RoomBuilder's
@@ -109,6 +116,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private var diagLog: [String] = []
     private let diagLogMax = 200
     private var meshAnchorCount = 0
+    // ★ Stage 1: LiDAR wall-measurement probe (non-destructive — logs only).
+    // World-space vertices classified as .wall, kept per anchor so they refresh
+    // and don't grow unbounded. Used to fit the wall plane from real geometry.
+    private var wallMeshPointsByAnchor: [UUID: [SIMD3<Float>]] = [:]
+    private var lastCameraForward: SIMD3<Float>?
+    private var lastCameraPos: SIMD3<Float>?
     private var roomUpdateCount = 0
     private var lastRayHitInfo: String = "none"
 
@@ -149,6 +162,22 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 let pos = w.transform.columns.3
                 lines.append("  Wall #\(i): size=\(w.wallSize.width)x\(w.wallSize.height) center=(\(pos.x),\(pos.y),\(pos.z))")
             }
+        }
+        lines.append("")
+        lines.append("LIDAR WALL FIT (Stage 1 probe — measurement only)")
+        if let f = fitWallFromMesh() {
+            let areaLidar = f.w * f.h
+            lines.append("  lidar size = \(String(format: "%.3f", f.w)) x \(String(format: "%.3f", f.h)) m")
+            lines.append("  lidar area = \(String(format: "%.3f", areaLidar)) m²  (from \(f.count) wall points)")
+            lines.append("  lidar center = (\(String(format: "%.3f", f.center.x)),\(String(format: "%.3f", f.center.y)),\(String(format: "%.3f", f.center.z)))")
+            if let w0 = walls.first?.value {
+                let areaRP = Float(w0.wallSize.width * w0.wallSize.height)
+                lines.append("  roomplan size = \(String(format: "%.3f", Float(w0.wallSize.width))) x \(String(format: "%.3f", Float(w0.wallSize.height))) m  area=\(String(format: "%.3f", areaRP)) m²")
+                lines.append("  >>> COMPARE these across repeated scans of the SAME wall: lidar should stay steady, roomplan won't <<<")
+            }
+        } else {
+            let total = wallMeshPointsByAnchor.values.reduce(0) { $0 + $1.count }
+            lines.append("  (not enough wall mesh yet — \(total) points; aim camera at wall a moment longer)")
         }
         lines.append("")
         lines.append("LOG TAIL (last 100)")
@@ -394,6 +423,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         isWallpaperApplied = false
         editModeActive = false
         meshAnchorCount = 0
+        wallMeshPointsByAnchor.removeAll()
         roomUpdateCount = 0
         removeCursor()
         endLassoMode()
@@ -685,6 +715,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         }
         let wallProximity: Float = 0.08  // 8cm — wider, removes more wall-near fuzz
 
+        var anchorWallPoints: [SIMD3<Float>] = []   // ★ Stage 1: wall verts from this anchor
+
         let fEl = geo.faces
         let bpi = fEl.bytesPerIndex
         let ipf = fEl.indexCountPerPrimitive
@@ -700,6 +732,17 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                     switch cls {
                     case .wall, .floor, .ceiling: skip = true
                     default: skip = false  // table, seat, window, door, none → occlude these
+                    }
+                    // ★ Stage 1: harvest WALL-classified triangle vertices for the
+                    // LiDAR plane fit (subsample: first vertex of each wall face).
+                    if cls == .wall && ipf == 3 {
+                        let p = fEl.buffer.contents().advanced(by: (f * ipf) * bpi)
+                        let vIdx: UInt32 = (bpi == 4)
+                            ? p.assumingMemoryBound(to: UInt32.self).pointee
+                            : UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)
+                        if Int(vIdx) < worldVerts.count {
+                            anchorWallPoints.append(worldVerts[Int(vIdx)])
+                        }
                     }
                 }
             }
@@ -742,6 +785,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
                 else { idx.append(UInt32(p.assumingMemoryBound(to: UInt16.self).pointee)) }
             }
         }
+        // ★ Stage 1: record this anchor's wall points (replaces prior, bounded).
+        // Done BEFORE the occluder early-return, since a pure-wall anchor has no
+        // occluder faces but is exactly the geometry we want to measure.
+        if !anchorWallPoints.isEmpty {
+            wallMeshPointsByAnchor[anchor.identifier] = anchorWallPoints
+        }
+
         guard !idx.isEmpty else { return nil }
 
         let vertSrc = SCNGeometrySource(vertices: verts)
@@ -756,6 +806,55 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     private func clearOccluderNodes() {
         for (_, n) in occluderNodes { n.removeFromParentNode() }
         occluderNodes.removeAll()
+    }
+
+    // ★ Stage 1: fit the wall the camera faces from accumulated LiDAR points.
+    // Returns real-world width/height/center, measured from actual geometry
+    // (not RoomPlan's estimate). Non-destructive: used for logging/comparison.
+    // Orientation comes from the camera (the wall the user points at); size and
+    // position come from the mesh points, with percentile clipping to reject
+    // stray points from other surfaces.
+    private func fitWallFromMesh() -> (w: Float, h: Float, center: SIMD3<Float>, n: SIMD3<Float>, count: Int)? {
+        var pts: [SIMD3<Float>] = []
+        for (_, arr) in wallMeshPointsByAnchor { pts.append(contentsOf: arr) }
+        guard pts.count >= 30, let camF = lastCameraForward else { return nil }
+
+        // Wall normal ≈ horizontalized camera-forward (the surface we face).
+        var n = SIMD3<Float>(camF.x, 0, camF.z)
+        let nLen = simd_length(n)
+        guard nLen > 1e-4 else { return nil }
+        n /= nLen
+
+        // Plane frame: up is world-up; right = up × n (horizontal along wall).
+        let up = SIMD3<Float>(0, 1, 0)
+        var right = simd_cross(up, n)
+        let rLen = simd_length(right)
+        guard rLen > 1e-4 else { return nil }
+        right /= rLen
+
+        // Plane offset along n: median rejects points from other walls.
+        let offsets = pts.map { simd_dot($0, n) }.sorted()
+        let medOffset = offsets[offsets.count / 2]
+        let onPlane = pts.filter { abs(simd_dot($0, n) - medOffset) < 0.12 }
+        guard onPlane.count >= 20 else { return nil }
+
+        // Robust 2.5–97.5 percentile spans reject stray cove/adjacent points.
+        let us = onPlane.map { simd_dot($0, right) }.sorted()
+        let vs = onPlane.map { simd_dot($0, up) }.sorted()
+        func pct(_ a: [Float], _ p: Float) -> Float {
+            let i = max(0, min(a.count - 1, Int(p * Float(a.count - 1))))
+            return a[i]
+        }
+        let uMin = pct(us, 0.025), uMax = pct(us, 0.975)
+        let vMin = pct(vs, 0.025), vMax = pct(vs, 0.975)
+        let w = uMax - uMin
+        let h = vMax - vMin
+        guard w > 0.2, h > 0.2 else { return nil }
+
+        let uC = (uMin + uMax) / 2
+        let vC = (vMin + vMax) / 2
+        let center = right * uC + up * vC + n * medOffset
+        return (w, h, center, n, onPlane.count)
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1569,6 +1668,10 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
 
 extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        // ★ Stage 1: track camera orientation to pick the wall the user faces.
+        let t = frame.camera.transform
+        lastCameraForward = -SIMD3<Float>(t.columns.2.x, t.columns.2.y, t.columns.2.z)
+        lastCameraPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
         if lassoModeActive && !lassoWorldPoints.isEmpty {
             broadcastLassoScreenPoints()
         }
@@ -1603,6 +1706,7 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.occluderNodes[ma.identifier]?.removeFromParentNode()
             self?.occluderNodes.removeValue(forKey: ma.identifier)
+            self?.wallMeshPointsByAnchor.removeValue(forKey: ma.identifier)
         }
     }
 }
