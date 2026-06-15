@@ -1,4 +1,11 @@
-// WallpaperARView.swift — v13c (v13 base + preview-leak fix + anchor stability)
+// WallpaperARView.swift — v13d (v13 base + preview fix + clamped anchor stability)
+//
+// v13d adds a sanity clamp to the anchor sync: ARKit world corrections larger
+// than 15cm are treated as bad relocalizations and IGNORED (wall stays where it
+// was placed / where the grid was), which prevents the wallpaper being shoved
+// sideways off the wall. Every correction (applied or ignored) is logged with
+// its magnitude and direction, so the diagnostic report shows whether the world
+// is jumping. Worst case = same as before; it can only hold placement steadier.
 //
 // This is the KNOWN-GOOD v13 geometry (wallpaper at detected size, no padding,
 // sits exactly on the scanned wall). Additions over v13:
@@ -69,6 +76,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var wallSize: CGSize
         var transform: simd_float4x4   // ★ now mutable: updated when ARKit corrects the world
         var anchorID: UUID?            // ★ ARAnchor that keeps this wall glued to the real wall
+        let placedTransform: simd_float4x4  // ★ original placement, for sanity-clamping corrections
     }
     // ★ Maps an ARAnchor.identifier -> wall surface UUID, so world corrections
     // are applied to the matching wall (keeps wallpaper from drifting off-wall).
@@ -881,7 +889,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             maskSize: maskSize,
             wallSize: CGSize(width: wMeters, height: hMeters),
             transform: surface.transform,
-            anchorID: anchor.identifier
+            anchorID: anchor.identifier,
+            placedTransform: surface.transform
         )
         diag("Built wall id=\(surface.identifier.uuidString.prefix(8)) size=\(String(format: "%.2f", wMeters))x\(String(format: "%.2f", hMeters))")
         return true
@@ -1598,6 +1607,27 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         for anchor in anchors {
             guard let wallID = wallAnchorIDs[anchor.identifier],
                   var w = walls[wallID] else { continue }
+
+            // Positional delta between ARKit's corrected transform and where we
+            // originally placed the wall (which matched the scan grid).
+            let oc = w.placedTransform.columns.3
+            let nc = anchor.transform.columns.3
+            let dx = nc.x - oc.x, dy = nc.y - oc.y, dz = nc.z - oc.z
+            let dist = (dx*dx + dy*dy + dz*dz).squareRoot()
+
+            // ★ Sanity clamp: a correction over 15cm is almost certainly a bad
+            // relocalization (it would shove the wallpaper off the wall). Ignore
+            // it and keep the wall where the grid was. Small drift is applied.
+            let clampMeters: Float = 0.15
+            if dist > clampMeters {
+                diag("anchor correction IGNORED (too large): d=\(String(format: "%.3f", dist))m dx=\(String(format: "%.3f", dx)) dy=\(String(format: "%.3f", dy)) dz=\(String(format: "%.3f", dz)) — keeping placed transform")
+                w.node.simdTransform = w.placedTransform
+                w.transform = w.placedTransform
+                walls[wallID] = w
+                continue
+            }
+
+            diag("anchor correction applied: d=\(String(format: "%.3f", dist))m dx=\(String(format: "%.3f", dx)) dy=\(String(format: "%.3f", dy)) dz=\(String(format: "%.3f", dz))")
             w.node.simdTransform = anchor.transform
             w.transform = anchor.transform
             walls[wallID] = w
