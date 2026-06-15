@@ -910,6 +910,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func processFinalRoom(_ room: CapturedRoom) {
         diag("processFinalRoom: \(room.walls.count) walls, \(room.doors.count) doors, \(room.windows.count) windows, \(room.openings.count) openings")
+        clearScanPreviewNodes()   // ★ safety net: ensure no grid lingers under the wallpaper
 
         for (_, w) in walls { w.node.removeFromParentNode() }
         walls.removeAll()
@@ -1717,6 +1718,14 @@ extension WallpaperARView: RoomCaptureSessionDelegate {
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            // ★ Ignore trailing updates that fire AFTER "Done Scanning". With the
+            // continuous single session these can arrive post-stop and redraw the
+            // grid, leaving it stuck on top of the wallpaper. Only accept updates
+            // while actually scanning.
+            guard self.currentMode == .scanning else {
+                self.diag("ignored late roomUpdate (mode=\(self.currentMode.rawValue))")
+                return
+            }
             self.roomUpdateCount += 1
             self.latestCapturedRoom = room
             self.lastLiveRoom = room   // ★ remember the live geometry the grid is drawn from
