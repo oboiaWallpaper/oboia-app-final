@@ -1,27 +1,27 @@
-// WallpaperARView.swift — v13e (v13d + offset fix: strict anchor clamp + lock-on-reconfig)
+// WallpaperARView.swift — v13f (v13e + alignment fix: no session reconfig blackout)
 //
-// v13e fixes the wallpaper-offset-after-scan bug seen in v13d.
+// v13f fixes the wallpaper-misaligned-on-wall bug seen in v13e.
 //
-// ROOT CAUSE of v13d bug:
-//   When startMeshTrackingForOccluder() called sceneView.session.run(cfg, options: [])
-//   to switch from RoomCaptureSession's ARSession to a regular ARWorldTracking
-//   session (for LiDAR mesh / occluder), ARKit issued large anchor "corrections"
-//   on the wall anchors. The old 15cm clamp let those through, sliding the
-//   wallpaper off the real wall.
+// ROOT CAUSE of v13e bug:
+//   startMeshTrackingForOccluder() was blocking ALL anchor corrections for 2
+//   seconds after the session reconfig, AND clamping later corrections to 2cm.
+//   But ARKit's relocalization after a reconfig legitimately needs to apply
+//   larger corrections to align wall transforms with the (slightly different)
+//   new world origin. By blocking those corrections, walls stayed pinned in
+//   stale coordinates — making the wallpaper appear tilted / offset past the
+//   real wall edges.
 //
-// FIXES IN v13e:
-//   1. Anchor sync clamp tightened from 15cm → 2cm. Anything larger is rejected
-//      and the wall is force-snapped back to its placedTransform.
-//   2. The sync compares each correction against the CURRENT transform (not the
-//      original placed one), so small natural drift can still be tracked over
-//      time without accumulating into a big jump.
-//   3. Immediately after startMeshTrackingForOccluder() reconfigures the AR
-//      session, every wall is force-locked to its placedTransform. This blocks
-//      the one-time post-reconfig jump that was causing the visible offset.
+// FIXES IN v13f:
+//   1. Removed the 2-second post-reconfig blackout window. ARKit is now
+//      allowed to correct wall anchors immediately after the reconfig.
+//   2. Loosened the anchor sync clamp from 2cm back to 15cm so legitimate
+//      relocalization corrections can be applied.
+//   3. Comparison still uses CURRENT transform (incremental drift) so we
+//      track natural small movement without one accumulated jump.
 //   4. Both w.node.simdTransform AND w.transform are always updated together,
-//      keeping lasso/eraser raycasts perfectly aligned with the rendered wall.
+//      keeping lasso/eraser raycasts perfectly aligned with rendered wall.
 //
-// Everything else from v13d is preserved (preview-leak fix, occluder throttle,
+// Everything else from v13e is preserved (preview-leak fix, occluder throttle,
 // scan grid look, lasso/brush behaviour, etc).
 
 import ARKit
@@ -66,17 +66,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         var wallSize: CGSize
         var transform: simd_float4x4   // ★ updated when ARKit corrects the world (only small corrections accepted)
         var anchorID: UUID?            // ★ ARAnchor that tracks this wall
-        let placedTransform: simd_float4x4  // ★ original placement — wall is force-snapped here on big corrections
+        let placedTransform: simd_float4x4  // ★ original placement (kept for diagnostics)
     }
     private var wallAnchorIDs: [UUID: UUID] = [:]
     private var lastOccluderRebuild: [UUID: TimeInterval] = [:]
     private var walls: [UUID: Wall] = [:]
     private let maskPxPerMeter: CGFloat = 256
-
-    // ★ v13e: For a short window right after session reconfiguration, BLOCK
-    // all anchor corrections (even tiny ones). This kills the post-reconfig
-    // jump that ARKit issues when we switch to the mesh tracking config.
-    private var ignoreAnchorCorrectionsUntil: TimeInterval = 0
 
     // Brush / Lasso / Wallpaper
     private var brushMode: BrushMode = .erase
@@ -131,7 +126,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func diagSnapshot() -> String {
         var lines: [String] = []
-        lines.append("=== OBOIA DIAGNOSTIC REPORT (v13e) ===")
+        lines.append("=== OBOIA DIAGNOSTIC REPORT (v13f) ===")
         lines.append("timestamp: \(ISO8601DateFormatter().string(from: Date()))")
         lines.append("")
         lines.append("STATE")
@@ -219,7 +214,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         panGesture = pan
 
         channel.setMethodCallHandler { [weak self] (call, result) in self?.route(call, result) }
-        diag("init() complete (v13e)")
+        diag("init() complete (v13f)")
     }
 
     func view() -> UIView { sceneView }
@@ -362,7 +357,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         c.planeDetection = []
         sceneView.session.run(c, options: [.resetTracking, .removeExistingAnchors])
         currentMode = .idle
-        emit("boot", data: ["status": "AR ready (v13e)"])
+        emit("boot", data: ["status": "AR ready (v13f)"])
         diag("bootIdleSession ok")
     }
 
@@ -385,8 +380,8 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ════════════════════════════════════════════════════════════
 
     private func startScan(result: @escaping FlutterResult) {
-        diag(">>> startScan v13e <<<")
-        emit("boot", data: ["status": ">>> startScan v13e <<<"])
+        diag(">>> startScan v13f <<<")
+        emit("boot", data: ["status": ">>> startScan v13f <<<"])
         guard RoomCaptureSession.isSupported else {
             emit("error", data: ["message": "RoomPlan not supported"])
             result(FlutterError(code: "NOROOMPLAN", message: "Not supported", details: nil))
@@ -779,8 +774,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         emit("boot", data: ["status": "Done: \(built) walls, \(String(format: "%.1f", area)) m²"])
     }
 
-    /// ★ v13e: Start LiDAR mesh tracking for occluder AND lock walls down so
-    /// the post-reconfig anchor corrections can't slide the wallpaper off-wall.
+    /// ★ v13f: Enable LiDAR mesh tracking for occluder WITHOUT resetting the
+    /// world coordinate system. By NOT passing .resetTracking or
+    /// .removeExistingAnchors, ARKit keeps the SAME world origin from
+    /// RoomPlan's session, so wall transforms remain valid in place.
     private func startMeshTrackingForOccluder() {
         guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             diag("scene reconstruction not supported — no occluder available")
@@ -794,24 +791,13 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             cfg.frameSemantics.insert(.sceneDepth)
         }
 
-        // ★ v13e CRITICAL FIX #1: BLOCK all anchor corrections for 2 seconds
-        // following the session reconfiguration. ARKit issues a burst of large
-        // "corrections" during this window because it's re-establishing the
-        // world. Those were sliding the wallpaper off the real wall.
-        ignoreAnchorCorrectionsUntil = CACurrentMediaTime() + 2.0
-        diag("anchor corrections BLOCKED until \(String(format: "%.3f", ignoreAnchorCorrectionsUntil.truncatingRemainder(dividingBy: 100000)))")
-
+        // ★ v13f CRITICAL FIX: Run with NO options. This keeps the same world
+        // origin so wall transforms stay aligned with reality. Previously we
+        // were silently resetting the world and then pinning walls to stale
+        // coordinates, causing the visible offset/tilt.
         sceneView.session.run(cfg, options: [])
 
-        // ★ v13e CRITICAL FIX #2: Immediately re-lock every wall to its
-        // placedTransform. Even if some early anchor update slips through,
-        // the wall will start from exactly where the grid was.
-        for (id, var w) in walls {
-            w.node.simdTransform = w.placedTransform
-            w.transform = w.placedTransform
-            walls[id] = w
-        }
-        diag("startMeshTrackingForOccluder: ran ARWorldTrackingConfiguration; locked \(walls.count) walls to placedTransform")
+        diag("startMeshTrackingForOccluder: reconfigured for mesh occluder, world preserved")
     }
 
     private func buildWall(
@@ -1549,34 +1535,23 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
         }
     }
 
-    // ★ v13e: STRICT anchor sync — small drift corrections only.
+    // ★ v13f: Trust ARKit's anchor updates with a reasonable clamp.
     //
-    // KEY CHANGES vs v13d:
-    //  1. During the 2-second post-reconfig blackout, ALL corrections are
-    //     rejected and walls are pinned to placedTransform. This kills the
-    //     burst of bad corrections that shifted the wallpaper.
-    //  2. Clamp tightened from 15cm → 2cm. Beyond that = relocalization
-    //     glitch, wall snaps back to placedTransform.
-    //  3. Comparison is now against the CURRENT transform (not placedTransform)
-    //     so legitimate small drift can be tracked over time without one big
-    //     accumulated jump.
+    // KEY CHANGES vs v13e:
+    //  1. Removed the post-reconfig blackout window entirely. ARKit needs to
+    //     be allowed to correct wall positions after the session reconfig so
+    //     they align with the (possibly slightly different) new world frame.
+    //  2. Clamp loosened from 2cm → 15cm to permit legitimate relocalization
+    //     corrections. Anything beyond 15cm is treated as a tracking glitch
+    //     and the wall is left in place.
+    //  3. Comparison still uses CURRENT transform (incremental drift), so we
+    //     track small natural drift over time without one big accumulated jump.
     //  4. Both w.node.simdTransform AND w.transform are updated together,
-    //     keeping lasso/eraser raycasts perfectly aligned with the rendered wall.
+    //     keeping lasso/eraser raycasts perfectly aligned with rendered wall.
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        let now = CACurrentMediaTime()
-        let blackoutActive = now < ignoreAnchorCorrectionsUntil
-
         for anchor in anchors {
             guard let wallID = wallAnchorIDs[anchor.identifier],
                   var w = walls[wallID] else { continue }
-
-            // ★ Blackout window: pin to placedTransform, ignore everything else.
-            if blackoutActive {
-                w.node.simdTransform = w.placedTransform
-                w.transform = w.placedTransform
-                walls[wallID] = w
-                continue
-            }
 
             // Compare correction against CURRENT transform (incremental drift)
             let oc = w.transform.columns.3
@@ -1584,23 +1559,20 @@ extension WallpaperARView: ARSessionDelegate, ARSCNViewDelegate {
             let dx = nc.x - oc.x, dy = nc.y - oc.y, dz = nc.z - oc.z
             let dist = (dx*dx + dy*dy + dz*dz).squareRoot()
 
-            // ★ STRICT: only accept corrections under 2cm. Anything bigger is
-            // an ARKit relocalization glitch that would visibly shift the
-            // wallpaper off the wall.
-            let clampMeters: Float = 0.02
+            // ★ Reasonable clamp: accept corrections up to 15cm. This is large
+            // enough to handle post-reconfig relocalization, but small enough
+            // to reject obvious tracking glitches.
+            let clampMeters: Float = 0.15
             if dist > clampMeters {
-                diag("anchor correction REJECTED: d=\(String(format: "%.4f", dist))m dx=\(String(format: "%.4f", dx)) dy=\(String(format: "%.4f", dy)) dz=\(String(format: "%.4f", dz)) — snapping to placedTransform")
-                // Force back to original placement so we don't drift over time
-                w.node.simdTransform = w.placedTransform
-                w.transform = w.placedTransform
-                walls[wallID] = w
+                diag("anchor correction REJECTED: d=\(String(format: "%.4f", dist))m — ignoring (likely tracking glitch)")
                 continue
             }
 
-            // ★ Accept small drift correction. CRITICAL: update both
-            // node.simdTransform AND w.transform together so lasso/eraser
-            // raycasts remain pixel-accurate.
-            diag("anchor correction applied: d=\(String(format: "%.4f", dist))m")
+            // ★ Accept correction. CRITICAL: update both node.simdTransform AND
+            // w.transform together so lasso/eraser raycasts remain pixel-accurate.
+            if dist > 0.001 {
+                diag("anchor correction applied: d=\(String(format: "%.4f", dist))m")
+            }
             w.node.simdTransform = anchor.transform
             w.transform = anchor.transform
             walls[wallID] = w
