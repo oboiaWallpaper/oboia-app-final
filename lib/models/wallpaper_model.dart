@@ -89,45 +89,117 @@ class WallpaperModel {
   static String _cleanUrl(String? url) =>
       url?.trim().replaceAll(RegExp(r'^"|"$'), '') ?? '';
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // ★ FIELD-MAPPING FIX (so dashboard edits show up live in the app)
+  //
+  // The dashboard stores names/prices/category under DIFFERENT field names than
+  // the app was reading, so edits saved but never appeared. These helpers read
+  // the dashboard's fields first, then fall back to the old/mobile field names,
+  // so BOTH new and legacy wallpapers work, and edits reflect immediately.
+  //
+  //   name      → nameEn / nameUz / name
+  //   price     → sellPrice / price
+  //   category  → categoryId / category
+  //   rollWidth → rollWidth(m) / rollWidthCm÷100
+  //   rollLength→ rollLength / rollLengthM
+  // ─────────────────────────────────────────────────────────────────────────
+  static String _pickName(Map<String, dynamic> d) {
+    final en = (d['nameEn'] ?? '').toString().trim();
+    final uz = (d['nameUz'] ?? '').toString().trim();
+    final legacy = (d['name'] ?? '').toString().trim();
+    if (en.isNotEmpty) return en;
+    if (uz.isNotEmpty) return uz;
+    if (legacy.isNotEmpty) return legacy;
+    return 'Unnamed';
+  }
+
+  static String _pickDescription(Map<String, dynamic> d) {
+    final en = (d['descriptionEn'] ?? '').toString().trim();
+    final uz = (d['descriptionUz'] ?? '').toString().trim();
+    final legacy = (d['description'] ?? '').toString().trim();
+    if (en.isNotEmpty) return en;
+    if (uz.isNotEmpty) return uz;
+    return legacy;
+  }
+
+  static double _pickPrice(Map<String, dynamic> d) {
+    final sell = d['sellPrice'];
+    if (sell is num && sell > 0) return sell.toDouble();
+    final p = d['price'];
+    if (p is num) return p.toDouble();
+    return 0;
+  }
+
+  static String _pickCategory(Map<String, dynamic> d) {
+    final catId = (d['categoryId'] ?? '').toString().trim();
+    if (catId.isNotEmpty) return catId;
+    return (d['category'] ?? '').toString().trim();
+  }
+
+  static double _pickRollWidth(Map<String, dynamic> d) {
+    // App expects metres. Dashboard stores rollWidthCm.
+    final m = d['rollWidth'];
+    if (m is num && m > 0) return m.toDouble();
+    final cm = d['rollWidthCm'];
+    if (cm is num && cm > 0) return cm.toDouble() / 100.0;
+    return 0.53;
+  }
+
+  static double _pickRollLength(Map<String, dynamic> d) {
+    final m = d['rollLength'];
+    if (m is num && m > 0) return m.toDouble();
+    final lm = d['rollLengthM'];
+    if (lm is num && lm > 0) return lm.toDouble();
+    return 10;
+  }
+
+  static bool _pickApproved(Map<String, dynamic> d) {
+    // Prefer the boolean the app filters on; also accept the dashboard's
+    // string status ('approved') so either schema works.
+    if (d['isApproved'] is bool) return d['isApproved'] as bool;
+    final status = (d['approvalStatus'] ?? '').toString().toLowerCase();
+    if (status.isNotEmpty) return status == 'approved';
+    return false;
+  }
+
+  static String? _pickThumb(Map<String, dynamic> d) {
+    final t = _cleanUrl(d['thumbnailUrl'] as String?);
+    if (t.isNotEmpty) return t;
+    // Dashboard sometimes only has images[] / arTexture.
+    final imgs = d['images'];
+    if (imgs is List && imgs.isNotEmpty) {
+      return _cleanUrl(imgs.first?.toString());
+    }
+    final ar = _cleanUrl(d['arTexture'] as String?);
+    if (ar.isNotEmpty) return ar;
+    return '';
+  }
+
   factory WallpaperModel.fromDoc(DocumentSnapshot doc) {
     final d = (doc.data() as Map<String, dynamic>?) ?? {};
-    return WallpaperModel(
-      id: doc.id,
-      name: (d['name'] ?? 'Unnamed') as String,
-      description: (d['description'] ?? '') as String,
-      category: (d['category'] ?? '') as String,
-      brand: (d['brand'] ?? '') as String,
-      price: ((d['price'] ?? 0) as num).toDouble(),
-      pricePerSqm: ((d['pricePerSqm'] ?? 0) as num).toDouble(),
-      rollWidth: ((d['rollWidth'] ?? 0.53) as num).toDouble(),
-      rollLength: ((d['rollLength'] ?? 10) as num).toDouble(),
-      stock: ((d['stock'] ?? 0) as num).toInt(),
-      shopId: (d['shopId'] ?? '') as String,
-      isApproved: (d['isApproved'] ?? false) as bool,
-      thumbnailUrl: _cleanUrl(d['thumbnailUrl'] as String?),
-      pbr: PbrMaps.fromMap(d['pbr'] as Map<String, dynamic>?),
-      processingStatus: d['processingStatus'] as String?,
-      createdAt: (d['createdAt'] is Timestamp)
-          ? (d['createdAt'] as Timestamp).toDate()
-          : DateTime.now(),
-    );
+    return WallpaperModel._fromData(d, doc.id);
   }
 
   factory WallpaperModel.fromMap(Map<String, dynamic> d, String id) {
+    return WallpaperModel._fromData(d, id);
+  }
+
+  // Single shared builder so fromDoc and fromMap stay identical.
+  factory WallpaperModel._fromData(Map<String, dynamic> d, String id) {
     return WallpaperModel(
       id: id,
-      name: (d['name'] ?? 'Unnamed') as String,
-      description: (d['description'] ?? '') as String,
-      category: (d['category'] ?? '') as String,
+      name: _pickName(d),
+      description: _pickDescription(d),
+      category: _pickCategory(d),
       brand: (d['brand'] ?? '') as String,
-      price: ((d['price'] ?? 0) as num).toDouble(),
+      price: _pickPrice(d),
       pricePerSqm: ((d['pricePerSqm'] ?? 0) as num).toDouble(),
-      rollWidth: ((d['rollWidth'] ?? 0.53) as num).toDouble(),
-      rollLength: ((d['rollLength'] ?? 10) as num).toDouble(),
+      rollWidth: _pickRollWidth(d),
+      rollLength: _pickRollLength(d),
       stock: ((d['stock'] ?? 0) as num).toInt(),
       shopId: (d['shopId'] ?? '') as String,
-      isApproved: (d['isApproved'] ?? false) as bool,
-      thumbnailUrl: _cleanUrl(d['thumbnailUrl'] as String?),
+      isApproved: _pickApproved(d),
+      thumbnailUrl: _pickThumb(d),
       pbr: PbrMaps.fromMap(d['pbr'] as Map<String, dynamic>?),
       processingStatus: d['processingStatus'] as String?,
       createdAt: (d['createdAt'] is Timestamp)
