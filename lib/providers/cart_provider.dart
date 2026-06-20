@@ -1,8 +1,6 @@
 // lib/providers/cart_provider.dart
-
 import 'dart:async';
 import 'package:flutter/foundation.dart';
-
 import '../models/cart_model.dart';
 import '../models/wallpaper_model.dart';
 import '../services/cart_service.dart';
@@ -13,7 +11,6 @@ class CartProvider extends ChangeNotifier {
   String? _userId;
 
   // ── Getters ─────────────────────────────────────────────────────────────
-
   List<CartItem> get items => List.unmodifiable(_items);
 
   /// Number of distinct items in the cart.
@@ -27,20 +24,17 @@ class CartProvider extends ChangeNotifier {
       _items.fold<double>(0.0, (acc, it) => acc + it.totalPrice);
 
   // ── Bind to user ─────────────────────────────────────────────────────────
-
   /// Call whenever Firebase auth state changes (pass null on sign-out).
   void bindUser(String? userId) {
     if (_userId == userId) return;
     _userId = userId;
     _sub?.cancel();
     _sub = null;
-
     if (userId == null) {
       _items = [];
       notifyListeners();
       return;
     }
-
     _sub = CartService.instance.cartStream(userId).listen((list) {
       _items = list;
       notifyListeners();
@@ -48,7 +42,6 @@ class CartProvider extends ChangeNotifier {
   }
 
   // ── Cart operations ──────────────────────────────────────────────────────
-
   /// Low-level add — prefer [addWallpaperToCart] from the AR screen.
   Future<void> add(CartItem item) async {
     if (_userId == null) return;
@@ -65,12 +58,10 @@ class CartProvider extends ChangeNotifier {
     required double wallHeight,
   }) async {
     if (_userId == null) return;
-
     final sqm = wallWidth * wallHeight;
     final perRoll = wallpaper.rollWidth * wallpaper.rollLength;
     final rollsNeeded = (perRoll > 0) ? (sqm / perRoll).ceil() : 1;
     final totalPrice = rollsNeeded * wallpaper.price;
-
     final item = CartItem(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       wallpaperId: wallpaper.id,
@@ -86,7 +77,36 @@ class CartProvider extends ChangeNotifier {
       totalPrice: totalPrice,
       addedAt: DateTime.now(),
     );
+    await CartService.instance.addItem(_userId!, item);
+  }
 
+  /// ★ NEW: Add a wallpaper to the cart WITHOUT scanning a wall — the customer
+  /// simply chooses how many rolls they want (like adding any normal product).
+  /// Wall measurements are 0 here; the seller confirms exact needs at order time.
+  Future<void> addWallpaperByQuantity({
+    required WallpaperModel wallpaper,
+    required String shopId,
+    required String shopName,
+    required int quantity,
+  }) async {
+    if (_userId == null) return;
+    final qty = quantity < 1 ? 1 : quantity;
+    final totalPrice = qty * wallpaper.price;
+    final item = CartItem(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      wallpaperId: wallpaper.id,
+      wallpaperName: wallpaper.name,
+      wallpaperThumbnail: wallpaper.thumbnailUrl,
+      shopId: shopId,
+      shopName: shopName,
+      wallWidth: 0,
+      wallHeight: 0,
+      sqm: 0,
+      rollsNeeded: qty,
+      pricePerRoll: wallpaper.price,
+      totalPrice: totalPrice,
+      addedAt: DateTime.now(),
+    );
     await CartService.instance.addItem(_userId!, item);
   }
 
