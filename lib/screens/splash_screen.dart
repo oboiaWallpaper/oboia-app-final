@@ -1,13 +1,16 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
-import 'package:flutter_animate/flutter_animate.dart';
 import 'package:go_router/go_router.dart';
-import 'package:provider/provider.dart';
 
-import '../providers/auth_provider.dart';
-import '../theme/app_colors.dart';
-
+/// OBOIA splash screen.
+///
+/// Shows the brand logo on a dark background for a short moment when the app
+/// opens, then hands control to the router. It navigates to '/welcome' and the
+/// app's global redirect (in main.dart) instantly forwards signed-in users on
+/// to '/home' (or '/craftsman'), so this works for both signed-in and
+/// signed-out users.
+///
+/// Pure Flutter + go_router — no native or Codemagic changes needed.
+/// Lives at: lib/screens/splash_screen.dart
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -15,88 +18,85 @@ class SplashScreen extends StatefulWidget {
   State<SplashScreen> createState() => _SplashScreenState();
 }
 
-class _SplashScreenState extends State<SplashScreen> {
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  late final Animation<double> _fade;
+  late final Animation<double> _scale;
+
+  static const Color _bg = Color(0xFF1A1C22); // brand dark
+  static const Color _gold = Color(0xFFFFD369); // brand gold
+
+  static const Duration _hold = Duration(milliseconds: 2200);
+
   @override
   void initState() {
     super.initState();
-    Timer(const Duration(seconds: 2), _decideNext);
+    _c = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+    _fade = CurvedAnimation(parent: _c, curve: Curves.easeOut);
+    _scale = Tween<double>(begin: 0.85, end: 1.0).animate(
+      CurvedAnimation(parent: _c, curve: Curves.easeOutBack),
+    );
+    _c.forward();
+
+    // After the hold, hand off to the router. Going to '/welcome' lets the
+    // global redirect in main.dart route signed-in users onward automatically.
+    Future.delayed(_hold, () {
+      if (!mounted) return;
+      context.go('/welcome');
+    });
   }
 
-  void _decideNext() {
-    if (!mounted) return;
-    final auth = context.read<AuthProvider>();
-    if (auth.loading) {
-      Timer(const Duration(milliseconds: 500), _decideNext);
-      return;
-    }
-    if (!auth.isSignedIn) {
-      context.go('/welcome');
-    } else if (auth.isCraftsman) {
-      context.go('/craftsman');
-    } else {
-      context.go('/home');
-    }
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.background,
+      backgroundColor: _bg,
       body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 110,
-              height: 110,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: const RadialGradient(
-                  colors: [AppColors.gold, AppColors.goldSecondary],
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: AppColors.gold.withOpacity(0.35),
-                    blurRadius: 40,
-                    spreadRadius: 4,
-                  ),
-                ],
-              ),
-              child: const Center(
-                child: Text(
-                  'O',
-                  style: TextStyle(
-                    color: Colors.black,
-                    fontSize: 56,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: -2,
+        child: FadeTransition(
+          opacity: _fade,
+          child: ScaleTransition(
+            scale: _scale,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Logo. If the asset is ever missing, fall back to gold text
+                // so the splash can never crash the app.
+                Image.asset(
+                  'assets/splash_logo.png',
+                  width: 140,
+                  height: 140,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const Text(
+                    'OBOIA',
+                    style: TextStyle(
+                      color: _gold,
+                      fontSize: 40,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1.5,
+                    ),
                   ),
                 ),
-              ),
-            )
-                .animate()
-                .scale(
-                  duration: 700.ms,
-                  curve: Curves.easeOutBack,
-                  begin: const Offset(0.6, 0.6),
-                )
-                .fadeIn(duration: 500.ms),
-            const SizedBox(height: 24),
-            const Text(
-              'OBOIA',
-              style: TextStyle(
-                color: AppColors.textPrimary,
-                fontSize: 32,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 8,
-              ),
-            ).animate().fadeIn(delay: 300.ms, duration: 600.ms),
-            const SizedBox(height: 8),
-            const Text(
-              'Premium wallpaper, previewed in AR',
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-            ).animate().fadeIn(delay: 600.ms, duration: 600.ms),
-          ],
+                const SizedBox(height: 28),
+                const SizedBox(
+                  width: 26,
+                  height: 26,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.4,
+                    valueColor: AlwaysStoppedAnimation<Color>(_gold),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
