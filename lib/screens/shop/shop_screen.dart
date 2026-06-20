@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/shop_model.dart';
 import '../../models/wallpaper_model.dart';
+import '../../providers/cart_provider.dart';
 import '../../providers/saved_walls_provider.dart';
 import '../../providers/shop_provider.dart';
 import '../../services/firestore_service.dart';
@@ -26,9 +27,6 @@ class _ShopScreenState extends State<ShopScreen> {
   String _query = '';
   final _searchCtrl = TextEditingController();
 
-  // ★ NEW: category ID → display name map. The dashboard saves a wallpaper's
-  // category as the category DOCUMENT ID; without this lookup the chips show
-  // raw IDs like "MOWMZfCKDGrjal61dfsE".
   Map<String, String> _categoryNames = {};
 
   @override
@@ -59,8 +57,6 @@ class _ShopScreenState extends State<ShopScreen> {
     }
   }
 
-  /// Display label for a category value (resolves ID → name, falls back to
-  /// the raw value for legacy wallpapers that stored a name directly).
   String _categoryLabel(String raw) => _categoryNames[raw] ?? raw;
 
   @override
@@ -86,8 +82,6 @@ class _ShopScreenState extends State<ShopScreen> {
                 flexibleSpace: FlexibleSpaceBar(
                   background: _banner(shop),
                   title: Text(
-                    // ★ CHANGED: displayName resolves nameEn/nameUz from the
-                    // dashboard; plain .name is empty for dashboard-created shops
                     shop?.displayName() ?? '',
                     style: const TextStyle(
                       color: AppColors.textPrimary,
@@ -190,9 +184,24 @@ class _ShopScreenState extends State<ShopScreen> {
                           delegate: SliverChildBuilderDelegate(
                             (context, i) {
                               final w = filtered[i];
-                              return WallpaperCard(
-                                wallpaper: w,
-                                onTap: () => _openAR(shop, w),
+                              // Card opens AR on tap (unchanged). A small gold
+                              // cart button is overlaid to add WITHOUT scanning.
+                              return Stack(
+                                children: [
+                                  Positioned.fill(
+                                    child: WallpaperCard(
+                                      wallpaper: w,
+                                      onTap: () => _openAR(shop, w),
+                                    ),
+                                  ),
+                                  Positioned(
+                                    top: 8,
+                                    right: 8,
+                                    child: _AddToCartButton(
+                                      onTap: () => _openQuantitySheet(shop, w),
+                                    ),
+                                  ),
+                                ],
                               );
                             },
                             childCount: filtered.length,
@@ -209,7 +218,6 @@ class _ShopScreenState extends State<ShopScreen> {
     );
   }
 
-  // After AR returns, if user saved a wall, push /walls (My Walls list)
   void _openAR(Shop? shop, Wallpaper w) {
     if (shop == null) return;
     context.read<ShopProvider>().setContext(shop: shop, wallpaper: w);
@@ -220,6 +228,17 @@ class _ShopScreenState extends State<ShopScreen> {
         context.push('/walls');
       }
     });
+  }
+
+  // Quantity picker — add a wallpaper to the cart without scanning a wall.
+  void _openQuantitySheet(Shop? shop, Wallpaper w) {
+    if (shop == null) return;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => _QuantitySheet(wallpaper: w, shop: shop),
+    );
   }
 
   Widget _banner(Shop? shop) {
@@ -263,7 +282,6 @@ class _ShopScreenState extends State<ShopScreen> {
           }
           final cat = categories[i - 1];
           final active = _category == cat;
-          // ★ CHANGED: show the human-readable name, filter by the raw value
           return _chip(_categoryLabel(cat), active,
               () => setState(() => _category = cat));
         },
@@ -314,6 +332,262 @@ class _ShopScreenState extends State<ShopScreen> {
         ],
       ),
     );
+  }
+}
+
+// Small gold cart button shown on each wallpaper card.
+class _AddToCartButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _AddToCartButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.gold,
+      shape: const CircleBorder(),
+      elevation: 3,
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: const Padding(
+          padding: EdgeInsets.all(8),
+          child: Icon(Icons.add_shopping_cart_rounded,
+              color: Colors.black, size: 18),
+        ),
+      ),
+    );
+  }
+}
+
+// Bottom sheet: choose quantity (rolls) and add to cart without scanning.
+class _QuantitySheet extends StatefulWidget {
+  final Wallpaper wallpaper;
+  final Shop shop;
+  const _QuantitySheet({required this.wallpaper, required this.shop});
+
+  @override
+  State<_QuantitySheet> createState() => _QuantitySheetState();
+}
+
+class _QuantitySheetState extends State<_QuantitySheet> {
+  int _qty = 1;
+  bool _adding = false;
+
+  // Simple price formatter (no external dependency): 1234567 -> "1 234 567"
+  String _money(num v) {
+    final s = v.round().toString();
+    final buf = StringBuffer();
+    for (int i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) buf.write(' ');
+      buf.write(s[i]);
+    }
+    return buf.toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final w = widget.wallpaper;
+    final total = _qty * w.price;
+
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+          20, 16, 20, 20 + MediaQuery.of(context).padding.bottom),
+      decoration: const BoxDecoration(
+        color: AppColors.card,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: AppColors.border,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: SizedBox(
+                  width: 64,
+                  height: 64,
+                  child: (w.thumbnailUrl != null && w.thumbnailUrl!.isNotEmpty)
+                      ? CachedNetworkImage(
+                          imageUrl: w.thumbnailUrl!,
+                          fit: BoxFit.cover,
+                          errorWidget: (_, __, ___) =>
+                              Container(color: AppColors.surface),
+                        )
+                      : Container(
+                          color: AppColors.surface,
+                          child: const Icon(Icons.wallpaper,
+                              color: AppColors.textTertiary),
+                        ),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      w.name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${_money(w.price)} so\'m / roll',
+                      style: const TextStyle(
+                        color: AppColors.textSecondary,
+                        fontSize: 12.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 22),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Quantity (rolls)',
+                style: TextStyle(
+                  color: AppColors.textPrimary,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              Row(
+                children: [
+                  _stepBtn(Icons.remove, () {
+                    if (_qty > 1) setState(() => _qty--);
+                  }),
+                  Container(
+                    width: 48,
+                    alignment: Alignment.center,
+                    child: Text(
+                      '$_qty',
+                      style: const TextStyle(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 18,
+                      ),
+                    ),
+                  ),
+                  _stepBtn(Icons.add, () => setState(() => _qty++)),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Total',
+                  style: TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 14,
+                  ),
+                ),
+                Text(
+                  '${_money(total)} so\'m',
+                  style: const TextStyle(
+                    color: AppColors.gold,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 20,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.gold,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14)),
+              ),
+              onPressed: _adding ? null : _add,
+              icon: _adding
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.black),
+                    )
+                  : const Icon(Icons.shopping_cart_checkout_rounded,
+                      color: Colors.black, size: 20),
+              label: const Text(
+                'Add to cart',
+                style: TextStyle(
+                  color: Colors.black,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 15,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _stepBtn(IconData icon, VoidCallback onTap) {
+    return Material(
+      color: AppColors.surface,
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Icon(icon, color: AppColors.textPrimary, size: 20),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _add() async {
+    setState(() => _adding = true);
+    try {
+      await context.read<CartProvider>().addWallpaperByQuantity(
+            wallpaper: widget.wallpaper,
+            shopId: widget.shop.id,
+            shopName: widget.shop.displayName(),
+            quantity: _qty,
+          );
+      if (!mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Added to cart'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } catch (_) {
+      if (mounted) setState(() => _adding = false);
+    }
   }
 }
 
