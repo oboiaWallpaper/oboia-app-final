@@ -7,6 +7,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../providers/saved_walls_provider.dart';
+import '../models/cart_line_item.dart';
+
 
 class OrderService {
   OrderService._();
